@@ -1,0 +1,9 @@
+# OpenDesk — Managed by uv (uv.lock)
+#
+# Install:
+#   uv sync              # install all dependencies
+#   uv sync --dev        # include dev dependencies
+#   uv add <package>     # add a dependency
+#   uv lock              # update lockfile
+#
+# See pyproject.toml for the actual dependency list.

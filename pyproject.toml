@@ -1,0 +1,82 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opendesk"
+version = "0.1.0"
+description = "Remote desktop application (TeamViewer/AnyDesk-like)"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "OpenDesk Contributors"},
+]
+requires-python = ">=3.12"
+dependencies = [
+    "PySide6>=6.10.1",
+    "Pillow>=10.2.0",
+    "numpy>=2.4.4",
+    "cryptography>=41.0.7",
+    "PyNaCl>=1.5.0",
+    "websockets>=10.4",
+    "mss>=9.0.0",
+    "opencv-python>=4.9.0",
+    "av>=12.0.0",
+    "aiortc>=1.9.0",
+    "python-xlib>=0.33",
+    "pyzmq>=26.0",
+    "argon2-cffi>=23.1.0",
+    "msgpack>=1.0.0",
+    "dbus-next>=0.2.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "black>=24.0",
+    "ruff>=0.3.0",
+    "mypy>=1.9.0",
+]
+wayland = [
+    "dbus-next>=0.2.3",
+    "evdev>=1.6.0",
+]
+win = []
+macos = [
+    "pyobjc-framework-Quartz>=9.0",
+]
+audio = [
+    "soundcard>=0.4.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["opendesk*", "relay_server*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.qss", "*.png", "*.svg", "*.ico"]
+
+[tool.uv]
+# uv-specific settings
+native-tls = true
+
+
+[tool.black]
+line-length = 99
+target-version = ["py312"]
+
+[tool.ruff]
+line-length = 99
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = false
+ignore_missing_imports = true
+
+[project.scripts]
+opendesk = "opendesk.app:main"
+opendesk-relay = "relay_server.server:main"

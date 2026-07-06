@@ -1,0 +1,124 @@
+"""
+Tests for the cryptography module.
+
+Covers E2E encryption roundtrip, key exchange, and password hashing.
+"""
+
+from __future__ import annotations
+
+from opendesk.crypto.e2ee import E2EEncryption, CryptoKeyPair, EncryptedMessage
+from opendesk.crypto.auth import hash_password, verify_password, generate_session_id
+
+
+# ── E2E encryption ────────────────────────────────────────────────────────
+
+
+class TestE2EEncryption:
+    def test_key_pair_generation(self) -> None:
+        """A generated key pair should have 32-byte keys."""
+        kp = CryptoKeyPair.generate()
+        assert len(kp.private_bytes) == 32
+        assert len(kp.public_bytes) == 32
+
+    def test_public_key_encoding(self) -> None:
+        """Base64 encode/decode of public key."""
+        kp = CryptoKeyPair.generate()
+        encoded = kp.encode_public()
+        assert isinstance(encoded, str)
+        assert len(encoded) > 40  # base64 of 32 bytes
+
+        decoded = CryptoKeyPair.decode_public(encoded)
+        assert bytes(decoded) == kp.public_bytes
+
+    def test_encrypt_decrypt_roundtrip(self) -> None:
+        """Alice encrypts → Bob decrypts successfully."""
+        alice = E2EEncryption()
+        bob = E2EEncryption()
+
+        alice.set_remote_key(bob.local_key_pair.public_key)
+        bob.set_remote_key(alice.local_key_pair.public_key)
+
+        plaintext = b"Hello, this is a secret message!"
+        encrypted = alice.encrypt(plaintext)
+        decrypted = bob.decrypt(encrypted)
+
+        assert decrypted == plaintext
+
+    def test_encrypted_message_serialisation(self) -> None:
+        """EncryptedMessage encode/decode roundtrip."""
+        alice = E2EEncryption()
+        bob = E2EEncryption()
+        alice.set_remote_key(bob.local_key_pair.public_key)
+        bob.set_remote_key(alice.local_key_pair.public_key)
+
+        original = alice.encrypt(b"serialise me")
+        data = original.encode()
+        restored = EncryptedMessage.decode(data)
+
+        assert restored.ciphertext == original.ciphertext
+        assert restored.nonce == original.nonce
+        assert restored.sender_public_key == original.sender_public_key
+
+    def test_wrong_key_fails(self) -> None:
+        """Decrypting with a different key should raise an error."""
+        alice = E2EEncryption()
+        bob = E2EEncryption()
+        eve = E2EEncryption()
+
+        alice.set_remote_key(bob.local_key_pair.public_key)
+        bob.set_remote_key(alice.local_key_pair.public_key)
+
+        encrypted = alice.encrypt(b"secret")
+        # Eve tries to decrypt with her own key
+        eve.set_remote_key(alice.local_key_pair.public_key)
+
+        import nacl.exceptions
+        try:
+            eve.decrypt(encrypted)
+            assert False, "Should have raised CryptoError"
+        except nacl.exceptions.CryptoError:
+            pass  # expected
+
+    def test_key_rotation(self) -> None:
+        """After key rotation, old ciphertexts should not decrypt."""
+        alice = E2EEncryption()
+        bob = E2EEncryption()
+        alice.set_remote_key(bob.local_key_pair.public_key)
+        bob.set_remote_key(alice.local_key_pair.public_key)
+
+        encrypted = alice.encrypt(b"before rotation")
+
+        # Rotate keys and exchange new ones
+        alice.rotate_keys()
+        bob.set_remote_key(alice.local_key_pair.public_key)
+
+        # Old ciphertext should fail
+        import nacl.exceptions
+        try:
+            bob.decrypt(encrypted)
+            assert False, "Old key should not work after rotation"
+        except nacl.exceptions.CryptoError:
+            pass
+
+
+# ── Password hashing ──────────────────────────────────────────────────────
+
+
+class TestPasswordHashing:
+    def test_hash_and_verify(self) -> None:
+        h = hash_password("MySecurePass123!")
+        assert verify_password("MySecurePass123!", h)
+        assert not verify_password("WrongPassword", h)
+
+    def test_hash_format(self) -> None:
+        h = hash_password("test")
+        assert h.startswith("$argon2id$"), f"Unexpected format: {h[:20]}"
+
+    def test_session_id_format(self) -> None:
+        sid = generate_session_id()
+        assert len(sid) == 11  # "123 456 789"
+        assert sid.count(" ") == 2
+        parts = sid.split()
+        assert len(parts) == 3
+        assert all(len(p) == 3 for p in parts)
+        assert all(p.isdigit() for p in parts)
