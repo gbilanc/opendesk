@@ -202,7 +202,7 @@ class RelayServer:
                 Message(MessageType.RELAY_REGISTER, {"session_id": session_id}),
             )
             logger.info("Session created (legacy): %s for peer %s", session_id, peer.peer_id)
-            self._broadcast_device_list()
+            await self._broadcast_device_list()
             return
 
         host_id = self._sessions.get(session_id)
@@ -242,7 +242,7 @@ class RelayServer:
             Message(MessageType.RELAY_REGISTER, {"session_id": session_id, "mode": "host"}),
         )
         logger.info("Session registered: %s for peer %s", session_id, peer.peer_id)
-        self._broadcast_device_list()
+        await self._broadcast_device_list()
 
     async def _broadcast_device_list(self) -> None:
         """Send the current list of connected devices to all peers.
@@ -309,6 +309,13 @@ class RelayServer:
         peer = self._peers.pop(peer_id, None)
         if peer is None:
             return
+
+        # Close the TCP connection to free resources
+        try:
+            if peer.writer and not peer.writer.is_closing():
+                peer.writer.close()
+        except Exception:
+            pass
 
         # Remove from device registry if present
         was_device = False
