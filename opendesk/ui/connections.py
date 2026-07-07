@@ -95,7 +95,7 @@ class ConnectionDialog(QDialog):
     connection_requested = Signal(str, str)  # peer_id, password
 
     WIDTH = 420
-    HEIGHT = 280
+    HEIGHT = 340
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -111,8 +111,8 @@ class ConnectionDialog(QDialog):
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setSpacing(16)
-        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(12)
+        layout.setContentsMargins(24, 20, 24, 20)
 
         # ── Title ──
         title = QLabel("Remote Desktop Connection")
