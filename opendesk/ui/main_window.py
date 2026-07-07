@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from opendesk.core.keyboard_state import caps_lock_active
 from opendesk.core.screen_capture import ScreenCapture, CapturedFrame
 from opendesk.core.input_injection import (
     InputBackend,
@@ -55,6 +56,16 @@ class MainWindow(QMainWindow):
     WINDOW_TITLE = "OpenDesk"
     MIN_WIDTH = 1024
     MIN_HEIGHT = 680
+
+    # ── Caps Lock indicator styles ──
+    _CAPS_ON_STYLE = (
+        "font-size: 12px; font-weight: 700; color: #dc2626;"
+        " padding: 0 6px;"
+    )
+    _CAPS_OFF_STYLE = (
+        "font-size: 12px; font-weight: 600; color: #94a3b8;"
+        " padding: 0 6px;"
+    )
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -325,6 +336,16 @@ class MainWindow(QMainWindow):
         self._status_text = QLabel("Ready")
         self._status_text.setStyleSheet("font-size: 12px; color: #64748b;")
         status.addWidget(self._status_text, 1)
+
+        # ── Caps Lock indicator ──
+        self._caps_lock_label = QLabel("⇪")
+        self._caps_lock_label.setStyleSheet(MainWindow._CAPS_OFF_STYLE)
+        self._caps_lock_label.setVisible(False)
+        status.addPermanentWidget(self._caps_lock_label)
+
+        self._caps_timer = QTimer(self)
+        self._caps_timer.timeout.connect(self._update_caps_lock)
+        self._caps_timer.start(500)
 
         self.setStatusBar(status)
 
@@ -672,6 +693,16 @@ class MainWindow(QMainWindow):
         )
 
     # ── Internal ────────────────────────────────────────────────────
+
+    @Slot()
+    def _update_caps_lock(self) -> None:
+        """Poll Caps Lock state and update the status bar indicator."""
+        active = caps_lock_active()
+        if active:
+            self._caps_lock_label.setStyleSheet(MainWindow._CAPS_ON_STYLE)
+        else:
+            self._caps_lock_label.setStyleSheet(MainWindow._CAPS_OFF_STYLE)
+        self._caps_lock_label.setVisible(active)
 
     def _set_connected(self, connected: bool) -> None:
         """Update all UI state to reflect connection status."""
