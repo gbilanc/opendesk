@@ -102,22 +102,6 @@ QToolButton:disabled {
 }
 
 /* ── Buttons ── */
-QPushButton#PrimaryButton {
-    border: none;
-    background-color: #2563eb;
-    color: white;
-    font-weight: 600;
-}
-
-QPushButton#PrimaryButton:hover {
-    background-color: #1d4ed8;
-}
-
-QPushButton#PrimaryButton:disabled {
-    background-color: #475569;
-    color: #94a3b8;
-}
-
 QPushButton {
     padding: 8px 20px;
     border-radius: 8px;
@@ -142,6 +126,24 @@ QPushButton:disabled {
     color: #475569;
     background-color: #1e293b;
 }
+
+/* ── Primary ── */
+QPushButton[class="primary"] {
+    border: none;
+    background-color: #2563eb;
+    color: white;
+    font-weight: 600;
+}
+QPushButton[class="primary"]:hover { background-color: #1d4ed8; }
+QPushButton[class="primary"]:disabled { background-color: #475569; color: #94a3b8; }
+
+QPushButton[class="danger"] {
+    border: none;
+    background-color: #dc2626;
+    color: white;
+    font-weight: 600;
+}
+QPushButton[class="danger"]:hover { background-color: #b91c1c; }
 
 /* ── Input fields ── */
 QLineEdit, QTextEdit, QPlainTextEdit {

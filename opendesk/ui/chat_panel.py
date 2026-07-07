@@ -61,7 +61,7 @@ class ChatPanel(QDialog):
 
         self._send_btn = QPushButton("Send")
         self._send_btn.setEnabled(False)
-        self._send_btn.setObjectName("PrimaryButton")
+        self._send_btn.setProperty("class", "primary")
         self._send_btn.clicked.connect(self._send_message)
         input_layout.addWidget(self._send_btn)
 
