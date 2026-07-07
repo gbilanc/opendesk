@@ -95,7 +95,7 @@ class ConnectionDialog(QDialog):
     connection_requested = Signal(str, str)  # peer_id, password
 
     WIDTH = 420
-    HEIGHT = 340
+    HEIGHT = 380
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -137,6 +137,7 @@ class ConnectionDialog(QDialog):
 
         self._peer_id_input = QLineEdit()
         self._peer_id_input.setPlaceholderText("e.g. 123 456 789")
+        self._peer_id_input.setMinimumHeight(42)
         self._peer_id_input.setStyleSheet("""
             QLineEdit {
                 padding: 10px 14px;
@@ -156,6 +157,7 @@ class ConnectionDialog(QDialog):
         self._password_input = QLineEdit()
         self._password_input.setPlaceholderText("One-time password")
         self._password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self._password_input.setMinimumHeight(42)
         self._password_input.setStyleSheet("""
             QLineEdit {
                 padding: 10px 14px;
