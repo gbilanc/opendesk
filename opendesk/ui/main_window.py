@@ -350,7 +350,12 @@ class MainWindow(QMainWindow):
 
         self._esc_shortcut = QShortcut(QKeySequence("Escape"), self)
         self._esc_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
-        self._esc_shortcut.activated.connect(self._on_exit_fullscreen)
+        self._esc_shortcut.activated.connect(self._on_exit_fullscreen_in_viewer)
+
+    def _on_exit_fullscreen_in_viewer(self) -> None:
+        """Exit fullscreen in the viewer window if it's active."""
+        if self._viewer_window and self._viewer_window.isFullScreen():
+            self._viewer_window._toggle_fullscreen()
 
     def _setup_statusbar(self) -> None:
         """Configure the status bar."""
