@@ -9,7 +9,6 @@ real P2P relay networking.
 from __future__ import annotations
 
 import logging
-import threading
 import time
 
 import numpy as np
@@ -96,7 +95,6 @@ class MainWindow(QMainWindow):
 
         # Screen capture for hosting
         self._capture: ScreenCapture | None = None
-        self._capture_thread: threading.Thread | None = None
         self._capture_running = False
         self._input_backend: InputBackend | None = None
         self._encoder: VideoEncoder | None = None
