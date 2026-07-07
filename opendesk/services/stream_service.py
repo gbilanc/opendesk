@@ -87,6 +87,29 @@ class StreamService(QObject):
 
     # ── streaming lifecycle ─────────────────────────────────────────
 
+    def _lazy_init_encoder(self, width: int, height: int) -> bool:
+        """Create the encoder on first successful capture, if not already done."""
+        if self._encoder is not None:
+            return True
+        try:
+            fps = int(self._settings.value("video/max_fps", 30))
+            quality_name = self._settings.value("video/quality", "MEDIUM")
+            quality = getattr(QualityLevel, quality_name, QualityLevel.MEDIUM)
+            self._encoder = VideoEncoder(
+                EncoderConfig(
+                    width=width,
+                    height=height,
+                    fps=fps,
+                    bitrate=_QUALITY_BITRATE[quality],
+                    quality=quality,
+                )
+            )
+            logger.info("Encoder lazy-init: %dx%d @ %s", width, height, quality_name)
+            return True
+        except Exception as e:
+            logger.warning("Encoder init failed: %s", e)
+            return False
+
     def start_streaming(self) -> None:
         """Avvia la cattura schermo, encoding e streaming."""
         try:
@@ -110,21 +133,17 @@ class StreamService(QObject):
             quality_name = self._settings.value("video/quality", "MEDIUM")
             quality = getattr(QualityLevel, quality_name, QualityLevel.MEDIUM)
 
-            # Capture first frame for resolution, init encoder
+            # Capture first frame — if it succeeds, init encoder immediately
             first = self._capture.capture_one(0)
             if first is not None:
-                self._encoder = VideoEncoder(
-                    EncoderConfig(
-                        width=first.width,
-                        height=first.height,
-                        fps=fps,
-                        bitrate=_QUALITY_BITRATE[quality],
-                        quality=quality,
-                    )
+                self._lazy_init_encoder(first.width, first.height)
+            else:
+                logger.warning(
+                    "First capture returned None — encoder will be initialised "
+                    "lazily on the first successful capture"
                 )
-                logger.info("Encoder init: %dx%d @ %s", first.width, first.height, quality_name)
 
-            # Start timers
+            # Start timers (always, even if encoder not yet ready)
             self._stream_timer.start(int(1000 / fps))
             self._bw_timer.start(3000)
             logger.info("Streaming started at %d FPS", fps)
@@ -135,6 +154,8 @@ class StreamService(QObject):
 
     def stop_streaming(self) -> None:
         """Ferma cattura, encoding e timer."""
+        if not self._capture_running and self._capture is None and self._encoder is None:
+            return  # already stopped
         self._stream_timer.stop()
         self._bw_timer.stop()
         self._capture_running = False
@@ -170,8 +191,14 @@ class StreamService(QObject):
             return
         try:
             frame = self._capture.capture_one(0)
-            if frame is None or self._encoder is None:
+            if frame is None:
                 return
+
+            # Lazy encoder initialisation — if the first capture returned
+            # None, the encoder may not exist yet.  Create it now.
+            if self._encoder is None:
+                if not self._lazy_init_encoder(frame.width, frame.height):
+                    return
 
             pts = int(frame.timestamp * 1000)
             packets = self._encoder.encode(frame.data)

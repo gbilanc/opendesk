@@ -198,10 +198,19 @@ class RelayServer:
         # ── Device lookup (client wants to connect to a specific device) ──
         lookup_device = payload.get("lookup_device", "")
         if lookup_device and not session_id:
+            # Try device_id first, then fall back to session_id for
+            # manual connection flows where the user may have typed a
+            # session ID (e.g. "123456789") instead of a device UUID.
             target = self._devices.get(lookup_device)
+            if target is None:
+                # Fall back: resolve session_id → host peer
+                host_id = self._sessions.get(lookup_device)
+                if host_id is not None:
+                    target = self._peers.get(host_id)
+
             if target is not None and target.session_id \
                and target.writer and not target.writer.is_closing():
-                # Device is online — use its session to pair
+                # Device / session is online — pair with it
                 session_id = target.session_id
                 host_id = self._sessions.get(session_id)
                 if host_id and host_id != peer.peer_id:
@@ -221,20 +230,20 @@ class RelayServer:
                             Message(MessageType.RELAY_PEER_LIST, {"peers": [peer.peer_id]}),
                         )
                         logger.info(
-                            "Peers paired via device lookup %s: %s ↔ %s",
+                            "Peers paired via lookup %s: %s ↔ %s",
                             lookup_device, host_id, peer.peer_id,
                         )
                         return
 
-            # Device offline or not found
+            # Device / session offline or not found
             await self._send(
                 peer,
                 Message(MessageType.ERROR, {
                     "code": 404,
-                    "message": f"Device {lookup_device} offline or not found",
+                    "message": f"Device/session {lookup_device} offline or not found",
                 }),
             )
-            logger.info("Device lookup failed: %s", lookup_device)
+            logger.info("Lookup failed: %s", lookup_device)
             return
 
         # ── No session_id → auto-generate (legacy) ──

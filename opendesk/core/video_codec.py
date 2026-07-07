@@ -350,13 +350,13 @@ class VideoDecoder:
                     payload = self._buffer + data if self._buffer else data
                     self._buffer = b""
                 else:
-                    # Not (yet) a keyframe — buffer the data AND attempt
-                    # decode anyway.  If the data actually is a keyframe
-                    # (the caller may not know), decode will succeed and
-                    # clear _needs_keyframe.  If it fails, the data stays
-                    # buffered for the real keyframe.
+                    # Not (yet) a keyframe — buffer the data but do NOT
+                    # attempt decode yet.  Previously we tried to decode
+                    # the incomplete buffer anyway, which always failed
+                    # and caused reset() — discarding the accumulated
+                    # extradata.
                     self._buffer += data
-                    payload = self._buffer
+                    return None
             else:
                 payload = data
 
