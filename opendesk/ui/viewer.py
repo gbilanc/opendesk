@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 
 import numpy as np
 from PIL import Image
@@ -40,8 +41,10 @@ from PySide6.QtWidgets import (
     QGraphicsView,
     QHBoxLayout,
     QLabel,
+    QMainWindow,
     QPushButton,
     QSizePolicy,
+    QStatusBar,
     QToolBar,
     QVBoxLayout,
     QWidget,
@@ -515,3 +518,107 @@ class ViewerToolbar(QToolBar):
         disc_act.setToolTip("End current session")
         disc_act.triggered.connect(self.disconnect_requested)
         self.addAction(disc_act)
+
+
+# ---------------------------------------------------------------------------
+# ViewerWindow — standalone window for remote display
+# ---------------------------------------------------------------------------
+
+
+class ViewerWindow(QMainWindow):
+    """Stand-alone window that shows the remote desktop stream.
+
+    Created by MainWindow when a connection is established.
+    Contains a RemoteViewer as its central widget plus a toolbar
+    with zoom/fit/fullscreen controls and a disconnect button.
+    """
+
+    WINDOW_TITLE = "OpenDesk — Remote Desktop"
+    MIN_WIDTH = 800
+    MIN_HEIGHT = 600
+
+    def __init__(
+        self,
+        on_mouse_event: Callable | None = None,
+        on_key_event: Callable | None = None,
+        on_disconnect: Callable | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(self.WINDOW_TITLE)
+        self.setMinimumSize(self.MIN_WIDTH, self.MIN_HEIGHT)
+        self.resize(1280, 720)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+
+        self._on_disconnect_cb = on_disconnect
+
+        # ── Central viewer ──
+        self._viewer = RemoteViewer(self)
+        self.setCentralWidget(self._viewer)
+
+        # ── Toolbar ──
+        self._toolbar = ViewerToolbar(self)
+        self._toolbar.fullscreen_requested.connect(self._toggle_fullscreen)
+        self._toolbar.zoom_in_requested.connect(self._viewer.zoom_in)
+        self._toolbar.zoom_out_requested.connect(self._viewer.zoom_out)
+        self._toolbar.fit_requested.connect(self._viewer.zoom_to_fit)
+        self._toolbar.disconnect_requested.connect(self._on_disconnect_clicked)
+        self.addToolBar(self._toolbar)
+
+        # ── Status bar ──
+        self._status = QStatusBar(self)
+        self._status_label = QLabel("Connected")
+        self._status.addWidget(self._status_label)
+        self.setStatusBar(self._status)
+
+        # ── Connect signals → callbacks ──
+        if on_mouse_event:
+            self._viewer.remote_mouse_event.connect(on_mouse_event)
+        if on_key_event:
+            self._viewer.remote_key_event.connect(on_key_event)
+
+    # ── public API ──────────────────────────────────────────────────
+
+    @property
+    def viewer(self) -> RemoteViewer:
+        """The embedded RemoteViewer widget."""
+        return self._viewer
+
+    def display_frame(self, rgb_data: np.ndarray, width: int, height: int) -> None:
+        """Display a decoded frame in the viewer."""
+        self._viewer.display_frame(rgb_data, width, height)
+
+    def set_connection_active(self, active: bool, peer_name: str = "") -> None:
+        """Update UI state for connection status."""
+        self._viewer.set_connection_active(active)
+        if active and peer_name:
+            self._status_label.setText(f"Connected to {peer_name}")
+            self.setWindowTitle(f"OpenDesk — {peer_name}")
+        else:
+            self._status_label.setText("Disconnected")
+            self.setWindowTitle(self.WINDOW_TITLE)
+
+    # ── slots ───────────────────────────────────────────────────────
+
+    def _toggle_fullscreen(self) -> None:
+        """Toggle fullscreen on this window."""
+        if self.isFullScreen():
+            self.showNormal()
+            self._toolbar.show()
+            self._status.show()
+        else:
+            self.showFullScreen()
+            self._toolbar.hide()
+            self._status.hide()
+
+    def _on_disconnect_clicked(self) -> None:
+        """User clicked disconnect."""
+        if self._on_disconnect_cb:
+            self._on_disconnect_cb()
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        """If user closes the window, trigger disconnect."""
+        if self._on_disconnect_cb:
+            self._on_disconnect_cb()
+        self.hide()
+        event.ignore()

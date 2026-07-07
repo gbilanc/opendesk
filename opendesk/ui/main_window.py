@@ -47,7 +47,7 @@ from opendesk.ui.connections import ConnectionDialog, SessionStatusWidget
 from opendesk.ui.file_transfer_ui import FileTransferDock
 from opendesk.ui.session_info import SessionInfoWidget
 from opendesk.ui.settings_dialog import SettingsDialog
-from opendesk.ui.viewer import RemoteViewer, ViewerToolbar
+from opendesk.ui.viewer import ViewerWindow
 
 logger = logging.getLogger(__name__)
 
@@ -140,11 +140,13 @@ class MainWindow(QMainWindow):
         # Connection dialog reference (for updating device list)
         self._connection_dialog: ConnectionDialog | None = None
 
+        # Viewer window (separate window for remote desktop)
+        self._viewer_window: ViewerWindow | None = None
+
         # Build UI
         self._setup_actions()
         self._setup_menus()
         self._setup_toolbar()
-        self._setup_viewer_toolbar()
         self._setup_statusbar()
         self._setup_docks()
         self._setup_central_widget()
@@ -290,16 +292,6 @@ class MainWindow(QMainWindow):
 
         self.addToolBar(toolbar)
 
-    def _setup_viewer_toolbar(self) -> None:
-        """Create a secondary, context-sensitive toolbar for the viewer."""
-        self._viewer_toolbar = ViewerToolbar(self)
-        self._viewer_toolbar.fullscreen_requested.connect(self._on_toggle_fullscreen)
-        self._viewer_toolbar.zoom_in_requested.connect(self._on_zoom_in)
-        self._viewer_toolbar.zoom_out_requested.connect(self._on_zoom_out)
-        self._viewer_toolbar.fit_requested.connect(self._on_fit_view)
-        self._viewer_toolbar.disconnect_requested.connect(self._on_disconnect)
-        self.addToolBar(self._viewer_toolbar)
-
     def _setup_docks(self) -> None:
         """Create dock widgets (chat, file transfers)."""
         # ── Chat panel (right) ──
@@ -320,7 +312,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Session info bar (shows your ID + password like TeamViewer)
+        # Session info bar (shows your device ID + session)
         self._session_info = SessionInfoWidget(
             self._auth_manager,
             device_id=self._device_id,
@@ -338,12 +330,15 @@ class MainWindow(QMainWindow):
                 self._session_info.password,
             )
 
-        # The remote viewer
-        self._viewer = RemoteViewer(central)
-        self._viewer.fullscreen_toggled.connect(self._on_toggle_fullscreen)
-        self._viewer.remote_mouse_event.connect(self._on_remote_mouse_event)
-        self._viewer.remote_key_event.connect(self._on_remote_key_event)
-        layout.addWidget(self._viewer, 1)
+        # No embedded viewer — it opens in a separate ViewerWindow
+        # Placeholder label so the central area isn't empty
+        placeholder = QLabel(
+            "Usa Session → Connect per connetterti\n"
+            "a un dispositivo remoto."
+        )
+        placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        placeholder.setStyleSheet("font-size: 16px; color: #64748b;")
+        layout.addWidget(placeholder, 1)
 
         self.setCentralWidget(central)
 
@@ -463,7 +458,8 @@ class MainWindow(QMainWindow):
     @Slot(np.ndarray, int, int)
     def _on_frame_received(self, rgb_data: np.ndarray, width: int, height: int) -> None:
         """A video frame was received from the remote host (client only)."""
-        self._viewer.display_frame(rgb_data, width, height)
+        if self._viewer_window is not None:
+            self._viewer_window.display_frame(rgb_data, width, height)
 
     @Slot(object)
     def _on_relay_message(self, msg: Message) -> None:
@@ -549,12 +545,33 @@ class MainWindow(QMainWindow):
 
     # ── Screen capture and streaming (host) ─────────────────────────
 
+    def _show_viewer_window(self, peer_name: str = "") -> None:
+        """Create and show the remote viewer window."""
+        if self._viewer_window is None:
+            self._viewer_window = ViewerWindow(
+                on_mouse_event=self._on_remote_mouse_event,
+                on_key_event=self._on_remote_key_event,
+                on_disconnect=self._on_disconnect,
+                parent=self,
+            )
+        self._viewer_window.set_connection_active(True, peer_name)
+        self._viewer_window.show()
+        self._viewer_window.raise_()
+        self._viewer_window.activateWindow()
+
+    def _hide_viewer_window(self) -> None:
+        """Hide the remote viewer window."""
+        if self._viewer_window is not None:
+            self._viewer_window.set_connection_active(False)
+            self._viewer_window.hide()
+
     def _start_host_streaming(self) -> None:
         """Start screen capture and send frames to the client."""
         try:
             self._capture = ScreenCapture()
             self._input_backend = create_input_backend()
             self._set_connected(True)
+            self._show_viewer_window(peer_name="Host")
             self._status_text.setText("Streaming to remote client...")
 
             # Reset bandwidth estimator
@@ -751,6 +768,9 @@ class MainWindow(QMainWindow):
         host, port = self._get_relay_config()
         self._relay.join_session(host, port, clean_id, password)
 
+        # Show viewer window (will display frames once connected)
+        self._show_viewer_window(peer_name=peer_id)
+
     @Slot()
     def _on_disconnect(self) -> None:
         """Disconnect the current session."""
@@ -768,55 +788,27 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_toggle_fullscreen(self) -> None:
-        """Toggle fullscreen mode."""
-        if self._fullscreen:
-            self._on_exit_fullscreen()
-        else:
-            self._on_enter_fullscreen()
-
-    def _on_enter_fullscreen(self) -> None:
-        """Enter fullscreen."""
-        self._fullscreen = True
-        self.showFullScreen()
-        self.menuBar().hide()
-        self._session_info.hide()
-        self._viewer_toolbar.hide()
-        for tb in self.findChildren(QToolBar):
-            tb.hide()
-        self.act_fullscreen.setChecked(True)
-        self._status_text.setText("Fullscreen — press Esc or F11 to exit")
-
-    def _on_exit_fullscreen(self) -> None:
-        """Exit fullscreen and restore UI."""
-        if not self._fullscreen:
-            return
-        self._fullscreen = False
-        self.showNormal()
-        self.menuBar().show()
-        self._session_info.show()
-        self._viewer_toolbar.show()
-        for tb in self.findChildren(QToolBar):
-            tb.show()
-        self.act_fullscreen.setChecked(False)
-        if self._connected:
-            self._status_text.setText(f"Session active: {self._peer_id}")
-        else:
-            self._status_text.setText("Ready")
+        """Toggle fullscreen mode on the viewer window."""
+        if self._viewer_window:
+            self._viewer_window._toggle_fullscreen()
 
     @Slot()
     def _on_fit_view(self) -> None:
         """Fit the remote screen to the window."""
-        self._viewer.zoom_to_fit()
+        if self._viewer_window:
+            self._viewer_window.viewer.zoom_to_fit()
 
     @Slot()
     def _on_zoom_in(self) -> None:
         """Zoom into the remote screen."""
-        self._viewer.zoom_in()
+        if self._viewer_window:
+            self._viewer_window.viewer.zoom_in()
 
     @Slot()
     def _on_zoom_out(self) -> None:
         """Zoom out of the remote screen."""
-        self._viewer.zoom_out()
+        if self._viewer_window:
+            self._viewer_window.viewer.zoom_out()
 
     # ── Slots: tools ───────────────────────────────────────────────
 
@@ -833,7 +825,10 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_settings(self) -> None:
         """Open the settings dialog."""
-        dialog = SettingsDialog(self)
+        dialog = SettingsDialog(
+            device_registry=self._device_registry,
+            parent=self,
+        )
         dialog.exec()
 
     # ── Slots: window ──────────────────────────────────────────────
@@ -886,11 +881,16 @@ class MainWindow(QMainWindow):
     def _set_connected(self, connected: bool) -> None:
         """Update all UI state to reflect connection status."""
         self._connected = connected
-        self._viewer.set_connection_active(connected)
 
         # Enable/disable actions
         self.act_connect.setEnabled(not connected)
         self.act_disconnect.setEnabled(connected)
+
+        # Show/hide viewer window
+        if connected and self._viewer_window is None:
+            self._show_viewer_window()
+        elif not connected:
+            self._hide_viewer_window()
 
         # Update session status widget
         if connected:
