@@ -345,12 +345,22 @@ class ScreenCapture:
 
     def capture_one(self, monitor_index: int = 0) -> CapturedFrame:
         if self._method == CaptureMethod.PIPEWIRE:
-            f = self._get_pw().capture_one(monitor_index)
-            if f is not None:
-                return f
+            try:
+                f = self._get_pw().capture_one(monitor_index)
+                if f is not None:
+                    return f
+            except Exception as e:
+                logger.warning("PipeWire capture failed: %s", e)
             logger.warning("PipeWire failed, falling back to MSS")
             self._method = CaptureMethod.MSS
-        return self._capture_mss(monitor_index)
+        try:
+            return self._capture_mss(monitor_index)
+        except Exception as e:
+            raise RuntimeError(
+                f"Screen capture failed: {e}\n"
+                "On Wayland, install xdg-desktop-portal + PipeWire. "
+                "On X11, ensure the display is accessible."
+            ) from e
 
     # ── capture loop ────────────────────────────────────────────────
 
@@ -389,15 +399,24 @@ class ScreenCapture:
 
     def _capture_mss(self, monitor_index: int = 0) -> CapturedFrame:
         sct = self._get_sct()
-        mon = sct.monitors[monitor_index + 1]
-        raw = sct.grab(mon)
-        buf = np.frombuffer(raw.rgb, dtype=np.uint8).reshape(raw.height, raw.width, 3)
-        return CapturedFrame(
-            data=buf[:, :, :3],
-            monitor_index=monitor_index,
-            timestamp=time.time(),
-            region=(mon["left"], mon["top"], mon["width"], mon["height"]),
-        )
+        try:
+            mon = sct.monitors[monitor_index + 1]
+            raw = sct.grab(mon)
+            buf = np.frombuffer(raw.rgb, dtype=np.uint8).reshape(raw.height, raw.width, 3)
+            return CapturedFrame(
+                data=buf[:, :, :3],
+                monitor_index=monitor_index,
+                timestamp=time.time(),
+                region=(mon["left"], mon["top"], mon["width"], mon["height"]),
+            )
+        except Exception as e:
+            if "X11" in type(e).__name__ or "XProto" in type(e).__name__ or "X Error" in str(e):
+                raise RuntimeError(
+                    "Screen capture via X11 (MSS) failed on Wayland. "
+                    "Install xdg-desktop-portal and PipeWire for native Wayland capture, "
+                    "or run under X11."
+                ) from e
+            raise
 
     def _loop_mss(self, monitor_index: int = 0) -> Iterator[CapturedFrame]:
         sct = self._get_sct()
