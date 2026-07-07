@@ -137,6 +137,9 @@ class MainWindow(QMainWindow):
         # Device list from relay (cache)
         self._device_list_cache: list[dict] = []
 
+        # Connection dialog reference (for updating device list)
+        self._connection_dialog: ConnectionDialog | None = None
+
         # Build UI
         self._setup_actions()
         self._setup_menus()
@@ -721,9 +724,17 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_connect(self) -> None:
         """Open the connection dialog."""
-        dialog = ConnectionDialog(self)
-        dialog.connection_requested.connect(self._on_connection_requested)
-        dialog.exec()
+        self._connection_dialog = ConnectionDialog(
+            devices=self._device_registry.all(),
+            parent=self,
+        )
+        self._connection_dialog.connection_requested.connect(self._on_connection_requested)
+        self._connection_dialog.finished.connect(self._on_connection_dialog_finished)
+        self._connection_dialog.exec()
+
+    def _on_connection_dialog_finished(self) -> None:
+        """Clean up dialog reference."""
+        self._connection_dialog = None
 
     @Slot(str, str)
     def _on_connection_requested(self, peer_id: str, password: str) -> None:

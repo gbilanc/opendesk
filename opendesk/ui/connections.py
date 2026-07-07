@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from opendesk.core.device_registry import DeviceEntry
+
 from PySide6.QtCore import Qt, Signal, Slot, QSize
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
@@ -88,52 +90,72 @@ def _save_recent(connections: list[RecentConnection]) -> None:
 class ConnectionDialog(QDialog):
     """Dialog for connecting to a remote computer.
 
+    Shows a list of known devices from the relay (with online/offline
+    status) alongside the manual session ID / password form.
     Emits ``connection_requested(peer_id, password)`` when the user
     clicks "Connect".
     """
 
     connection_requested = Signal(str, str)  # peer_id, password
 
-    WIDTH = 420
-    HEIGHT = 380
+    WIDTH = 480
+    HEIGHT = 480
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        devices: list[DeviceEntry] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Connect to Remote Computer")
         self.setFixedSize(self.WIDTH, self.HEIGHT)
         self.setModal(True)
 
-        self._setup_ui()
+        self._devices: list[DeviceEntry] = devices or []
         self._recent = _load_recent()
+
+        self._setup_ui()
+        self._populate_device_list()
         self._populate_recent()
 
     # ── UI setup ────────────────────────────────────────────────────
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setSpacing(12)
-        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(8)
+        layout.setContentsMargins(20, 16, 20, 16)
 
         # ── Title ──
         title = QLabel("Remote Desktop Connection")
         title.setStyleSheet("font-size: 18px; font-weight: 700;")
         layout.addWidget(title)
 
-        subtitle = QLabel(
-            "Enter the remote computer's session ID and password."
+        # ── Device list (online/offline) ──
+        self._device_section_label = QLabel("Dispositivi conosciuti:")
+        self._device_section_label.setStyleSheet(
+            "font-size: 12px; font-weight: 600; margin-top: 4px;"
         )
-        subtitle.setStyleSheet("font-size: 13px;")
-        subtitle.setWordWrap(True)
-        layout.addWidget(subtitle)
+        layout.addWidget(self._device_section_label)
 
-        # ── Form ──
+        self._device_list = QListWidget()
+        self._device_list.setMaximumHeight(120)
+        self._device_list.itemClicked.connect(self._on_device_selected)
+        layout.addWidget(self._device_list)
+
+        # ── Separator ──
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("max-height: 1px; margin: 4px 0;")
+        layout.addWidget(sep)
+
+        # ── Manual form ──
         form = QFormLayout()
-        form.setSpacing(10)
+        form.setSpacing(8)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
         self._peer_id_input = QLineEdit()
         self._peer_id_input.setPlaceholderText("e.g. 123 456 789")
-        self._peer_id_input.setMinimumHeight(42)
+        self._peer_id_input.setMinimumHeight(38)
         self._peer_id_input.setStyleSheet("""
             font-size: 16px;
             font-weight: 600;
@@ -145,7 +167,7 @@ class ConnectionDialog(QDialog):
         self._password_input = QLineEdit()
         self._password_input.setPlaceholderText("One-time password")
         self._password_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self._password_input.setMinimumHeight(42)
+        self._password_input.setMinimumHeight(38)
         self._password_input.setStyleSheet("font-size: 14px;")
         self._password_input.returnPressed.connect(self._on_connect)
         self._password_input.textChanged.connect(self._on_input_changed)
@@ -170,12 +192,12 @@ class ConnectionDialog(QDialog):
         layout.addLayout(btn_layout)
 
         # ── Recent connections (compact) ──
-        self._recent_label = QLabel("Recent connections:")
-        self._recent_label.setStyleSheet("font-size: 12px; margin-top: 8px;")
+        self._recent_label = QLabel("Connessioni recenti:")
+        self._recent_label.setStyleSheet("font-size: 12px; margin-top: 4px;")
         layout.addWidget(self._recent_label)
 
         self._recent_list = QListWidget()
-        self._recent_list.setMaximumHeight(100)
+        self._recent_list.setMaximumHeight(80)
         self._recent_list.itemClicked.connect(self._on_recent_selected)
         layout.addWidget(self._recent_list)
 
@@ -211,6 +233,59 @@ class ConnectionDialog(QDialog):
         peer_id = item.data(Qt.ItemDataRole.UserRole)
         if peer_id:
             self._peer_id_input.setText(peer_id)
+            self._password_input.setFocus()
+
+    # ── device list ────────────────────────────────────────────────
+
+    def update_device_list(self, devices: list[DeviceEntry]) -> None:
+        """Update the displayed device list (called from MainWindow)."""
+        self._devices = devices
+        self._populate_device_list()
+
+    def _populate_device_list(self) -> None:
+        """Populate the device list with online/offline indicators."""
+        self._device_list.clear()
+
+        if not self._devices:
+            self._device_section_label.hide()
+            self._device_list.hide()
+            return
+
+        self._device_section_label.show()
+        self._device_list.show()
+
+        for dev in self._devices:
+            status = "🟢" if dev.online else "🔴"
+            display = f"{status}  {dev.device_name}"
+            if dev.online:
+                display += f"  (ID: {dev.session_id})"
+            else:
+                display += f"  — offline"
+
+            item = QListWidgetItem(display)
+            item.setData(Qt.ItemDataRole.UserRole, dev.device_id)
+            item.setData(Qt.ItemDataRole.UserRole + 1, dev.session_id)  # session_id
+            item.setData(Qt.ItemDataRole.UserRole + 2, dev.trusted)  # trusted
+
+            if dev.trusted:
+                item.setToolTip("Dispositivo pre-autorizzato — connessione senza password")
+
+            self._device_list.addItem(item)
+
+    @Slot(QListWidgetItem)
+    def _on_device_selected(self, item: QListWidgetItem) -> None:
+        """Fill the form from a selected device."""
+        session_id = item.data(Qt.ItemDataRole.UserRole + 1) or ""
+        trusted = item.data(Qt.ItemDataRole.UserRole + 2) or False
+
+        self._peer_id_input.setText(session_id)
+
+        if trusted:
+            # Auto-connect for pre-authorized devices
+            # Use a fixed/blank password — the relay will handle it
+            self._password_input.setText("pre-authorized")
+            self._on_connect()
+        else:
             self._password_input.setFocus()
 
     # ── recent connections ──────────────────────────────────────────
