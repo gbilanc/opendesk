@@ -168,6 +168,7 @@ class ConnectionDialog(QDialog):
             }
         """)
         self._password_input.returnPressed.connect(self._on_connect)
+        self._password_input.textChanged.connect(self._on_input_changed)
         form.addRow("Password:", self._password_input)
 
         layout.addLayout(form)

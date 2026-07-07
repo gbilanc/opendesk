@@ -2,17 +2,23 @@
 Main application window.
 
 Orchestrates the remote viewer, connection manager, toolbars,
-and status bar.  Manages the overall connection lifecycle.
+and status bar.  Manages the overall connection lifecycle with
+real P2P relay networking.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
+import time
 
-from PySide6.QtCore import QSize, Qt, Slot
+import numpy as np
+
+from PySide6.QtCore import QObject, QSettings, QSize, Qt, QTimer, Slot
 from PySide6.QtGui import QAction, QCloseEvent, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
+    QLabel,
     QMainWindow,
     QMessageBox,
     QStatusBar,
@@ -21,7 +27,18 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from opendesk.core.screen_capture import ScreenCapture, CapturedFrame
+from opendesk.core.input_injection import (
+    InputBackend,
+    MouseButton,
+    KeyState,
+    MouseEvent,
+    KeyboardEvent,
+    create_input_backend,
+)
 from opendesk.crypto.auth import AuthManager
+from opendesk.network.protocol import Message, MessageType
+from opendesk.network.relay_client import RelayClient, RelayRole
 from opendesk.ui.chat_panel import ChatPanel
 from opendesk.ui.connections import ConnectionDialog, SessionStatusWidget
 from opendesk.ui.file_transfer_ui import FileTransferDock
@@ -48,10 +65,35 @@ class MainWindow(QMainWindow):
         # Application state
         self._connected: bool = False
         self._fullscreen: bool = False
-        self._peer_id: str = ""
+        self._peer_id: str = ""  # remote session ID when acting as client
+        self._host_session_id: str = ""  # our own session ID when hosting
 
         # Session management
         self._auth_manager = AuthManager()
+
+        # Relay / P2P networking
+        self._relay = RelayClient(self)
+        self._relay.connected.connect(self._on_relay_connected)
+        self._relay.disconnected.connect(self._on_relay_disconnected)
+        self._relay.peer_joined.connect(self._on_peer_joined)
+        self._relay.auth_requested.connect(self._on_auth_requested)
+        self._relay.auth_result.connect(self._on_auth_result)
+        self._relay.frame_received.connect(self._on_frame_received)
+        self._relay.message_received.connect(self._on_relay_message)
+        self._relay.error.connect(self._on_relay_error)
+
+        # Screen capture for hosting
+        self._capture: ScreenCapture | None = None
+        self._capture_thread: threading.Thread | None = None
+        self._capture_running = False
+        self._input_backend: InputBackend | None = None
+
+        # Streaming timer (host): polls screen capture at target FPS
+        self._stream_timer = QTimer(self)
+        self._stream_timer.timeout.connect(self._capture_and_send_frame)
+
+        # Settings
+        self._settings = QSettings("OpenDesk", "OpenDesk")
 
         # Build UI
         self._setup_actions()
@@ -192,8 +234,8 @@ class MainWindow(QMainWindow):
             }
         """)
 
-        self.act_connect_tb = toolbar.addAction(self.act_connect)
-        self.act_disconnect_tb = toolbar.addAction(self.act_disconnect)
+        toolbar.addAction(self.act_connect)
+        toolbar.addAction(self.act_disconnect)
         toolbar.addSeparator()
         toolbar.addAction(self.act_fit)
         toolbar.addAction(self.act_zoom_in)
@@ -224,7 +266,6 @@ class MainWindow(QMainWindow):
         self._transfer_dock = FileTransferDock(self)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._transfer_dock)
 
-        # Tabify file transfers with chat if they share the same area
         self.tabifyDockWidget(self._chat_panel, self._transfer_dock)
 
     def _setup_central_widget(self) -> None:
@@ -236,27 +277,31 @@ class MainWindow(QMainWindow):
 
         # Session info bar (shows your ID + password like TeamViewer)
         self._session_info = SessionInfoWidget(self._auth_manager, central)
+        self._session_info.session_refreshed.connect(self._on_session_refreshed)
         layout.addWidget(self._session_info)
+
+        # session_refreshed was already emitted in __init__, catch up
+        if self._session_info.session_id and self._session_info.password:
+            self._on_session_refreshed(
+                self._session_info.session_id,
+                self._session_info.password,
+            )
 
         # The remote viewer
         self._viewer = RemoteViewer(central)
         self._viewer.fullscreen_toggled.connect(self._on_toggle_fullscreen)
+        self._viewer.remote_mouse_event.connect(self._on_remote_mouse_event)
+        self._viewer.remote_key_event.connect(self._on_remote_key_event)
         layout.addWidget(self._viewer, 1)
 
         self.setCentralWidget(central)
 
     def _setup_fullscreen_shortcuts(self) -> None:
-        """Register global shortcuts that work even in fullscreen.
-
-        F11 and Escape must work when menu/toolbar are hidden.
-        QShortcut with Qt.ApplicationShortcut context ensures this.
-        """
-        # F11 toggle fullscreen (global, works even in fullscreen)
+        """Register global shortcuts that work even in fullscreen."""
         self._fs_shortcut = QShortcut(QKeySequence("F11"), self)
         self._fs_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self._fs_shortcut.activated.connect(self._on_toggle_fullscreen)
 
-        # Escape to exit fullscreen
         self._esc_shortcut = QShortcut(QKeySequence("Escape"), self)
         self._esc_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self._esc_shortcut.activated.connect(self._on_exit_fullscreen)
@@ -277,13 +322,207 @@ class MainWindow(QMainWindow):
         self._session_status = SessionStatusWidget()
         status.addPermanentWidget(self._session_status)
 
-        self._status_label = QWidget()  # left-side status text
-        from PySide6.QtWidgets import QLabel
         self._status_text = QLabel("Ready")
         self._status_text.setStyleSheet("font-size: 12px; color: #64748b;")
         status.addWidget(self._status_text, 1)
 
         self.setStatusBar(status)
+
+    # ── Relay / Networking ──────────────────────────────────────────
+
+    def _get_relay_config(self) -> tuple[str, int]:
+        """Read relay host and port from saved settings."""
+        host = self._settings.value("network/relay_host", "")
+        port = int(self._settings.value("network/relay_port", 8474))
+        # Default to localhost if not configured
+        if not host:
+            host = "127.0.0.1"
+        return host, port
+
+    @Slot(str, str)
+    def _on_session_refreshed(self, session_id: str, password: str) -> None:
+        """Called when a new local session is created — start hosting on relay."""
+        self._host_session_id = session_id.replace(" ", "")  # strip spaces from ID
+        host, port = self._get_relay_config()
+        logger.info(
+            "Starting host on relay %s:%s with session %s", host, port, session_id
+        )
+        self._status_text.setText(f"Hosting: {session_id}")
+        self._relay.start_hosting(host, port, self._host_session_id, password)
+
+    @Slot(str, str)
+    def _on_relay_connected(self, role: str, session_id: str) -> None:
+        """Relay connection established."""
+        logger.info("Relay connected as %s: %s", role, session_id)
+        if role == "host":
+            self._status_text.setText(f"Waiting for connection... (ID: {session_id})")
+        elif role == "client":
+            self._status_text.setText(f"Connected to {session_id}, authenticating...")
+
+    @Slot()
+    def _on_relay_disconnected(self) -> None:
+        """Relay connection lost."""
+        logger.info("Relay disconnected")
+        self._stop_streaming()
+        if self._connected:
+            self._set_connected(False)
+            self._status_text.setText("Disconnected")
+            self._peer_id = ""
+
+    @Slot()
+    def _on_peer_joined(self) -> None:
+        """A remote peer joined our session (host only)."""
+        logger.info("Remote peer joined our session")
+        self._status_text.setText("Authenticating remote peer...")
+
+    @Slot()
+    def _on_auth_requested(self) -> None:
+        """Authentication was requested by host (client only)."""
+        logger.debug("Auth requested by host")
+
+    @Slot(bool, str)
+    def _on_auth_result(self, success: bool, message: str) -> None:
+        """Authentication result."""
+        if success:
+            logger.info("Authentication successful")
+            self._status_text.setText("Authentication successful")
+            if self._relay.role == RelayRole.HOST:
+                # Host: start screen capture and streaming
+                self._start_host_streaming()
+            else:
+                # Client: connected, waiting for video
+                self._set_connected(True)
+                self._status_text.setText(f"Session active: {self._peer_id}")
+        else:
+            logger.warning("Authentication failed: %s", message)
+            QMessageBox.warning(
+                self, "Authentication Failed",
+                f"Failed to authenticate with the remote computer:\n{message}",
+            )
+            self._relay.disconnect()
+
+    @Slot(np.ndarray, int, int)
+    def _on_frame_received(self, rgb_data: np.ndarray, width: int, height: int) -> None:
+        """A video frame was received from the remote host (client only)."""
+        self._viewer.display_frame(rgb_data, width, height)
+
+    @Slot(object)
+    def _on_relay_message(self, msg: Message) -> None:
+        """Handle an incoming relay message."""
+        # Route messages from remote peer
+        if msg.type == MessageType.MOUSE_EVENT and self._input_backend:
+            self._inject_mouse(msg)
+        elif msg.type == MessageType.KEYBOARD_EVENT and self._input_backend:
+            self._inject_keyboard(msg)
+        elif msg.type == MessageType.CHAT_MESSAGE:
+            text = msg.payload.get("text", "")
+            self._chat_panel.add_message("Remote", text, is_remote=True)
+        elif msg.type == MessageType.DISCONNECT:
+            self._on_disconnect()
+
+    @Slot(str)
+    def _on_relay_error(self, error_msg: str) -> None:
+        """Relay error occurred."""
+        logger.error("Relay error: %s", error_msg)
+        QMessageBox.critical(self, "Connection Error", error_msg)
+        self._on_disconnect()
+
+    # ── Screen capture and streaming (host) ─────────────────────────
+
+    def _start_host_streaming(self) -> None:
+        """Start screen capture and send frames to the client."""
+        try:
+            self._capture = ScreenCapture()
+            self._input_backend = create_input_backend()
+            self._set_connected(True)
+            self._status_text.setText("Streaming to remote client...")
+
+            # Start streaming timer at target FPS
+            fps = int(self._settings.value("video/max_fps", 30))
+            self._stream_timer.start(int(1000 / fps))
+            self._capture_running = True
+            logger.info("Screen capture started at %d FPS", fps)
+        except Exception as e:
+            logger.exception("Failed to start screen capture: %s", e)
+            QMessageBox.critical(
+                self, "Capture Error",
+                f"Failed to start screen capture:\n{e}",
+            )
+            self._on_disconnect()
+
+    def _stop_streaming(self) -> None:
+        """Stop screen capture and streaming."""
+        self._stream_timer.stop()
+        self._capture_running = False
+        if self._capture:
+            self._capture.release()
+            self._capture = None
+        if self._input_backend:
+            self._input_backend.release()
+            self._input_backend = None
+
+    @Slot()
+    def _capture_and_send_frame(self) -> None:
+        """Capture a single frame and send it via relay (called by timer)."""
+        if not self._capture_running or self._capture is None:
+            return
+        try:
+            frame = self._capture.capture_one(0)
+            if frame is not None:
+                self._relay.send_frame(
+                    frame.data, frame.width, frame.height,
+                    int(frame.timestamp * 1000),
+                )
+        except Exception as e:
+            logger.warning("Capture error: %s", e)
+
+    # ── Input injection (host) ──────────────────────────────────────
+
+    def _inject_mouse(self, msg: Message) -> None:
+        """Inject a mouse event from the remote client."""
+        if self._input_backend is None:
+            return
+        payload = msg.payload
+        x = payload.get("x", 0)
+        y = payload.get("y", 0)
+        button = payload.get("button")
+        pressed = payload.get("pressed")
+        absolute = payload.get("absolute", True)
+
+        if button is not None:
+            btn = MouseButton(button)
+            state = KeyState.PRESSED if pressed else KeyState.RELEASED
+            self._input_backend.move_mouse(x, y, absolute)
+            self._input_backend.click_mouse(btn, state)
+        else:
+            self._input_backend.move_mouse(x, y, absolute)
+
+    def _inject_keyboard(self, msg: Message) -> None:
+        """Inject a keyboard event from the remote client."""
+        if self._input_backend is None:
+            return
+        payload = msg.payload
+        key = payload.get("key", "")
+        pressed = payload.get("pressed", False)
+        state = KeyState.PRESSED if pressed else KeyState.RELEASED
+        if key:
+            self._input_backend.key_event(key, state)
+
+    # ── Input forwarding (client) ───────────────────────────────────
+
+    @Slot(int, int, int, bool, bool)
+    def _on_remote_mouse_event(
+        self, x: int, y: int, button: int, pressed: bool, absolute: bool
+    ) -> None:
+        """Forward a local mouse event to the remote host."""
+        if self._relay.is_connected and self._relay.role == RelayRole.CLIENT:
+            self._relay.send_mouse_event(x, y, button, pressed, absolute)
+
+    @Slot(str, bool)
+    def _on_remote_key_event(self, key: str, pressed: bool) -> None:
+        """Forward a local keyboard event to the remote host."""
+        if self._relay.is_connected and self._relay.role == RelayRole.CLIENT:
+            self._relay.send_key_event(key, pressed)
 
     # ── Slots: session ──────────────────────────────────────────────
 
@@ -296,29 +535,34 @@ class MainWindow(QMainWindow):
 
     @Slot(str, str)
     def _on_connection_requested(self, peer_id: str, password: str) -> None:
-        """Handle a connection request from the dialog."""
+        """Handle a connection request from the dialog.
+
+        Connects to the relay as a client and joins the remote session.
+        """
         logger.info("Connection requested: peer=%s", peer_id)
         self._peer_id = peer_id
         self._status_text.setText(f"Connecting to {peer_id}...")
 
-        # TODO: wire up actual P2P connection
-        # For now, simulate connection
-        self._set_connected(True)
+        # Normalise session ID (remove spaces)
+        clean_id = peer_id.replace(" ", "")
+        host, port = self._get_relay_config()
+        self._relay.join_session(host, port, clean_id, password)
 
     @Slot()
     def _on_disconnect(self) -> None:
         """Disconnect the current session."""
-        if not self._connected:
+        if not self._connected and not self._relay.is_connected:
             return
 
         logger.info("Disconnecting session: %s", self._peer_id)
+        self._stop_streaming()
+        self._relay.disconnect()
         self._set_connected(False)
         self._status_text.setText("Disconnected")
         self._peer_id = ""
 
     # ── Slots: view ─────────────────────────────────────────────────
 
-    @Slot()
     @Slot()
     def _on_toggle_fullscreen(self) -> None:
         """Toggle fullscreen mode."""
@@ -405,7 +649,8 @@ class MainWindow(QMainWindow):
     def _on_chat_message_sent(self, text: str) -> None:
         """Handle a chat message sent by the local user."""
         logger.debug("Chat message sent: %s", text)
-        # TODO: send via P2P connection
+        if self._relay.is_connected:
+            self._relay.send_message(Message.chat_message(text))
 
     # ── Slots: help ─────────────────────────────────────────────────
 
@@ -433,16 +678,14 @@ class MainWindow(QMainWindow):
         # Enable/disable actions
         self.act_connect.setEnabled(not connected)
         self.act_disconnect.setEnabled(connected)
-        self.act_connect_tb.setEnabled(not connected)
-        self.act_disconnect_tb.setEnabled(connected)
 
         # Update session status widget
         if connected:
+            display_id = self._peer_id or self._host_session_id
             self._session_status.set_status(
-                f"Connected to {self._peer_id}", connected=True
+                f"Connected to {display_id}", connected=True
             )
-            self._status_text.setText(f"Session active: {self._peer_id}")
-            self.setWindowTitle(f"OpenDesk — {self._peer_id}")
+            self.setWindowTitle(f"OpenDesk — {display_id}")
         else:
             self._session_status.set_status("Disconnected")
             self._status_text.setText("Ready")
@@ -461,5 +704,7 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
 
+        self._stop_streaming()
+        self._relay.disconnect()
         logger.info("Application closing")
         event.accept()

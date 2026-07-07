@@ -176,10 +176,7 @@ class RemoteViewer(QGraphicsView):
     def set_connection_active(self, active: bool) -> None:
         """Mark connection state for UI updates."""
         self._connection_active = active
-        if active:
-            self._show_placeholder()
-        else:
-            self._show_placeholder()
+        self._show_placeholder()
 
     # ── Zoom / Fit ──────────────────────────────────────────────────
 

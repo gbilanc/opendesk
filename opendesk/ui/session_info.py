@@ -184,6 +184,16 @@ class SessionInfoWidget(QWidget):
             }
         """
 
+    # ── Properties ──────────────────────────────────────────────────
+
+    @property
+    def session_id(self) -> str:
+        return self._session_id
+
+    @property
+    def password(self) -> str:
+        return self._password
+
     # ── Session lifecycle ───────────────────────────────────────────
 
     @Slot()

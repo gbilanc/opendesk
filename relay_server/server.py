@@ -167,12 +167,17 @@ class RelayServer:
     # ── message routing ─────────────────────────────────────────────
 
     async def _handle_register(self, peer: RelayPeer, payload: dict) -> None:
-        """Register a peer with a session ID."""
+        """Register a peer with a session ID.
+
+        - Empty session_id: relay generates a new one (legacy mode).
+        - Existing session_id: join as client, pair with host.
+        - New session_id: register as host for that session_id.
+        """
         from opendesk.network.protocol import Message, MessageType
 
         session_id = payload.get("session_id", "")
         if not session_id:
-            # Create a new session
+            # Legacy: relay generates session_id
             session_id = generate_session_id()
             self._sessions[session_id] = peer.peer_id
             peer.session_id = session_id
@@ -180,40 +185,46 @@ class RelayServer:
                 peer,
                 Message(MessageType.RELAY_REGISTER, {"session_id": session_id}),
             )
-            logger.info("Session created: %s for peer %s", session_id, peer.peer_id)
+            logger.info("Session created (legacy): %s for peer %s", session_id, peer.peer_id)
             return
 
-        # Join an existing session
         host_id = self._sessions.get(session_id)
-        if host_id is None:
+        if host_id is not None:
+            # Session exists → join as client
+            host_peer = self._peers.get(host_id)
+            if host_peer is None:
+                del self._sessions[session_id]
+                await self._send(
+                    peer,
+                    Message(MessageType.RELAY_REGISTER, {"session_id": session_id, "mode": "host"}),
+                )
+                return
+
+            # Pair the peers
+            peer.session_id = session_id
+            peer.paired_peer_id = host_id
+            host_peer.paired_peer_id = peer.peer_id
+
             await self._send(
                 peer,
-                Message(MessageType.ERROR, {"code": 404, "message": "Session not found"}),
+                Message(MessageType.RELAY_REGISTER,
+                        {"session_id": session_id, "paired": True, "mode": "client"}),
             )
-            return
-
-        host_peer = self._peers.get(host_id)
-        if host_peer is None:
             await self._send(
-                peer,
-                Message(MessageType.ERROR, {"code": 410, "message": "Host disconnected"}),
+                host_peer,
+                Message(MessageType.RELAY_PEER_LIST, {"peers": [peer.peer_id]}),
             )
+            logger.info("Peers paired in session %s: %s ↔ %s", session_id, host_id, peer.peer_id)
             return
 
-        # Pair the peers
+        # New session → register as host with this session_id
+        self._sessions[session_id] = peer.peer_id
         peer.session_id = session_id
-        peer.paired_peer_id = host_id
-        host_peer.paired_peer_id = peer.peer_id
-
         await self._send(
             peer,
-            Message(MessageType.RELAY_REGISTER, {"session_id": session_id, "paired": True}),
+            Message(MessageType.RELAY_REGISTER, {"session_id": session_id, "mode": "host"}),
         )
-        await self._send(
-            host_peer,
-            Message(MessageType.RELAY_PEER_LIST, {"peers": [peer.peer_id]}),
-        )
-        logger.info("Peers paired in session %s: %s ↔ %s", session_id, host_id, peer.peer_id)
+        logger.info("Session registered: %s for peer %s", session_id, peer.peer_id)
 
     async def _handle_route(self, peer: RelayPeer, payload: dict) -> None:
         """Forward a message to the paired peer."""
