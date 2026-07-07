@@ -212,6 +212,10 @@ class _RelaySession:
                     await self._send_async(Message.auth_fail("Invalid password"))
                     self.inbox.put(("auth_result", (False, "Invalid password"), self.session_seq))
 
+            elif t == MessageType.VIDEO_REQUEST_KEYFRAME:
+                logger.debug("Peer requested keyframe (host)")
+                self.inbox.put(("keyframe_requested", None, self.session_seq))
+
             elif t == MessageType.DISCONNECT:
                 break
 
@@ -277,23 +281,48 @@ class _RelaySession:
                 width = payload.get("width", 0)
                 height = payload.get("height", 0)
                 data = payload.get("data")
-                keyframe = payload.get("keyframe", False)
+                is_keyframe = payload.get("keyframe", False)
                 logger.debug(
                     "VIDEO_FRAME received: %dx%d, keyframe=%s, data_len=%d",
-                    width, height, keyframe, len(data) if data else 0,
+                    width, height, is_keyframe, len(data) if data else 0,
                 )
                 if data and width > 0 and height > 0:
                     if self._decoder is None:
                         self._decoder = VideoDecoder()
                     try:
-                        rgb = self._decoder.decode(data, width, height)
+                        rgb = self._decoder.decode(
+                            data, width, height, is_keyframe=is_keyframe,
+                        )
                         if rgb is not None:
-                            self.inbox.put(("frame", (rgb.copy(), width, height), self.session_seq))
-                            logger.debug("Frame decoded successfully: %dx%d", width, height)
+                            self.inbox.put(
+                                ("frame", (rgb.copy(), width, height), self.session_seq),
+                            )
+                            logger.debug(
+                                "Frame decoded successfully: %dx%d", width, height,
+                            )
                         else:
-                            logger.warning("Frame decode returned None — decoder not ready yet")
+                            logger.warning(
+                                "Frame decode returned None%s",
+                                " — decoder not ready yet" if not is_keyframe else "",
+                            )
+                            # If we're getting non-keyframes without a prior
+                            # keyframe, ask the host to send one.
+                            if not is_keyframe and self._decoder is not None:
+                                self._decoder.reset()
+                                await self._send_async(
+                                    Message(MessageType.VIDEO_REQUEST_KEYFRAME, {}),
+                                )
                     except Exception as e:
                         logger.exception("Frame decode error: %s", e)
+                        self._decoder.reset()
+                        await self._send_async(
+                            Message(MessageType.VIDEO_REQUEST_KEYFRAME, {}),
+                        )
+            elif t == MessageType.VIDEO_REQUEST_KEYFRAME:
+                logger.debug("Keyframe requested by peer")
+                # Forward to host via inbox so the StreamService can
+                # force a keyframe on the encoder.
+                self.inbox.put(("keyframe_requested", None, self.session_seq))
 
             elif t == MessageType.ERROR:
                 err = msg.payload.get("message", "Unknown relay error")
@@ -353,6 +382,7 @@ class RelayClient(QObject):
     message_received = Signal(object)  # Message
     error = Signal(str)
     device_list_received = Signal(list)  # list[dict] — devices from relay
+    keyframe_requested = Signal()  # remote peer needs a keyframe
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -494,5 +524,7 @@ class RelayClient(QObject):
                 self.message_received.emit(data)
             elif event == "error":
                 self.error.emit(data)
+            elif event == "keyframe_requested":
+                self.keyframe_requested.emit()
             elif event == "device_list":
                 self.device_list_received.emit(data)

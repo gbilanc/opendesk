@@ -68,6 +68,9 @@ class StreamService(QObject):
         self._bw_measure_time: float = 0.0
         self._bw_estimated_kbps: float = 0.0
 
+        # React when the remote peer requests a keyframe
+        self._relay.keyframe_requested.connect(self._force_keyframe)
+
     # ── properties ──────────────────────────────────────────────────
 
     @property
@@ -146,6 +149,17 @@ class StreamService(QObject):
             self._input_backend = None
         self._bw_measure_bytes = 0
         logger.info("Streaming stopped")
+
+    @Slot()
+    def _force_keyframe(self) -> None:
+        """Force the next video frame to be a keyframe (IDR).
+
+        Called when the remote peer signals that it needs a fresh
+        keyframe to re-sync the video decoder.
+        """
+        if self._encoder is not None:
+            self._encoder.request_keyframe()
+            logger.info("Forcing keyframe on next encode per peer request")
 
     # ── capture / encoder ───────────────────────────────────────────
 

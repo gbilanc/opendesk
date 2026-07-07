@@ -90,6 +90,7 @@ class VideoEncoder:
         self._pts: int = 0
         self._initialised = False
         self._actual_bitrate: int = self._config.bitrate
+        self._force_next_keyframe: bool = False
 
     # ── properties ──────────────────────────────────────────────────
 
@@ -127,10 +128,15 @@ class VideoEncoder:
         Returns
         -------
         list[EncodedPacket]
-            Encoded packets (usually 1, but can be multiple per frame).
+            Encoded packets. On the first call, the encoder also emits
+            SPS/PPS extradata; we merge those into the first keyframe
+            packet so the receiver always gets a complete decodable unit.
         """
         self._ensure_initialised(frame.shape[1], frame.shape[0])
-        packets: list[EncodedPacket] = []
+
+        # Force keyframe on the very first frame
+        force_keyframe = self._pts == 0 or self._force_next_keyframe
+        self._force_next_keyframe = False
 
         # Convert RGB → YUV420P
         yuv = self._rgb_to_yuv(frame)
@@ -138,10 +144,30 @@ class VideoEncoder:
         # Create a VideoFrame from the YUV planes
         av_frame = self._make_av_frame(yuv)
 
-        for packet in self._stream.encode(av_frame):
-            packets.append(self._packet_from_av(packet))
+        if force_keyframe:
+            av_frame.pict_type = 1  # PictureType.I (IDR / keyframe)
 
-        return packets
+        raw_packets = list(self._stream.encode(av_frame))
+        if not raw_packets:
+            return []
+
+        # PyAV may emit multiple packets for one input frame
+        # (e.g. SPS/PPS + IDR on the first keyframe).
+        # Combine them into one so the receiver never sees
+        # a partial / undecodable H.264 payload.
+        if len(raw_packets) > 1:
+            has_keyframe = any(p.is_keyframe for p in raw_packets)
+            combined = b"".join(bytes(p) for p in raw_packets)
+            last = raw_packets[-1]
+            return [EncodedPacket(
+                data=combined,
+                pts=last.pts or 0,
+                is_keyframe=has_keyframe,
+                width=self._config.width,
+                height=self._config.height,
+            )]
+
+        return [self._packet_from_av(raw_packets[0])]
 
     def flush(self) -> list[EncodedPacket]:
         """Flush remaining packets from the encoder.
@@ -156,8 +182,7 @@ class VideoEncoder:
 
     def request_keyframe(self) -> None:
         """Force the next frame to be a keyframe."""
-        if self._stream is not None:
-            self._stream.codec_context.force_keyframe = True
+        self._force_next_keyframe = True
 
     def release(self) -> None:
         """Release encoder resources."""
@@ -268,24 +293,42 @@ class VideoEncoder:
 class VideoDecoder:
     """H.264 decoder wrapping PyAV.
 
-    Uses an in-memory ``av.open`` with a raw H.264 demuxer
-    to properly handle Annex-B byte-stream (start codes).
-    This is more robust than a bare ``CodecContext`` because
-    the demuxer provides the necessary extradata (SPS/PPS)
-    to the decoder.
+    Buffers pre-keyframe data (SPS/PPS extradata) until a keyframe
+    arrives, then feeds the complete bitstream to the decoder.
+    Recovers from decoder errors by recreating the codec context.
 
     Usage::
 
         dec = VideoDecoder()
-        frame = dec.decode(packet.data, packet.width, packet.height)
+        frame = dec.decode(packet.data, packet.width, packet.height, is_keyframe)
     """
 
     def __init__(self) -> None:
         self._codec: Any = None  # noqa: ANN401
         self._lock = Lock()
+        # Track decoder initialisation state
+        self._needs_keyframe = True
+        # Buffer for SPS/PPS / extradata received before the first keyframe
+        self._buffer = b""
 
-    def decode(self, data: bytes, width: int, height: int) -> np.ndarray | None:
+    def decode(
+        self,
+        data: bytes,
+        width: int,
+        height: int,
+        is_keyframe: bool = False,
+    ) -> np.ndarray | None:
         """Decode an H.264 packet into an RGB numpy array.
+
+        Parameters
+        ----------
+        data : bytes
+            Raw H.264 packet data (Annex B byte-stream).
+        width, height : int
+            Frame dimensions (for array allocation).
+        is_keyframe : bool
+            Whether the packet is a keyframe (IDR).  The decoder uses
+            this to decide whether to attempt decode or buffer.
 
         Returns
         -------
@@ -296,11 +339,25 @@ class VideoDecoder:
         import io
 
         with self._lock:
+            # ── Determine whether we can attempt decode ──
+            if self._needs_keyframe:
+                if is_keyframe:
+                    # Explicit keyframe — prepend any buffered extradata
+                    payload = self._buffer + data if self._buffer else data
+                    self._buffer = b""
+                else:
+                    # Buffer pre-keyframe data (SPS/PPS) and try decode anyway
+                    # (the caller might not know this is actually a keyframe).
+                    # If decode succeeds below, _needs_keyframe will be cleared.
+                    self._buffer += data
+                    payload = self._buffer
+            else:
+                payload = data
+
+            # ── Method 1: in-memory demuxer ──
+            decoded_frame: Any = None
             try:
-                # Use an in-memory demuxer to properly handle H.264 Annex B
-                # byte-stream with start codes.  This gives the decoder
-                # proper extradata (SPS/PPS) from the first keyframe.
-                fh = io.BytesIO(data)
+                fh = io.BytesIO(payload)
                 container = av.open(fh, "r", format="h264")
                 for packet in container.demux():
                     if packet.stream.type != "video":
@@ -309,31 +366,54 @@ class VideoDecoder:
                     if not frames:
                         continue
                     av_frame = frames[-1]
-                    rgb = av_frame.to_rgb().to_ndarray()
-                    container.close()
-                    return rgb
+                    decoded_frame = av_frame.to_rgb().to_ndarray()
+                    break
                 container.close()
-                return None
             except Exception:
-                logger.debug("In-memory demuxer failed, fallback to CodecContext")
-                # Fallback: direct CodecContext (works for some streams)
-                try:
-                    if self._codec is None:
-                        self._codec = av.CodecContext.create("h264", "r")
-                    av_packet = av.Packet(data)
-                    frames = self._codec.decode(av_packet)
-                    if not frames:
-                        # Try flushing
-                        frames = self._codec.decode(None)
-                    if not frames:
-                        return None
+                pass  # fall through to CodecContext
+
+            if decoded_frame is not None:
+                self._codec = None  # discard stale fallback codec
+                self._needs_keyframe = False
+                self._buffer = b""
+                return decoded_frame
+
+            # ── Method 2: CodecContext fallback ──
+            try:
+                if self._codec is None:
+                    self._codec = av.CodecContext.create("h264", "r")
+                av_packet = av.Packet(payload)
+                frames = self._codec.decode(av_packet)
+                if not frames:
+                    frames = self._codec.decode(None)
+                if frames:
                     av_frame = frames[-1]
                     rgb = av_frame.to_rgb().to_ndarray()
+                    self._codec = None
+                    self._needs_keyframe = False
+                    self._buffer = b""
                     return rgb
-                except Exception as e:
-                    logger.error("VideoDecoder failed: %s", e)
-                    return None
+                # No frames yet — keep buffering if we still need a keyframe
+                return None
+
+            except Exception as e:
+                logger.error("VideoDecoder failed: %s", e)
+                # Recreate the codec context to recover from error state
+                self._codec = None
+                self._needs_keyframe = True
+                self._buffer = b""
+                return None
+
+    def reset(self) -> None:
+        """Reset decoder state — requires a fresh keyframe next."""
+        with self._lock:
+            self._codec = None
+            self._needs_keyframe = True
+            self._buffer = b""
+            logger.debug("VideoDecoder reset — awaiting keyframe")
 
     def release(self) -> None:
         with self._lock:
             self._codec = None
+            self._buffer = b""
+            self._needs_keyframe = True
