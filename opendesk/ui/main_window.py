@@ -100,9 +100,9 @@ class MainWindow(QMainWindow):
         self._setup_menus()
         self._setup_toolbar()
         self._setup_viewer_toolbar()
+        self._setup_statusbar()
         self._setup_docks()
         self._setup_central_widget()
-        self._setup_statusbar()
         self._setup_fullscreen_shortcuts()
 
         logger.info("Main window initialised")
