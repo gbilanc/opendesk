@@ -141,9 +141,15 @@ class _RelaySession:
 
     async def _run_host(self) -> None:
         logger.info("Host connecting to relay %s:%s", self.host, self.port)
-        self._reader, self._writer = await asyncio.open_connection(
-            self.host, self.port
-        )
+        try:
+            self._reader, self._writer = await asyncio.open_connection(
+                self.host, self.port
+            )
+        except OSError as e:
+            logger.error("Host connection failed: %s", e)
+            self.inbox.put(("error", str(e)))
+            self.inbox.put(("disconnected", None))
+            return
 
         # Register session
         await self._send_async(Message.relay_register(session_id=self.session_id))
@@ -179,9 +185,15 @@ class _RelaySession:
 
     async def _run_client(self) -> None:
         logger.info("Client connecting to relay %s:%s", self.host, self.port)
-        self._reader, self._writer = await asyncio.open_connection(
-            self.host, self.port
-        )
+        try:
+            self._reader, self._writer = await asyncio.open_connection(
+                self.host, self.port
+            )
+        except OSError as e:
+            logger.error("Client connection failed: %s", e)
+            self.inbox.put(("error", str(e)))
+            self.inbox.put(("disconnected", None))
+            return
 
         # Join session
         await self._send_async(Message.relay_register(session_id=self.session_id))

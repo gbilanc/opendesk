@@ -337,6 +337,9 @@ class MainWindow(QMainWindow):
         # Default to localhost if not configured
         if not host:
             host = "127.0.0.1"
+        # 0.0.0.0 is a bind address, not a connect target
+        if host == "0.0.0.0":
+            host = "127.0.0.1"
         return host, port
 
     @Slot(str, str)
