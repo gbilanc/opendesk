@@ -231,8 +231,11 @@ class _RelaySession:
             self.inbox.put(("disconnected", None, self.session_seq))
             return
 
-        # Join session
-        await self._send_async(Message.relay_register(session_id=self.session_id))
+        # Look up device by ID (device_id) → relay pairs us with its session
+        await self._send_async(Message(
+            MessageType.RELAY_REGISTER,
+            {"lookup_device": self.session_id},
+        ))
 
         async for msg in self._read_loop():
             self.inbox.put(("message", msg, self.session_seq))

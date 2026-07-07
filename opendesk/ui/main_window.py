@@ -114,6 +114,21 @@ class MainWindow(QMainWindow):
         self._setup_central_widget()
         self._setup_fullscreen_shortcuts()
 
+        # Create initial session and start hosting
+        import string, random
+        alphabet = string.ascii_uppercase + string.digits
+        initial_pwd = "".join(random.choices(alphabet, k=8))
+        self._connection.create_session(initial_pwd)
+        self._session_info.set_session(
+            self._connection.session_id,
+            self._connection.password,
+        )
+        self._host_session_id = self._connection.session_id.replace(" ", "")
+        self._status_text.setText(
+            f"Hosting: {self._connection.session_id.replace(' ', '')}"
+        )
+        self._connection.start_hosting()
+
         logger.info("Main window initialised")
 
     # ── Initialisation ──────────────────────────────────────────────
@@ -281,13 +296,6 @@ class MainWindow(QMainWindow):
         self._session_info.device_name_changed.connect(self._on_device_name_changed)
         layout.addWidget(self._session_info)
 
-        # session_refreshed was already emitted in __init__, catch up
-        if self._session_info.session_id and self._session_info.password:
-            self._on_session_refreshed(
-                self._session_info.session_id,
-                self._session_info.password,
-            )
-
         # Connection panel (device list + manual entry)
         self._connection_panel = ConnectionPanel(central)
         self._connection_panel.connection_requested.connect(self._on_connection_requested)
@@ -336,11 +344,15 @@ class MainWindow(QMainWindow):
 
     @Slot(str, str)
     def _on_session_refreshed(self, session_id: str, password: str) -> None:
-        """Called when a new local session is created — start hosting on relay."""
+        """Called when user clicks 'Nuova sessione' — create new session and re-host."""
         self._connection.create_session(password)
-        self._host_session_id = session_id.replace(" ", "")
-        logger.info("Starting host with session %s", session_id)
-        self._status_text.setText(f"Hosting: {session_id}")
+        self._session_info.set_session(
+            self._connection.session_id,
+            self._connection.password,
+        )
+        self._host_session_id = self._connection.session_id.replace(" ", "")
+        logger.info("New session created: %s", self._connection.session_id)
+        self._status_text.setText(f"Hosting: {self._host_session_id}")
         self._connection.start_hosting()
 
     @Slot(str, str)

@@ -276,7 +276,7 @@ class ConnectionPanel(QWidget):
         fields.setSpacing(8)
 
         self._manual_id = QLineEdit()
-        self._manual_id.setPlaceholderText("ID sessione (es. 123 456 789)")
+        self._manual_id.setPlaceholderText("ID dispositivo (es. ABC-12345)")
         self._manual_id.setMinimumHeight(36)
         self._manual_id.setStyleSheet("font-size: 14px; font-weight: 600; letter-spacing: 2px;")
         fields.addWidget(self._manual_id, 2)
@@ -366,11 +366,11 @@ class ConnectionPanel(QWidget):
         self._manual_connect_btn.setEnabled(has_id and has_pwd)
 
     def _on_manual_connect(self) -> None:
-        session_id = self._manual_id.text().strip()
+        device_id = self._manual_id.text().strip()
         password = self._manual_pwd.text().strip()
-        if not session_id or not password:
+        if not device_id or not password:
             return
-        self.connection_requested.emit(session_id, password)
+        self.connection_requested.emit(device_id, password)
 
     @Slot()
     def _on_connect(self) -> None:
@@ -394,7 +394,8 @@ class ConnectionPanel(QWidget):
 
         password = "" if trusted else self._prompt_password(device_id)
         if password is not None:
-            self.connection_requested.emit(session_id, password)
+            # Use device_id (not session_id) for lookup
+            self.connection_requested.emit(device_id, password)
 
     def _prompt_password(self, device_id: str) -> str | None:
         pwd, ok = QInputDialog.getText(

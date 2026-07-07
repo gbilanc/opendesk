@@ -174,11 +174,13 @@ class RelayServer:
     # ── message routing ─────────────────────────────────────────────
 
     async def _handle_register(self, peer: RelayPeer, payload: dict) -> None:
-        """Register a peer with a session ID.
+        """Register a peer with a session ID or look up by device ID.
 
-        - Empty session_id: relay generates a new one (legacy mode).
-        - Existing session_id: join as client, pair with host.
-        - New session_id: register as host for that session_id.
+        Flow:
+        1. If ``device_id`` is present but ``session_id`` is NOT → **device lookup**
+           (find the device's current session and pair with it).
+        2. If ``session_id`` is present → join or create that session (existing logic).
+        3. If neither is present → relay generates a new session (legacy).
         """
         from opendesk.network.protocol import Message, MessageType
 
@@ -192,8 +194,51 @@ class RelayServer:
             logger.info("Device registered: %s (%s)", device_id, device_name)
 
         session_id = payload.get("session_id", "")
+
+        # ── Device lookup (client wants to connect to a specific device) ──
+        lookup_device = payload.get("lookup_device", "")
+        if lookup_device and not session_id:
+            target = self._devices.get(lookup_device)
+            if target is not None and target.session_id \
+               and target.writer and not target.writer.is_closing():
+                # Device is online — use its session to pair
+                session_id = target.session_id
+                host_id = self._sessions.get(session_id)
+                if host_id and host_id != peer.peer_id:
+                    host_peer = self._peers.get(host_id)
+                    if host_peer:
+                        peer.session_id = session_id
+                        peer.paired_peer_id = host_id
+                        host_peer.paired_peer_id = peer.peer_id
+                        await self._send(
+                            peer,
+                            Message(MessageType.RELAY_REGISTER,
+                                    {"session_id": session_id, "paired": True,
+                                     "mode": "client", "device_name": target.device_name}),
+                        )
+                        await self._send(
+                            host_peer,
+                            Message(MessageType.RELAY_PEER_LIST, {"peers": [peer.peer_id]}),
+                        )
+                        logger.info(
+                            "Peers paired via device lookup %s: %s ↔ %s",
+                            lookup_device, host_id, peer.peer_id,
+                        )
+                        return
+
+            # Device offline or not found
+            await self._send(
+                peer,
+                Message(MessageType.ERROR, {
+                    "code": 404,
+                    "message": f"Device {lookup_device} offline or not found",
+                }),
+            )
+            logger.info("Device lookup failed: %s", lookup_device)
+            return
+
+        # ── No session_id → auto-generate (legacy) ──
         if not session_id:
-            # Legacy: relay generates session_id
             session_id = generate_session_id()
             self._sessions[session_id] = peer.peer_id
             peer.session_id = session_id
@@ -205,9 +250,9 @@ class RelayServer:
             await self._broadcast_device_list()
             return
 
+        # ── Session exists → join as client ──
         host_id = self._sessions.get(session_id)
         if host_id is not None:
-            # Session exists → join as client
             host_peer = self._peers.get(host_id)
             if host_peer is None:
                 del self._sessions[session_id]
@@ -217,7 +262,6 @@ class RelayServer:
                 )
                 return
 
-            # Pair the peers
             peer.session_id = session_id
             peer.paired_peer_id = host_id
             host_peer.paired_peer_id = peer.peer_id
@@ -234,7 +278,7 @@ class RelayServer:
             logger.info("Peers paired in session %s: %s ↔ %s", session_id, host_id, peer.peer_id)
             return
 
-        # New session → register as host with this session_id
+        # ── New session → register as host ──
         self._sessions[session_id] = peer.peer_id
         peer.session_id = session_id
         await self._send(

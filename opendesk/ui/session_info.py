@@ -53,7 +53,7 @@ class SessionInfoWidget(QWidget):
         self._device_name = device_name
         self._name_editing = False
         self._setup_ui()
-        self.refresh_session()
+        # Don't auto-create session — MainWindow pushes it via set_session()
 
     # ── UI ──────────────────────────────────────────────────────────
 
@@ -114,11 +114,11 @@ class SessionInfoWidget(QWidget):
         row1.addStretch(1)
         layout.addLayout(row1)
 
-        # ── Row 2: Session ID + Password ──
+        # ── Row 2: Device ID (large, for sharing) + Password ──
         row2 = QHBoxLayout()
         row2.setSpacing(8)
 
-        id_label = QLabel("ID sessione:")
+        id_label = QLabel("ID dispositivo:")
         id_label.setStyleSheet(
             "font-size: 12px; font-weight: 700; color: #2563eb;"
         )
@@ -146,7 +146,7 @@ class SessionInfoWidget(QWidget):
         self._copy_id_btn.setFixedHeight(26)
         self._copy_id_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._copy_id_btn.setStyleSheet(self._button_style())
-        self._copy_id_btn.clicked.connect(self._copy_session_id)
+        self._copy_id_btn.clicked.connect(self._copy_device_id)
         row2.addWidget(self._copy_id_btn)
 
         # Separator
@@ -188,7 +188,7 @@ class SessionInfoWidget(QWidget):
 
         row2.addStretch(1)
 
-        # ── Refresh button (right-aligned in row 2) ──
+        # ── Refresh button (right-aligned) ──
         self._refresh_btn = QPushButton("🔄 Nuova sessione")
         self._refresh_btn.setFixedHeight(26)
         self._refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -235,6 +235,14 @@ class SessionInfoWidget(QWidget):
     def password(self) -> str:
         return self._password
 
+    @Slot(str, str)
+    def set_session(self, session_id: str, password: str) -> None:
+        """Aggiorna la sessione mostrata (chiamato da MainWindow)."""
+        self._session_id = session_id
+        self._password = password
+        self._id_display.setText(self._format_device_id())
+        self._pwd_display.setText(password)
+
     # ── Device name editing ────────────────────────────────────────
 
     @Slot()
@@ -266,6 +274,12 @@ class SessionInfoWidget(QWidget):
 
     # ── Session lifecycle ───────────────────────────────────────────
 
+    def _format_device_id(self) -> str:
+        """Format device UUID as a short readable ID."""
+        # Show first 8 chars, uppercase, with dash
+        raw = self._device_id.replace("-", "")[:8].upper()
+        return f"{raw[:4]}-{raw[4:]}" if len(raw) > 4 else raw
+
     @Slot()
     def refresh_session(self) -> None:
         """Create a new session and update the display."""
@@ -274,19 +288,20 @@ class SessionInfoWidget(QWidget):
         self._session_id = session.session_id
         self._password = password
 
-        self._id_display.setText(self._session_id)
+        # Show device ID as the main identifier
+        self._id_display.setText(self._format_device_id())
         self._pwd_display.setText(self._password)
 
-        logger.info("New session: %s", self._session_id)
+        logger.info("New session: %s (device: %s)", self._session_id, self._format_device_id())
         self.session_refreshed.emit(self._session_id, self._password)
 
     @Slot()
-    def _copy_session_id(self) -> None:
-        """Copy session ID to the clipboard."""
+    def _copy_device_id(self) -> None:
+        """Copy device ID to the clipboard."""
         clipboard = QApplication.clipboard()
-        clipboard.setText(self._session_id)
+        clipboard.setText(self._format_device_id())
         self._flash_button(self._copy_id_btn, "Copiato!", self._button_style())
-        logger.info("Session ID copied: %s", self._session_id)
+        logger.info("Device ID copied: %s", self._format_device_id())
 
     @Slot()
     def _copy_password(self) -> None:
