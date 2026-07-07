@@ -104,74 +104,168 @@ def compute_dirty_region(
 
 
 class PipeWireCapture:
-    """Wayland screen capture via PipeWire + xdg-desktop-portal D-Bus API.
+    """Wayland screen capture via GStreamer's ``pipewiresrc``.
 
-    Uses ``dbus_next`` (pure Python) to request a screencast from
-    ``org.freedesktop.portal.ScreenCast``.
+    Uses GStreamer (via a subprocess with system Python) to capture the
+    screen through ``pipewiresrc``, which internally shows the standard
+    xdg-desktop-portal screen selection dialog to the user.
 
     Requires:
-        - ``dbus-next`` (pip install dbus-next)
-        - ``xdg-desktop-portal`` + backend (-wlr, -gnome, or -kde)
+        - GStreamer with pipewire plugin (``gstreamer1.0-pipewire``)
+        - ``xdg-desktop-portal`` + backend
         - PipeWire runtime
-
-    Falls back gracefully if dependencies are missing.
     """
 
     def __init__(self) -> None:
         self._available: bool | None = None
-        self._session_handle: str | None = None
         self._monitors: list[MonitorInfo] = []
-        self._frame_queue: list[np.ndarray] = []
+        self._helper_process: subprocess.Popen | None = None
+        self._resolved_w: int = 0
+        self._resolved_h: int = 0
+        self._started: bool = False
 
     # ── availability ────────────────────────────────────────────────
 
     def is_available(self) -> bool:
+        """Check if GStreamer + pipewiresrc are available on the system."""
         if self._available is not None:
             return self._available
 
-        try:
-            import dbus_next  # noqa: F401
-        except ImportError:
-            logger.debug("PipeWire: dbus-next not installed")
+        system_python = _find_system_python()
+        if not system_python:
+            logger.debug("PipeWire: no system Python with gi found")
             self._available = False
             return False
 
         import subprocess
-        import shutil
+        try:
+            r = subprocess.run(
+                [system_python, "-c",
+                 "import gi; gi.require_version('Gst', '1.0');"
+                 "from gi.repository import Gst; Gst.init(None);"
+                 "e = Gst.ElementFactory.make('pipewiresrc', None);"
+                 "exit(0 if e else 1)"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                self._available = True
+                return True
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            pass
 
-        # Check xdg-desktop-portal is on D-Bus
-        if shutil.which("busctl"):
-            try:
-                r = subprocess.run(
-                    ["busctl", "list", "--no-pager"],
-                    capture_output=True, text=True, timeout=3,
-                )
-                if "org.freedesktop.portal.Desktop" in r.stdout:
-                    self._available = True
-                    return True
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                pass
-
-        if shutil.which("gdbus"):
-            try:
-                r = subprocess.run(
-                    ["gdbus", "call", "--session",
-                     "--dest", "org.freedesktop.DBus",
-                     "--object-path", "/",
-                     "--method", "org.freedesktop.DBus.ListNames"],
-                    capture_output=True, text=True, timeout=3,
-                )
-                if "org.freedesktop.portal.Desktop" in r.stdout:
-                    self._available = True
-                    return True
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                pass
-
-        logger.debug("PipeWire: xdg-desktop-portal not found on D-Bus")
+        logger.debug("PipeWire: GStreamer pipewiresrc not available")
         self._available = False
         return False
 
     # ── public API ──────────────────────────────────────────────────
+
+    def start(self, monitor_index: int = 0) -> None:
+        """Start the capture subprocess.
+
+        This launches a GStreamer pipeline in a subprocess (using the
+        system Python).  The portal will show a screen-selection dialog
+        to the user.
+        """
+        if self._started:
+            return
+        self._started = True
+
+        import subprocess
+        from pathlib import Path
+
+        helper = Path(__file__).parent / "_pipewire_helper.py"
+
+        system_python = _find_system_python()
+        if not system_python:
+            logger.warning("PipeWire: system Python not found, cannot start")
+            return
+
+        logger.info(
+            "Starting PipeWire capture (monitor %d) via %s",
+            monitor_index, helper,
+        )
+
+        self._helper_process = subprocess.Popen(
+            [system_python, str(helper),
+             "--monitor", str(monitor_index),
+             "--fps", "30"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        # Read header (first 8 bytes = width, height as uint32 LE)
+        # Timeout: if the portal dialog is not approved, fail after 30 s
+        import struct
+        import select
+        header = b""
+        deadline = time.monotonic() + 30.0
+        while len(header) < 8 and time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            r, _, _ = select.select([self._helper_process.stdout], [], [], min(remaining, 1.0))
+            if r:
+                chunk = self._helper_process.stdout.read(8 - len(header))
+                if not chunk:
+                    break
+                header += chunk
+
+        if len(header) < 8:
+            logger.error("PipeWire: failed to read frame header (timeout or portal not approved)")
+            stderr = self._helper_process.stderr.read() if self._helper_process.stderr else b""
+            if stderr:
+                logger.warning("PipeWire helper stderr: %s", stderr.decode(errors="replace"))
+            self.release()
+            return
+
+        self._resolved_w, self._resolved_h = struct.unpack("<II", header)
+        logger.info(
+            "PipeWire capture started: %dx%d",
+            self._resolved_w, self._resolved_h,
+        )
+
+    def capture_one(self, monitor_index: int = 0) -> CapturedFrame | None:
+        """Capture a single frame from the running subprocess."""
+        if not self._started:
+            self.start(monitor_index)
+
+        if self._helper_process is None or self._helper_process.stdout is None:
+            return None
+
+        # Check if process is still alive
+        if self._helper_process.poll() is not None:
+            logger.warning(
+                "PipeWire helper exited with code %d",
+                self._helper_process.returncode,
+            )
+            stderr = self._helper_process.stderr.read() if self._helper_process.stderr else b""
+            if stderr:
+                logger.warning("PipeWire helper stderr: %s", stderr.decode(errors="replace"))
+            self.release()
+            return None
+
+        frame_size = self._resolved_w * self._resolved_h * 3
+        data = self._helper_process.stdout.read(frame_size)
+        if len(data) < frame_size:
+            logger.warning("PipeWire: incomplete frame read (%d < %d)", len(data), frame_size)
+            return None
+
+        rgb = np.frombuffer(data, dtype=np.uint8).reshape(self._resolved_h, self._resolved_w, 3)
+        return CapturedFrame(
+            data=rgb.copy(),
+            monitor_index=monitor_index,
+            timestamp=time.time(),
+            region=(0, 0, self._resolved_w, self._resolved_h),
+        )
+
+    def capture_loop(self, monitor_index: int = 0):
+        """Generator that yields frames from the PipeWire subprocess."""
+        self.start(monitor_index)
+        while True:
+            frame = self.capture_one(monitor_index)
+            if frame is None:
+                break
+            yield frame
 
     def monitors(self) -> list[MonitorInfo]:
         if self._monitors:
@@ -215,52 +309,21 @@ class PipeWireCapture:
             ))
         return self._monitors
 
-    def capture_one(self, monitor_index: int = 0) -> CapturedFrame | None:
-        self._ensure_session(monitor_index)
-        if not self._frame_queue:
-            return None
-        data = self._frame_queue.pop(0)
-        mon = self._monitors[monitor_index] if monitor_index < len(self._monitors) else None
-        return CapturedFrame(
-            data=data,
-            monitor_index=monitor_index,
-            timestamp=time.time(),
-            region=(mon.left, mon.top, mon.width, mon.height) if mon else (0, 0, 0, 0),
-        )
-
     def release(self) -> None:
-        self._session_handle = None
-        self._frame_queue.clear()
-
-    # ── internal D-Bus ──────────────────────────────────────────────
-
-    def _ensure_session(self, monitor_index: int = 0) -> None:
-        if self._session_handle is not None:
-            return
-        try:
-            from dbus_next import BusType, Message
-            from dbus_next.aio import MessageBus
-            import asyncio
-
-            async def _create():
-                bus = await MessageBus(bus_type=BusType.SESSION).connect()
-                msg = Message(
-                    destination="org.freedesktop.portal.Desktop",
-                    path="/org/freedesktop/portal/desktop",
-                    interface="org.freedesktop.portal.ScreenCast",
-                    member="CreateSession",
-                    signature="a{sv}",
-                    body=[{}],
-                )
-                resp = await bus.call(msg)
-                if resp.body:
-                    self._session_handle = resp.body[0]
-                    logger.info("PipeWire session: %s", self._session_handle)
-
-            asyncio.run(_create())
-        except Exception as e:
-            logger.warning("PipeWire session failed: %s", e)
-            self._session_handle = "fallback"
+        """Stop the capture helper subprocess."""
+        self._started = False
+        if self._helper_process:
+            try:
+                self._helper_process.terminate()
+                self._helper_process.wait(timeout=3)
+            except Exception:
+                try:
+                    self._helper_process.kill()
+                except Exception:
+                    pass
+            self._helper_process = None
+        self._resolved_w = 0
+        self._resolved_h = 0
 
 
 # ---------------------------------------------------------------------------
@@ -345,8 +408,9 @@ class ScreenCapture:
 
     def capture_one(self, monitor_index: int = 0) -> CapturedFrame:
         if self._method == CaptureMethod.PIPEWIRE:
+            pw = self._get_pw()
             try:
-                f = self._get_pw().capture_one(monitor_index)
+                f = pw.capture_one(monitor_index)
                 if f is not None:
                     return f
             except Exception as e:
@@ -448,6 +512,7 @@ class ScreenCapture:
 
     def _loop_pipewire(self, monitor_index: int = 0) -> Iterator[CapturedFrame]:
         pw = self._get_pw()
+        pw.start(monitor_index)
         while True:
             t0 = time.perf_counter()
             frame = pw.capture_one(monitor_index)
@@ -493,3 +558,32 @@ def screenshot(monitor_index: int = 0) -> Image.Image:
         _global_capture = ScreenCapture()
     frame = _global_capture.capture_one(monitor_index)
     return Image.fromarray(frame.data)
+
+
+# -------------------------------------------------------------------------
+# Helper: find system Python with GStreamer gi bindings
+# -------------------------------------------------------------------------
+
+
+def _find_system_python() -> str | None:
+    """Find a Python interpreter that has GStreamer gi bindings."""
+    import shutil
+    import subprocess
+
+    candidates = ["/usr/bin/python3", "/usr/bin/python"]
+    for py in candidates:
+        if not shutil.which(py):
+            continue
+        try:
+            r = subprocess.run(
+                [py, "-c", "import gi; gi.require_version('Gst', '1.0');"
+                 "from gi.repository import Gst; Gst.init(None);"
+                 "print('ok')"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if r.returncode == 0:
+                return py
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            continue
+
+    return None
