@@ -106,6 +106,9 @@ class MainWindow(QMainWindow):
         # Settings
         self._settings = QSettings("OpenDesk", "OpenDesk")
 
+        # Relay retry counter (exponential backoff)
+        self._relay_retries = 0
+
         # Build UI
         self._setup_actions()
         self._setup_menus()
@@ -368,6 +371,7 @@ class MainWindow(QMainWindow):
     def _on_relay_connected(self, role: str, session_id: str) -> None:
         """Relay connection established."""
         logger.info("Relay connected as %s: %s", role, session_id)
+        self._relay_retries = 0  # Reset retry counter on successful connection
         if role == "host":
             self._status_text.setText(f"Waiting for connection... (ID: {session_id})")
         elif role == "client":
@@ -438,8 +442,42 @@ class MainWindow(QMainWindow):
     def _on_relay_error(self, error_msg: str) -> None:
         """Relay error occurred."""
         logger.error("Relay error: %s", error_msg)
-        QMessageBox.critical(self, "Connection Error", error_msg)
+
+        role = self._relay.role if self._relay else None
+        from opendesk.network.relay_client import RelayRole
+
+        if role == RelayRole.CLIENT:
+            # Client connection is user-initiated — show error dialog
+            QMessageBox.critical(self, "Connection Error", error_msg)
+        else:
+            # Host/relay is optional — non-fatal, just warn in status bar
+            self._status_text.setText("⚠ Relay unavailable — will retry")
+            self._schedule_relay_retry()
+
         self._on_disconnect()
+
+    def _schedule_relay_retry(self) -> None:
+        """Schedule a relay reconnection attempt with exponential backoff."""
+        # Cap at 5 retries (max ~2 minutes of trying)
+        if self._relay_retries >= 5:
+            self._status_text.setText("⚠ Relay unavailable — local session only")
+            return
+
+        delay = min(2 ** self._relay_retries * 2, 30)  # 2, 4, 8, 16, 30 seconds
+        self._relay_retries += 1
+        logger.info("Retrying relay connection in %ds (attempt %d/5)", delay, self._relay_retries)
+        QTimer.singleShot(int(delay * 1000), self._retry_relay_connection)
+
+    def _retry_relay_connection(self) -> None:
+        """Retry connecting to the relay server."""
+        if not self._host_session_id:
+            return
+        host, port = self._get_relay_config()
+        logger.info("Retrying relay connection to %s:%s", host, port)
+        self._status_text.setText("Reconnecting to relay...")
+        # Need the password — retrieve from session_info
+        password = self._session_info.password if self._session_info else ""
+        self._relay.start_hosting(host, port, self._host_session_id, password)
 
     # ── Screen capture and streaming (host) ─────────────────────────
 
