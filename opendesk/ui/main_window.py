@@ -541,7 +541,7 @@ class MainWindow(QMainWindow):
         pressed = payload.get("pressed")
         absolute = payload.get("absolute", True)
 
-        if button is not None:
+        if button:
             btn = MouseButton(button)
             state = KeyState.PRESSED if pressed else KeyState.RELEASED
             self._input_backend.move_mouse(x, y, absolute)
