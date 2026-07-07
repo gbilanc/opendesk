@@ -104,12 +104,14 @@ class RemoteViewer(QGraphicsView):
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
-        self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.FullViewportUpdate)
+        self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.MinimalViewportUpdate)
+        self.setOptimizationFlag(QGraphicsView.OptimizationFlag.DontAdjustForAntialiasing, True)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setBackgroundBrush(QBrush(QColor("#0f172a")))  # dark background
 
         # ── State ──
-        self._pixmap_item: QGraphicsView | None = None
+        from PySide6.QtWidgets import QGraphicsPixmapItem
+        self._pixmap_item: QGraphicsPixmapItem | None = None
         self._remote_resolution: tuple[int, int] = (1280, 720)
         self._fit_mode = self.FitMode.FIT_WINDOW
         self._zoom_level: float = 1.0
