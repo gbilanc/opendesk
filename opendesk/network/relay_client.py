@@ -115,7 +115,15 @@ class _RelaySession:
             except Exception:
                 pass
             self._writer = None
-        if self._loop:
+        # Cancel all pending tasks to avoid
+        # "Task was destroyed but it is pending" warnings.
+        if self._loop and self._loop.is_running():
+            current = asyncio.current_task(self._loop)
+            for task in asyncio.all_tasks(self._loop):
+                if task is not current:
+                    task.cancel()
+            # Yield control so cancelled tasks can process their cancellation
+            await asyncio.sleep(0)
             self._loop.stop()
 
     # ── sending ─────────────────────────────────────────────────────
@@ -132,6 +140,8 @@ class _RelaySession:
             data = msg.encode()
             self._writer.write(data)
             await self._writer.drain()
+        except asyncio.CancelledError:
+            pass
         except Exception as e:
             logger.warning("Send error: %s", e)
             self.inbox.put(("error", f"Send failed: {e}"))
