@@ -475,11 +475,22 @@ class RelayClient(QObject):
         self._thread.start()
 
     def _stop_session(self) -> None:
-        """Stop the current session if any."""
-        if self._session:
-            self._session.stop()
-            self._session = None
-            self._thread = None
+        """Stop the current session if any.
+
+        Signals the event loop to stop and waits for the background
+        thread to finish (with a timeout) so that no stale coroutines
+        are left running when a new session starts.
+        """
+        if self._session is None or self._thread is None:
+            return
+        self._session.stop()
+        self._session = None
+        # Wait for the thread to actually finish so we don't race
+        # with a new session that may re-use the same inbox / seq.
+        self._thread.join(timeout=2.0)
+        if self._thread.is_alive():
+            logger.warning("Relay thread did not stop within 2s")
+        self._thread = None
 
     @Slot()
     def _poll_inbox(self) -> None:

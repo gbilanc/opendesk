@@ -161,15 +161,17 @@ class Message:
         if body_len > _MAX_MESSAGE_SIZE:
             raise ValueError(f"Message too large: {body_len} bytes")
 
-        body_data = b""
-        while len(body_data) < body_len:
-            chunk = await reader.read(body_len - len(body_data))
+        body_buf = bytearray(body_len)
+        bytes_read = 0
+        while bytes_read < body_len:
+            chunk = await reader.read(body_len - bytes_read)
             if not chunk:
                 raise ConnectionError("Connection closed while reading body")
-            body_data += chunk
+            body_buf[bytes_read : bytes_read + len(chunk)] = chunk
+            bytes_read += len(chunk)
 
         # Reconstruct full wire-format for decode()
-        wire_data = header_data + body_data
+        wire_data = header_data + bytes(body_buf)
         return cls.decode(wire_data)
 
     @staticmethod

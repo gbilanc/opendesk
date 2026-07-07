@@ -7,6 +7,7 @@ OS-specific behaviour.
 
 from __future__ import annotations
 
+import os
 import sys
 from enum import Enum, auto
 
@@ -52,5 +53,4 @@ def is_wayland() -> bool:
     """
     if current_platform() != Platform.LINUX:
         return False
-    import os
     return "WAYLAND_DISPLAY" in os.environ

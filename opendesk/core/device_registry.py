@@ -76,13 +76,15 @@ class DeviceRegistry:
 
     # ── write ───────────────────────────────────────────────────────
 
-    def upsert(self, device_id: str, **kwargs: Any) -> DeviceEntry:
+    def upsert(self, device_id: str, *, _save: bool = True, **kwargs: Any) -> DeviceEntry:
         """Add or update a device entry.
 
         Parameters
         ----------
         device_id : str
             Permanent device ID.
+        _save : bool
+            If ``False``, skip writing to disk (useful for batch ops).
         **kwargs
             Fields to update (device_name, online, trusted, session_id,
             last_seen).
@@ -107,7 +109,8 @@ class DeviceRegistry:
         if not kwargs.get("last_seen"):
             entry.last_seen = time.time()
 
-        self._save()
+        if _save:
+            self._save()
         return entry
 
     def remove(self, device_id: str) -> bool:
@@ -137,13 +140,14 @@ class DeviceRegistry:
         for entry in self._devices.values():
             entry.online = False
 
-        # Update from relay list
+        # Update from relay list (batch: no intermediate saves)
         for d in devices:
             device_id = d.get("device_id", "")
             if not device_id:
                 continue
             self.upsert(
                 device_id,
+                _save=False,
                 device_name=d.get("device_name", ""),
                 online=True,
                 session_id=d.get("session_id", ""),

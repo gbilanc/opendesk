@@ -163,7 +163,11 @@ class RemoteViewer(QGraphicsView):
                 rgb_data = rgb_data.clip(0, 255).astype(np.uint8)
             if rgb_data.shape[2] == 3:
                 h, w, _ = rgb_data.shape
-                img = QImage(rgb_data.data, w, h, w * 3, QImage.Format.Format_RGB888)
+                # Copy to a dedicated buffer so QImage does not reference
+                # a numpy array that may be garbage-collected later.
+                buf = rgb_data.copy().tobytes()
+                img = QImage(buf, w, h, w * 3, QImage.Format.Format_RGB888)
+                img._np_buffer = buf  # keep Python reference alive
             else:
                 return
         elif isinstance(rgb_data, bytes):

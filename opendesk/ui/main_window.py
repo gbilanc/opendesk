@@ -69,6 +69,7 @@ class MainWindow(QMainWindow):
 
         # Application state
         self._connected: bool = False
+        self._disconnecting: bool = False
         self._fullscreen: bool = False
         self._peer_id: str = ""  # remote session ID when acting as client
 
@@ -440,12 +441,13 @@ class MainWindow(QMainWindow):
         logger.error("Relay error: %s", error_msg)
         if self._relay.role == RelayRole.CLIENT:
             QMessageBox.critical(self, "Connection Error", error_msg)
+            self._on_disconnect()
         else:
+            # Host: stay alive and retry instead of fully disconnecting
             self._status_text.setText("⚠ Relay unavailable — will retry")
             self._connection.schedule_retry(
                 lambda m: self._status_text.setText(m)
             )
-        self._on_disconnect()
 
     @Slot(list)
     def _on_device_list_received(self, devices: list[dict]) -> None:
@@ -539,12 +541,18 @@ class MainWindow(QMainWindow):
         """Disconnect the current session."""
         if not self._connected and not self._relay.is_connected:
             return
-        logger.info("Disconnecting session: %s", self._peer_id)
-        self._stop_streaming()
-        self._connection.disconnect()
-        self._set_connected(False)
-        self._status_text.setText("Disconnected")
-        self._peer_id = ""
+        if self._disconnecting:
+            return
+        self._disconnecting = True
+        try:
+            logger.info("Disconnecting session: %s", self._peer_id)
+            self._stop_streaming()
+            self._connection.disconnect()
+            self._set_connected(False)
+            self._status_text.setText("Disconnected")
+            self._peer_id = ""
+        finally:
+            self._disconnecting = False
 
     # ── Slots: view ─────────────────────────────────────────────────
 

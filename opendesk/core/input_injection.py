@@ -314,8 +314,14 @@ class WaylandInputBackend(InputBackend):
     def move_mouse(self, x: int, y: int, absolute: bool = True) -> None:
         if absolute:
             # uinput absolute positioning requires ABS_X/ABS_Y capability
-            # which is complex. Use relative movement from current position.
-            logger.debug("Wayland absolute positioning not supported, using relative")
+            # plus knowledge of the current cursor position, which is
+            # not exposed by Wayland compositors.  We would need to
+            # maintain a virtual absolute coordinate space and convert
+            # to relative deltas.  For now, log once and skip.
+            logger.warning(
+                "Wayland absolute mouse positioning is not yet supported. "
+                "Cursor will not move to the requested absolute coordinates."
+            )
             return
         self._ui.write(self._e.EV_REL, self._e.REL_X, x)
         self._ui.write(self._e.EV_REL, self._e.REL_Y, y)

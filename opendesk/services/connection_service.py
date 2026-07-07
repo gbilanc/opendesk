@@ -177,11 +177,15 @@ class ConnectionService(QObject):
 
     def _get_relay_config(self) -> tuple[str, int]:
         host = self._settings.value("network/relay_host", "")
-        port = int(self._settings.value("network/relay_port", 8474))
         if not host:
             host = "127.0.0.1"
         if host == "0.0.0.0":
             host = "127.0.0.1"
+        try:
+            port = int(self._settings.value("network/relay_port", 8474))
+        except (ValueError, TypeError):
+            logger.warning("Invalid relay port in settings, using default 8474")
+            port = 8474
         return host, port
 
     # ── retry ───────────────────────────────────────────────────────
@@ -197,7 +201,8 @@ class ConnectionService(QObject):
         QTimer.singleShot(int(delay * 1000), lambda: self._retry_now(status_callback))
 
     def _retry_now(self, status_callback) -> None:
-        if not self._host_session_id:
+        # Guard: don't reconnect if the user explicitly disconnected
+        if not self._host_session_id or self._relay.is_connected:
             return
         host, port = self._get_relay_config()
         status_callback("Reconnecting to relay...")

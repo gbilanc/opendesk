@@ -553,11 +553,24 @@ _global_capture: ScreenCapture | None = None
 
 
 def screenshot(monitor_index: int = 0) -> Image.Image:
+    """Take a single screenshot.
+
+    Uses a cached ``ScreenCapture`` instance for repeated calls.
+    Call ``release_screenshot_capture()`` to free resources.
+    """
     global _global_capture
     if _global_capture is None:
         _global_capture = ScreenCapture()
     frame = _global_capture.capture_one(monitor_index)
     return Image.fromarray(frame.data)
+
+
+def release_screenshot_capture() -> None:
+    """Release the global screenshot capture instance."""
+    global _global_capture
+    if _global_capture is not None:
+        _global_capture.release()
+        _global_capture = None
 
 
 # -------------------------------------------------------------------------
