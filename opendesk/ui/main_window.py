@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from opendesk.core.keyboard_state import caps_lock_active
+from opendesk.core.device_registry import DeviceRegistry
 from opendesk.core.screen_capture import ScreenCapture, CapturedFrame
 from opendesk.core.video_codec import VideoEncoder, EncoderConfig, QualityLevel, _QUALITY_BITRATE
 from opendesk.core.input_injection import (
@@ -129,6 +130,9 @@ class MainWindow(QMainWindow):
         self._bw_measure_bytes: int = 0
         self._bw_measure_time: float = 0.0
         self._bw_estimated_kbps: float = 0.0
+
+        # Device registry (persistent list of known devices)
+        self._device_registry = DeviceRegistry()
 
         # Device list from relay (cache)
         self._device_list_cache: list[dict] = []
@@ -489,10 +493,14 @@ class MainWindow(QMainWindow):
         """Called when the relay sends the current device list."""
         logger.debug("Device list received: %d devices", len(devices))
         self._device_list_cache = devices
+        # Merge into local registry
+        self._device_registry.merge_from_relay(devices)
         # Update connection dialog if it's open
         if hasattr(self, "_connection_dialog") and self._connection_dialog is not None:
             try:
-                self._connection_dialog.update_device_list(devices)
+                self._connection_dialog.update_device_list(
+                    self._device_registry.all()
+                )
             except Exception:
                 pass
 
