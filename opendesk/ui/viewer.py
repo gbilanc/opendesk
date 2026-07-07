@@ -60,6 +60,7 @@ _MIN_ZOOM = 0.1
 _MAX_ZOOM = 5.0
 _ZOOM_STEP = 1.15
 _HUD_UPDATE_MS = 1000  # HUD refresh interval
+_FRAME_TIMEOUT_MS = 10000  # 10 s without a frame → show warning
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +86,8 @@ class RemoteViewer(QGraphicsView):
     # Signal emitted with mouse/keyboard events for remote injection
     remote_mouse_event = Signal(int, int, int, bool, bool)  # x, y, button, pressed, abs
     remote_key_event = Signal(str, bool)  # key, pressed
+    # Signal emitted when no frame has been received for a while
+    frame_timeout = Signal()
 
     # ── Zoom modes ──────────────────────────────────────────────────
 
@@ -134,6 +137,11 @@ class RemoteViewer(QGraphicsView):
         self._hud_timer.timeout.connect(self._update_hud)
         self._hud_timer.start(_HUD_UPDATE_MS)
 
+        # ── Frame timeout watchdog ──
+        self._frame_timeout_timer = QTimer(self)
+        self._frame_timeout_timer.setSingleShot(True)
+        self._frame_timeout_timer.timeout.connect(self._on_frame_timeout)
+
         # Placeholder while disconnected
         self._show_placeholder()
 
@@ -178,9 +186,17 @@ class RemoteViewer(QGraphicsView):
         self._frame_count_since_hud += 1
         self._last_frame_time = time.time()
 
+        # Reset the frame timeout watchdog
+        if self._connection_active:
+            self._frame_timeout_timer.start(_FRAME_TIMEOUT_MS)
+
     def set_connection_active(self, active: bool) -> None:
         """Mark connection state for UI updates."""
         self._connection_active = active
+        if active:
+            self._frame_timeout_timer.start(_FRAME_TIMEOUT_MS)
+        else:
+            self._frame_timeout_timer.stop()
         self._show_placeholder()
 
     # ── Zoom / Fit ──────────────────────────────────────────────────
@@ -305,6 +321,10 @@ class RemoteViewer(QGraphicsView):
         super().keyReleaseEvent(event)
 
     # ── Internal ────────────────────────────────────────────────────
+
+    def _on_frame_timeout(self) -> None:
+        """Emitted when no frame arrives within the timeout window."""
+        self.frame_timeout.emit()
 
     def _show_placeholder(self) -> None:
         """Show a placeholder when not connected."""
@@ -537,6 +557,8 @@ class ViewerWindow(QMainWindow):
     MIN_WIDTH = 800
     MIN_HEIGHT = 600
 
+    frame_timeout = Signal()
+
     def __init__(
         self,
         on_mouse_event: Callable | None = None,
@@ -576,6 +598,7 @@ class ViewerWindow(QMainWindow):
             self._viewer.remote_mouse_event.connect(on_mouse_event)
         if on_key_event:
             self._viewer.remote_key_event.connect(on_key_event)
+        self._viewer.frame_timeout.connect(self._on_frame_timeout)
 
     # ── public API ──────────────────────────────────────────────────
 
@@ -583,6 +606,11 @@ class ViewerWindow(QMainWindow):
     def viewer(self) -> RemoteViewer:
         """The embedded RemoteViewer widget."""
         return self._viewer
+
+    @Slot()
+    def _on_frame_timeout(self) -> None:
+        """No frame received for a while — notify via signal."""
+        self.frame_timeout.emit()
 
     def display_frame(self, rgb_data: np.ndarray, width: int, height: int) -> None:
         """Display a decoded frame in the viewer."""

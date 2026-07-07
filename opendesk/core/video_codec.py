@@ -268,6 +268,12 @@ class VideoEncoder:
 class VideoDecoder:
     """H.264 decoder wrapping PyAV.
 
+    Uses an in-memory ``av.open`` with a raw H.264 demuxer
+    to properly handle Annex-B byte-stream (start codes).
+    This is more robust than a bare ``CodecContext`` because
+    the demuxer provides the necessary extradata (SPS/PPS)
+    to the decoder.
+
     Usage::
 
         dec = VideoDecoder()
@@ -287,22 +293,46 @@ class VideoDecoder:
             RGB uint8 (H, W, 3) or ``None`` if not enough data yet.
         """
         import av
+        import io
 
         with self._lock:
-            if self._codec is None:
-                self._codec = av.CodecContext.create("h264", "r")
-                self._codec.width = width
-                self._codec.height = height
-                self._codec.pix_fmt = "yuv420p"
-
-            packets = av.Packet(data)
-            frames = self._codec.decode(packets)
-            if not frames:
+            try:
+                # Use an in-memory demuxer to properly handle H.264 Annex B
+                # byte-stream with start codes.  This gives the decoder
+                # proper extradata (SPS/PPS) from the first keyframe.
+                fh = io.BytesIO(data)
+                container = av.open(fh, "r", format="h264")
+                for packet in container.demux():
+                    if packet.stream.type != "video":
+                        continue
+                    frames = packet.decode()
+                    if not frames:
+                        continue
+                    av_frame = frames[-1]
+                    rgb = av_frame.to_rgb().to_ndarray()
+                    container.close()
+                    return rgb
+                container.close()
                 return None
-
-            av_frame = frames[-1]
-            rgb = av_frame.to_rgb().to_ndarray()
-            return rgb
+            except Exception:
+                logger.debug("In-memory demuxer failed, fallback to CodecContext")
+                # Fallback: direct CodecContext (works for some streams)
+                try:
+                    if self._codec is None:
+                        self._codec = av.CodecContext.create("h264", "r")
+                    av_packet = av.Packet(data)
+                    frames = self._codec.decode(av_packet)
+                    if not frames:
+                        # Try flushing
+                        frames = self._codec.decode(None)
+                    if not frames:
+                        return None
+                    av_frame = frames[-1]
+                    rgb = av_frame.to_rgb().to_ndarray()
+                    return rgb
+                except Exception as e:
+                    logger.error("VideoDecoder failed: %s", e)
+                    return None
 
     def release(self) -> None:
         with self._lock:

@@ -411,10 +411,9 @@ class MainWindow(QMainWindow):
         """Relay connection lost."""
         logger.info("Relay disconnected")
         self._stop_streaming()
-        if self._connected:
-            self._set_connected(False)
-            self._status_text.setText("Disconnected")
-            self._peer_id = ""
+        self._set_connected(False)
+        self._status_text.setText("Disconnected")
+        self._peer_id = ""
 
     @Slot()
     def _on_peer_joined(self) -> None:
@@ -453,6 +452,20 @@ class MainWindow(QMainWindow):
         """A video frame was received from the remote host (client only)."""
         if self._viewer_window is not None:
             self._viewer_window.display_frame(rgb_data, width, height)
+
+    @Slot()
+    def _on_frame_timeout(self) -> None:
+        """No frame received for 10s — show error and disconnect."""
+        logger.warning("Frame timeout — no video frame received for 10 seconds")
+        QMessageBox.warning(
+            self,
+            "Connection Timeout",
+            "No video frames received from the remote host.\n"
+            "The connection may have been lost or the remote host may "
+            "be unable to stream.\n"
+            "Please check your connection and try again.",
+        )
+        self._on_disconnect()
 
     @Slot(object)
     def _on_relay_message(self, msg: Message) -> None:
@@ -541,6 +554,7 @@ class MainWindow(QMainWindow):
                 on_disconnect=self._on_disconnect,
                 parent=self,
             )
+            self._viewer_window.frame_timeout.connect(self._on_frame_timeout)
         self._viewer_window.set_connection_active(True, peer_name)
         self._viewer_window.show()
         self._viewer_window.raise_()

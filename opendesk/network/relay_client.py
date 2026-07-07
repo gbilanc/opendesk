@@ -63,6 +63,9 @@ class _RelaySession:
     Holds the TCP connection and event loop.  Incoming messages are
     pushed into ``inbox`` (a thread-safe queue).  Outgoing messages
     are sent via ``asyncio.run_coroutine_threadsafe()``.
+
+    Each session carries a ``session_seq`` number so that stale inbox
+    events from a previous session can be ignored.
     """
 
     def __init__(
@@ -75,6 +78,7 @@ class _RelaySession:
         inbox: queue.Queue,
         device_id: str = "",
         device_name: str = "",
+        session_seq: int = 0,
     ) -> None:
         self.host = host
         self.port = port
@@ -84,6 +88,7 @@ class _RelaySession:
         self.inbox = inbox
         self.device_id = device_id
         self.device_name = device_name
+        self.session_seq = session_seq
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._reader: asyncio.StreamReader | None = None
@@ -114,6 +119,13 @@ class _RelaySession:
             asyncio.run_coroutine_threadsafe(self._stop_async(), self._loop)
 
     async def _stop_async(self) -> None:
+        """Cleanly stop the network session.
+
+        Closes the TCP writer first — this causes the reader to fail
+        with ``ConnectionError`` / ``IncompleteReadError``, which
+        makes ``_read_loop`` exit naturally via its exception handler,
+        without needing to cancel tasks manually.
+        """
         self._running.clear()
         if self._writer:
             try:
@@ -124,16 +136,8 @@ class _RelaySession:
         if self._decoder:
             self._decoder.release()
             self._decoder = None
-        # Cancel all pending tasks to avoid
-        # "Task was destroyed but it is pending" warnings.
-        if self._loop and self._loop.is_running():
-            current = asyncio.current_task(self._loop)
-            for task in asyncio.all_tasks(self._loop):
-                if task is not current:
-                    task.cancel()
-            # Yield control so cancelled tasks can process their cancellation
-            await asyncio.sleep(0)
-            self._loop.stop()
+        # Small yield so shutdown tasks can propagate
+        await asyncio.sleep(0)
 
     # ── sending ─────────────────────────────────────────────────────
 
@@ -153,8 +157,8 @@ class _RelaySession:
             pass
         except Exception as e:
             logger.warning("Send error: %s", e)
-            self.inbox.put(("error", f"Send failed: {e}"))
-            self.inbox.put(("disconnected", None))
+            self.inbox.put(("error", f"Send failed: {e}", self.session_seq))
+            self.inbox.put(("disconnected", None, self.session_seq))
 
     # ── host flow ───────────────────────────────────────────────────
 
@@ -166,8 +170,8 @@ class _RelaySession:
             )
         except OSError as e:
             logger.error("Host connection failed: %s", e)
-            self.inbox.put(("error", str(e)))
-            self.inbox.put(("disconnected", None))
+            self.inbox.put(("error", str(e), self.session_seq))
+            self.inbox.put(("disconnected", None, self.session_seq))
             return
 
         # Register session with device identity
@@ -178,40 +182,40 @@ class _RelaySession:
         ))
 
         async for msg in self._read_loop():
-            self.inbox.put(("message", msg))
+            self.inbox.put(("message", msg, self.session_seq))
 
             t = msg.type
             if t == MessageType.RELAY_REGISTER:
-                self.inbox.put(("connected", ("host", self.session_id)))
+                self.inbox.put(("connected", ("host", self.session_id), self.session_seq))
 
             elif t == MessageType.RELAY_PEER_LIST:
-                self.inbox.put(("peer_joined", None))
+                self.inbox.put(("peer_joined", None, self.session_seq))
                 # Request auth from client
                 await self._send_async(Message.auth_request(self.session_id))
 
             elif t == MessageType.RELAY_DEVICE_LIST:
                 devices = msg.payload.get("devices", [])
-                self.inbox.put(("device_list", devices))
+                self.inbox.put(("device_list", devices, self.session_seq))
 
             elif t == MessageType.RELAY_DEVICE_UPDATE:
                 device = msg.payload.get("device", {})
                 online = msg.payload.get("online", False)
-                self.inbox.put(("device_update", (device, online)))
+                self.inbox.put(("device_update", (device, online), self.session_seq))
 
             elif t == MessageType.AUTH_RESPONSE:
                 client_pw = msg.payload.get("password", "")
                 success = client_pw == self.password
                 if success:
                     await self._send_async(Message.auth_ok())
-                    self.inbox.put(("auth_result", (True, "Authenticated")))
+                    self.inbox.put(("auth_result", (True, "Authenticated"), self.session_seq))
                 else:
                     await self._send_async(Message.auth_fail("Invalid password"))
-                    self.inbox.put(("auth_result", (False, "Invalid password")))
+                    self.inbox.put(("auth_result", (False, "Invalid password"), self.session_seq))
 
             elif t == MessageType.DISCONNECT:
                 break
 
-        self.inbox.put(("disconnected", None))
+        self.inbox.put(("disconnected", None, self.session_seq))
 
     # ── client flow ─────────────────────────────────────────────────
 
@@ -223,65 +227,73 @@ class _RelaySession:
             )
         except OSError as e:
             logger.error("Client connection failed: %s", e)
-            self.inbox.put(("error", str(e)))
-            self.inbox.put(("disconnected", None))
+            self.inbox.put(("error", str(e), self.session_seq))
+            self.inbox.put(("disconnected", None, self.session_seq))
             return
 
         # Join session
         await self._send_async(Message.relay_register(session_id=self.session_id))
 
         async for msg in self._read_loop():
-            self.inbox.put(("message", msg))
+            self.inbox.put(("message", msg, self.session_seq))
 
             t = msg.type
             if t == MessageType.RELAY_REGISTER and msg.payload.get("paired"):
-                self.inbox.put(("connected", ("client", self.session_id)))
+                self.inbox.put(("connected", ("client", self.session_id), self.session_seq))
 
             elif t == MessageType.AUTH_REQUEST:
                 await self._send_async(Message.auth_response(self.password))
-                self.inbox.put(("auth_requested", None))
+                self.inbox.put(("auth_requested", None, self.session_seq))
 
             elif t == MessageType.AUTH_OK:
-                self.inbox.put(("auth_result", (True, "Authenticated")))
+                self.inbox.put(("auth_result", (True, "Authenticated"), self.session_seq))
 
             elif t == MessageType.AUTH_FAIL:
                 reason = msg.payload.get("reason", "Authentication failed")
-                self.inbox.put(("auth_result", (False, reason)))
+                self.inbox.put(("auth_result", (False, reason), self.session_seq))
                 break
 
             elif t == MessageType.RELAY_DEVICE_LIST:
                 devices = msg.payload.get("devices", [])
-                self.inbox.put(("device_list", devices))
+                self.inbox.put(("device_list", devices, self.session_seq))
 
             elif t == MessageType.RELAY_DEVICE_UPDATE:
                 device = msg.payload.get("device", {})
                 online = msg.payload.get("online", False)
-                self.inbox.put(("device_update", (device, online)))
+                self.inbox.put(("device_update", (device, online), self.session_seq))
 
             elif t == MessageType.VIDEO_FRAME:
                 payload = msg.payload
                 width = payload.get("width", 0)
                 height = payload.get("height", 0)
                 data = payload.get("data")
+                keyframe = payload.get("keyframe", False)
+                logger.debug(
+                    "VIDEO_FRAME received: %dx%d, keyframe=%s, data_len=%d",
+                    width, height, keyframe, len(data) if data else 0,
+                )
                 if data and width > 0 and height > 0:
                     if self._decoder is None:
                         self._decoder = VideoDecoder()
                     try:
                         rgb = self._decoder.decode(data, width, height)
                         if rgb is not None:
-                            self.inbox.put(("frame", (rgb.copy(), width, height)))
+                            self.inbox.put(("frame", (rgb.copy(), width, height), self.session_seq))
+                            logger.debug("Frame decoded successfully: %dx%d", width, height)
+                        else:
+                            logger.warning("Frame decode returned None — decoder not ready yet")
                     except Exception as e:
-                        logger.warning("Frame decode error: %s", e)
+                        logger.exception("Frame decode error: %s", e)
 
             elif t == MessageType.ERROR:
                 err = msg.payload.get("message", "Unknown relay error")
-                self.inbox.put(("error", err))
+                self.inbox.put(("error", err, self.session_seq))
                 break
 
             elif t == MessageType.DISCONNECT:
                 break
 
-        self.inbox.put(("disconnected", None))
+        self.inbox.put(("disconnected", None, self.session_seq))
 
     # ── I/O helpers ─────────────────────────────────────────────────
 
@@ -341,26 +353,41 @@ class RelayClient(QObject):
         self._timer.timeout.connect(self._poll_inbox)
         self._timer.start(_POLL_INTERVAL_MS)
         self._role: RelayRole | None = None
+        self._current_seq: int = 0
 
     # ── public API ──────────────────────────────────────────────────
+
+    def _drain_inbox(self) -> None:
+        """Discard any stale events left from a previous session."""
+        while not self._inbox.empty():
+            try:
+                self._inbox.get_nowait()
+            except queue.Empty:
+                break
 
     def start_hosting(self, host: str, port: int, session_id: str, password: str,
                       device_id: str = "", device_name: str = "") -> None:
         """Connect to relay and register as host."""
         self._stop_session()
+        self._drain_inbox()
+        self._current_seq += 1
         self._role = RelayRole.HOST
         self._session = _RelaySession(
             host, port, session_id, password, RelayRole.HOST, self._inbox,
             device_id=device_id, device_name=device_name,
+            session_seq=self._current_seq,
         )
         self._start_thread()
 
     def join_session(self, host: str, port: int, session_id: str, password: str) -> None:
         """Connect to relay and join a session as client."""
         self._stop_session()
+        self._drain_inbox()
+        self._current_seq += 1
         self._role = RelayRole.CLIENT
         self._session = _RelaySession(
             host, port, session_id, password, RelayRole.CLIENT, self._inbox,
+            session_seq=self._current_seq,
         )
         self._start_thread()
 
@@ -416,12 +443,25 @@ class RelayClient(QObject):
 
     @Slot()
     def _poll_inbox(self) -> None:
-        """Process messages from the network thread (runs in UI thread)."""
+        """Process messages from the network thread (runs in UI thread).
+
+        Ignores events from stale sessions (e.g. a ``disconnected``
+        event from a previous session that was still flushing its
+        inbox after a new session was started).
+        """
         while not self._inbox.empty():
             try:
-                event, data = self._inbox.get_nowait()
+                event, data, seq = self._inbox.get_nowait()
             except queue.Empty:
                 break
+
+            # Skip stale events from a previous session
+            if seq != self._current_seq:
+                logger.debug(
+                    "Skipping stale event '%s' (seq %d, current %d)",
+                    event, seq, self._current_seq,
+                )
+                continue
 
             if event == "connected":
                 role_str, sid = data
