@@ -31,6 +31,7 @@ import numpy as np
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
 
 from opendesk.network.protocol import Message, MessageType
+from opendesk.core.video_codec import VideoDecoder
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,7 @@ class _RelaySession:
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._running = threading.Event()
+        self._decoder: VideoDecoder | None = None
 
     # ── lifecycle ───────────────────────────────────────────────────
 
@@ -115,6 +117,9 @@ class _RelaySession:
             except Exception:
                 pass
             self._writer = None
+        if self._decoder:
+            self._decoder.release()
+            self._decoder = None
         # Cancel all pending tasks to avoid
         # "Task was destroyed but it is pending" warnings.
         if self._loop and self._loop.is_running():
@@ -231,12 +236,16 @@ class _RelaySession:
                 payload = msg.payload
                 width = payload.get("width", 0)
                 height = payload.get("height", 0)
-                data_b64 = payload.get("data")
-                if data_b64 and width > 0 and height > 0:
-                    import base64
-                    raw = base64.b64decode(data_b64)
-                    rgb = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3)
-                    self.inbox.put(("frame", (rgb.copy(), width, height)))
+                data = payload.get("data")
+                if data and width > 0 and height > 0:
+                    if self._decoder is None:
+                        self._decoder = VideoDecoder()
+                    try:
+                        rgb = self._decoder.decode(data, width, height)
+                        if rgb is not None:
+                            self.inbox.put(("frame", (rgb.copy(), width, height)))
+                    except Exception as e:
+                        logger.warning("Frame decode error: %s", e)
 
             elif t == MessageType.ERROR:
                 err = msg.payload.get("message", "Unknown relay error")
@@ -263,11 +272,9 @@ class _RelaySession:
                 logger.debug("Read cancelled (shutting down)")
                 break
 
-    def send_frame(self, rgb: np.ndarray, width: int, height: int, pts: int) -> None:
-        """Send a VIDEO_FRAME over the relay."""
-        import base64
-        data_b64 = base64.b64encode(rgb.tobytes()).decode()
-        msg = Message.video_frame(data=data_b64, width=width, height=height, pts=pts)
+    def send_frame(self, data: bytes, width: int, height: int, pts: int, keyframe: bool = False) -> None:
+        """Send an encoded (H.264) VIDEO_FRAME over the relay."""
+        msg = Message.video_frame(data=data, width=width, height=height, pts=pts, keyframe=keyframe)
         self.send_message(msg)
 
 

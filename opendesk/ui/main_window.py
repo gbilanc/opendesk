@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 
 from opendesk.core.keyboard_state import caps_lock_active
 from opendesk.core.screen_capture import ScreenCapture, CapturedFrame
+from opendesk.core.video_codec import VideoEncoder, EncoderConfig, QualityLevel, _QUALITY_BITRATE
 from opendesk.core.input_injection import (
     InputBackend,
     MouseButton,
@@ -98,6 +99,7 @@ class MainWindow(QMainWindow):
         self._capture_thread: threading.Thread | None = None
         self._capture_running = False
         self._input_backend: InputBackend | None = None
+        self._encoder: VideoEncoder | None = None
 
         # Streaming timer (host): polls screen capture at target FPS
         self._stream_timer = QTimer(self)
@@ -489,8 +491,29 @@ class MainWindow(QMainWindow):
             self._set_connected(True)
             self._status_text.setText("Streaming to remote client...")
 
-            # Start streaming timer at target FPS
+            # Read settings before capture
             fps = int(self._settings.value("video/max_fps", 30))
+            quality_name = self._settings.value("video/quality", "MEDIUM")
+            quality = getattr(QualityLevel, quality_name, QualityLevel.MEDIUM)
+
+            # Capture one frame to determine resolution, then init encoder
+            first = self._capture.capture_one(0)
+            if first is not None:
+                self._encoder = VideoEncoder(
+                    EncoderConfig(
+                        width=first.width,
+                        height=first.height,
+                        fps=fps,
+                        bitrate=_QUALITY_BITRATE[quality],
+                        quality=quality,
+                    )
+                )
+                logger.info(
+                    "Encoder initialised: %dx%d @ %s",
+                    first.width, first.height, quality_name,
+                )
+
+            # Start streaming timer at target FPS
             self._stream_timer.start(int(1000 / fps))
             self._capture_running = True
             logger.info("Screen capture started at %d FPS", fps)
@@ -509,24 +532,35 @@ class MainWindow(QMainWindow):
         if self._capture:
             self._capture.release()
             self._capture = None
+        if self._encoder:
+            self._encoder.release()
+            self._encoder = None
         if self._input_backend:
             self._input_backend.release()
             self._input_backend = None
 
     @Slot()
     def _capture_and_send_frame(self) -> None:
-        """Capture a single frame and send it via relay (called by timer)."""
+        """Capture a single frame, encode as H.264, and send via relay."""
         if not self._capture_running or self._capture is None:
             return
         try:
             frame = self._capture.capture_one(0)
-            if frame is not None:
+            if frame is None or self._encoder is None:
+                return
+
+            pts = int(frame.timestamp * 1000)
+            packets = self._encoder.encode(frame.data)
+            for pkt in packets:
                 self._relay.send_frame(
-                    frame.data, frame.width, frame.height,
-                    int(frame.timestamp * 1000),
+                    pkt.data,
+                    pkt.width,
+                    pkt.height,
+                    pts,
+                    keyframe=pkt.is_keyframe,
                 )
         except Exception as e:
-            logger.warning("Capture error: %s", e)
+            logger.warning("Capture/encode error: %s", e)
 
     # ── Input injection (host) ──────────────────────────────────────
 
