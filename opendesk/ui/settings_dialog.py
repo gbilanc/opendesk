@@ -18,7 +18,10 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QCheckBox,
+    QPushButton,
     QSlider,
     QSpinBox,
     QTabWidget,
@@ -27,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from opendesk.core.video_codec import QualityLevel
+from opendesk.core.device_registry import DeviceRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -41,13 +45,18 @@ _APP = "OpenDesk"
 class SettingsDialog(QDialog):
     """Application settings dialog with tabs."""
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        device_registry: DeviceRegistry | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.setMinimumWidth(500)
-        self.setMinimumHeight(400)
+        self.setMinimumWidth(520)
+        self.setMinimumHeight(450)
 
         self._settings = QSettings(_ORG, _APP)
+        self._registry = device_registry
 
         self._setup_ui()
         self._load_settings()
@@ -111,17 +120,49 @@ class SettingsDialog(QDialog):
 
         # ── Tab 3: Security ──
         sec_tab = QWidget()
-        sec_layout = QFormLayout(sec_tab)
+        sec_layout = QVBoxLayout(sec_tab)
         sec_layout.setSpacing(12)
 
-        self._require_auth = QCheckBox("Require password for incoming connections")
-        self._require_auth.setChecked(True)
-        sec_layout.addRow("", self._require_auth)
+        # ── Auth group ──
+        auth_group = QGroupBox("Accesso")
+        auth_form = QFormLayout(auth_group)
+        auth_form.setSpacing(8)
 
-        self._e2ee_check = QCheckBox("Enable end-to-end encryption")
+        self._require_auth = QCheckBox("Richiedi password per connessioni in ingresso")
+        self._require_auth.setChecked(True)
+        auth_form.addRow("", self._require_auth)
+
+        self._e2ee_check = QCheckBox("Abilita crittografia end-to-end")
         self._e2ee_check.setChecked(True)
-        self._e2ee_check.setEnabled(True)
-        sec_layout.addRow("", self._e2ee_check)
+        auth_form.addRow("", self._e2ee_check)
+
+        sec_layout.addWidget(auth_group)
+
+        # ── Authorized devices group ──
+        auth_dev_group = QGroupBox("Dispositivi pre-autorizzati")
+        auth_dev_layout = QVBoxLayout(auth_dev_group)
+
+        desc = QLabel(
+            "I dispositivi in questa lista possono connettersi "
+            "senza inserire la password."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet("font-size: 12px;")
+        auth_dev_layout.addWidget(desc)
+
+        self._trusted_list = QListWidget()
+        self._trusted_list.setMinimumHeight(120)
+        auth_dev_layout.addWidget(self._trusted_list)
+
+        btn_row = QHBoxLayout()
+        self._remove_trusted_btn = QPushButton("Rimuovi")
+        self._remove_trusted_btn.clicked.connect(self._remove_trusted_device)
+        btn_row.addWidget(self._remove_trusted_btn)
+        btn_row.addStretch()
+        auth_dev_layout.addLayout(btn_row)
+
+        sec_layout.addWidget(auth_dev_group)
+        sec_layout.addStretch()
 
         tabs.addTab(sec_tab, "Security")
 
@@ -186,6 +227,37 @@ class SettingsDialog(QDialog):
         self._enable_audio.setChecked(
             self._settings.value("audio/enabled", False, type=bool)
         )
+
+        self._populate_trusted_devices()
+
+    def _populate_trusted_devices(self) -> None:
+        """Populate the list of pre-authorized devices."""
+        self._trusted_list.clear()
+        if self._registry is None:
+            self._trusted_list.addItem("(nessun registro dispositivi)")
+            return
+
+        trusted = self._registry.trusted()
+        if not trusted:
+            self._trusted_list.addItem("Nessun dispositivo pre-autorizzato")
+            return
+
+        for dev in trusted:
+            text = f"{dev.device_name}  ({dev.device_id[:8]}…)"
+            item = QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, dev.device_id)
+            self._trusted_list.addItem(item)
+
+    @Slot()
+    def _remove_trusted_device(self) -> None:
+        """Remove the selected device from the trusted list."""
+        item = self._trusted_list.currentItem()
+        if item is None:
+            return
+        device_id = item.data(Qt.ItemDataRole.UserRole)
+        if device_id and self._registry:
+            self._registry.set_trusted(device_id, False)
+            self._populate_trusted_devices()
 
     def _save_settings(self) -> None:
         """Save current UI values to QSettings."""

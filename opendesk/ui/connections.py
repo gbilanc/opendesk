@@ -22,6 +22,7 @@ from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
