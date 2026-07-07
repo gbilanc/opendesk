@@ -290,17 +290,13 @@ class MainWindow(QMainWindow):
         self.addToolBar(toolbar)
 
     def _setup_docks(self) -> None:
-        """Create dock widgets (chat, file transfers)."""
-        # ── Chat panel (right) ──
+        """Create floating windows for chat and file transfers."""
+        # ── Chat window ──
         self._chat_panel = ChatPanel(self)
         self._chat_panel.message_sent.connect(self._on_chat_message_sent)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._chat_panel)
 
-        # ── File transfers (bottom) ──
+        # ── File transfers window ──
         self._transfer_dock = FileTransferDock(self)
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._transfer_dock)
-
-        self.tabifyDockWidget(self._chat_panel, self._transfer_dock)
 
     def _setup_central_widget(self) -> None:
         """Build the central area with session info + remote viewer."""
@@ -817,13 +813,23 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_toggle_chat(self) -> None:
-        """Show/hide the chat panel."""
-        self._chat_panel.setVisible(self.act_show_chat.isChecked())
+        """Show/hide the chat window."""
+        if self.act_show_chat.isChecked():
+            self._chat_panel.show()
+            self._chat_panel.raise_()
+            self._chat_panel.activateWindow()
+        else:
+            self._chat_panel.hide()
 
     @Slot()
     def _on_toggle_transfers(self) -> None:
-        """Show/hide the file transfers panel."""
-        self._transfer_dock.setVisible(self.act_show_transfers.isChecked())
+        """Show/hide the file transfers window."""
+        if self.act_show_transfers.isChecked():
+            self._transfer_dock.show()
+            self._transfer_dock.raise_()
+            self._transfer_dock.activateWindow()
+        else:
+            self._transfer_dock.hide()
 
     @Slot(str)
     def _on_chat_message_sent(self, text: str) -> None:

@@ -9,7 +9,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal, Slot, QSize
 from PySide6.QtWidgets import (
-    QDockWidget,
+    QDialog,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -26,23 +26,17 @@ from opendesk.core.file_transfer import TransferJob, TransferState
 logger = logging.getLogger(__name__)
 
 
-class FileTransferDock(QDockWidget):
-    """Dock widget showing active/completed file transfers."""
+class FileTransferDock(QDialog):
+    """Standalone window showing active/completed file transfers."""
 
     cancel_requested = Signal(str)  # job_id
     pause_requested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__("File Transfers", parent)
-        self.setAllowedAreas(
-            Qt.DockWidgetArea.RightDockWidgetArea
-            | Qt.DockWidgetArea.BottomDockWidgetArea
-        )
-        self.setMinimumWidth(320)
-        self.setFeatures(
-            QDockWidget.DockWidgetFeature.DockWidgetClosable
-            | QDockWidget.DockWidgetFeature.DockWidgetMovable
-        )
+        super().__init__(parent)
+        self.setWindowTitle("File Transfers")
+        self.setMinimumSize(380, 350)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
 
         # ── Central widget ──
         central = QWidget(self)

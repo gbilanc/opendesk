@@ -10,7 +10,7 @@ import time
 from PySide6.QtCore import Qt, Signal, Slot, QSize
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QDockWidget,
+    QDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -26,22 +26,17 @@ logger = logging.getLogger(__name__)
 _MAX_MESSAGES = 500
 
 
-class ChatPanel(QDockWidget):
-    """Dock widget for in-session chat."""
+class ChatPanel(QDialog):
+    """Standalone window for in-session chat."""
 
     message_sent = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__("Chat", parent)
-        self.setAllowedAreas(
-            Qt.DockWidgetArea.RightDockWidgetArea
-            | Qt.DockWidgetArea.BottomDockWidgetArea
-        )
-        self.setMinimumWidth(280)
-        self.setFeatures(
-            QDockWidget.DockWidgetFeature.DockWidgetClosable
-            | QDockWidget.DockWidgetFeature.DockWidgetMovable
-        )
+        super().__init__(parent)
+        self.setWindowTitle("Chat")
+        self.setMinimumSize(320, 400)
+        self.resize(360, 450)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
 
         # ── Central widget ──
         central = QWidget(self)
