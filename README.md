@@ -61,7 +61,6 @@ opendesk/
 │   ├── crypto/        # E2E encryption (NaCl Box), Argon2 auth
 │   ├── ui/            # PySide6 widgets + QSS themes (light/dark)
 │   └── utils/         # Logging, platform detection
-├── relay_server/      # Standalone TCP relay server
 ├── tests/             # 92 tests — unit, integration, edge cases
 └── uv.lock            # Locked dependencies (53 packages)
 ```
@@ -69,46 +68,38 @@ opendesk/
 ## Commands
 
 ```bash
-uv run opendesk            # Start the remote desktop client
-uv run opendesk-relay --port 8474  # Start relay server
-uv run pytest              # Run all tests
+uv run opendesk  # Start the remote desktop client
+uv run pytest    # Run all tests
 ```
 
 ## Relay server
 
-Il relay server permette la connessione quando P2P diretto (WebRTC) non è possibile
-(NAT simmetrico, firewall restrittivi).
+Il relay server è ora un'app standalone separata in **`../opendesk-relay`** (o
+[github.com/opendesk/opendesk-relay](https://github.com/opendesk/opendesk-relay)).
+
+Documentazione completa e istruzioni nel README del progetto relay:
+
+```bash
+cd ../opendesk-relay
+cat README.md
+```
 
 ### Avvio rapido
 
 ```bash
-# Con uv (raccomandato)
-uv run opendesk-relay --port 8474
-
-# Con pip
-opendesk-relay --port 8474
-
-# O direttamente
-python3 -m relay_server.server --port 8474
+cd ../opendesk-relay
+uv sync
+uv run relay-server --port 8474
 ```
 
 ### Installazione come servizio systemd (Linux)
 
 ```bash
-# Installa come servizio di sistema
-sudo ./scripts/install-relay.sh --port 8474
-
-# Avvia
-sudo systemctl start opendesk-relay
-
-# Logs in tempo reale
-sudo journalctl -u opendesk-relay -f
-
-# Riavvia dopo aggiornamenti
-sudo systemctl restart opendesk-relay
+sudo ./opendesk-relay/install-relay.sh --port 8474
+# (dalla directory opendesk, o esegui dal progetto opendesk-relay)
 ```
 
-### Configurazione client
+### Configurazione client OpenDesk
 
 Nelle impostazioni del client OpenDesk (Tools → Settings → Network), imposta:
 
@@ -117,16 +108,3 @@ Nelle impostazioni del client OpenDesk (Tools → Settings → Network), imposta
 | **Relay Host** | IP pubblico del server |
 | **Relay Port** | 8474 (o la porta configurata) |
 | **Enable relay** | ✅ |
-
-### Opzioni CLI
-
-```
-opendesk-relay --help
-opendesk-relay --host 0.0.0.0 --port 8474 --debug
-```
-
-| Opzione | Default | Descrizione |
-|---------|---------|-------------|
-| `--host` | `0.0.0.0` | Indirizzo su cui ascoltare |
-| `--port` | `8474` | Porta TCP |
-| `--debug` | off | Logging dettagliato |

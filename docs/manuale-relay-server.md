@@ -86,8 +86,11 @@ uv run opendesk-relay --port 8474
 opendesk-relay --port 8474
 
 # Direttamente con Python
-python3 -m relay_server.server --port 8474
+python3 -m relay_server --port 8474
 ```
+
+> **Nota:** Il relay server è ora un'app standalone in `../opendesk-relay/`.
+> Documentazione completa: `../opendesk-relay/README.md`
 
 ### 3.2 Opzioni CLI
 
@@ -456,7 +459,9 @@ Il relay server **non decifra** i messaggi. La crittografia E2E (Curve25519 + XS
 ### 9.1 Script di installazione
 
 ```bash
-sudo ./scripts/install-relay.sh [--port PORT]
+# Dalla directory del progetto relay
+cd ../opendesk-relay
+sudo ./install-relay.sh [--port PORT]
 ```
 
 Lo script:
@@ -532,8 +537,8 @@ Il service include misure di sicurezza **systemd-hardening**:
 | `opendesk/crypto/auth.py` | `AuthManager`, hashing Argon2id, session ID |
 | `opendesk/crypto/e2ee.py` | Crittografia E2E (NaCl Box) |
 | `opendesk/ui/settings_dialog.py` | UI impostazioni relay (Tab Network) |
-| `scripts/opendesk-relay.service` | Template servizio systemd |
-| `scripts/install-relay.sh` | Script di installazione servizio |
+| `install-relay.sh` | Script di installazione servizio (in `opendesk-relay/`) |
+| `opendesk-relay.service` | Template servizio systemd (in `opendesk-relay/`) |
 
 ### 10.2 Costanti importanti
 
@@ -560,7 +565,7 @@ Il relay server è registrato come script CLI in `pyproject.toml`:
 
 ```toml
 [project.scripts]
-opendesk-relay = "relay_server.server:main"
+opendesk-relay = "relay_server.__main__:main"
 ```
 
 ### 10.4 Test

@@ -51,7 +51,7 @@ audio = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["opendesk*", "relay_server*"]
+include = ["opendesk*"]
 
 [tool.setuptools.package-data]
 "*" = ["*.qss", "*.png", "*.svg", "*.ico"]
@@ -77,6 +77,8 @@ python_version = "3.12"
 strict = false
 ignore_missing_imports = true
 
+
+
 [project.scripts]
 opendesk = "opendesk.app:main"
-opendesk-relay = "relay_server.server:main"
+
