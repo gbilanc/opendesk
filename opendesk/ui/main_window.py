@@ -438,17 +438,22 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_frame_timeout(self) -> None:
         logger.warning("Frame timeout — no video frame received for 10 seconds")
-        QMessageBox.warning(self, "Connection Timeout",
-            "No video frames received from the remote host.\n"
-            "Please check your connection and try again.")
-        self._on_disconnect()
+        # Don't disconnect — the relay/p2p connection may still be
+        # healthy; only the video stream is stalled.
+        self._status_text.setText("⚠ No video frames — connection may be stalled")
+        self._stop_streaming()
 
     @Slot(str)
     def _on_stream_error(self, error_msg: str) -> None:
-        """Stream error (from StreamService)."""
+        """Stream error (from StreamService).
+
+        Log the error but do NOT disconnect — the relay connection
+        stays alive so the peer doesn't get a spurious "Peer
+        disconnected" error.  The host can retry streaming later.
+        """
         logger.error("Stream error: %s", error_msg)
-        QMessageBox.critical(self, "Streaming Error", error_msg)
-        self._on_disconnect()
+        self._status_text.setText(f"⚠ Streaming error: {error_msg}")
+        self._stop_streaming()
 
     @Slot(object)
     def _on_relay_message(self, msg: Message) -> None:
@@ -558,9 +563,22 @@ class MainWindow(QMainWindow):
             self._viewer_window.hide()
 
     def _start_host_streaming(self) -> None:
-        """Start screen capture and send frames to the client."""
-        self._set_connected(True)
-        self._show_viewer_window(peer_name="Host")
+        """Start screen capture and send frames to the client.
+
+        Called on the HOST side when the remote peer authenticates.
+        We update the UI to reflect the active session and start
+        streaming screen frames TO the client.  Unlike the client
+        side, we do NOT open a ViewerWindow here — the client is
+        the one viewing our screen.
+        """
+        logger.info("Host streaming: auth succeeded, client connected")
+        self._connected = True
+        self.act_connect.setEnabled(False)
+        self.act_disconnect.setEnabled(True)
+        self._session_status.set_status(
+            f"Streaming to client", connected=True,
+        )
+        self.setWindowTitle(f"OpenDesk — Streaming")
         self._status_text.setText("Streaming to remote client...")
         self._stream.start_streaming()
 
