@@ -192,46 +192,49 @@ class _RelaySession:
             device_name=self.device_name,
         ))
 
-        async for msg in self._read_loop():
-            self.inbox.put(("message", msg, self.session_seq))
+        gen = self._read_loop()
+        try:
+            async for msg in gen:
+                self.inbox.put(("message", msg, self.session_seq))
 
-            t = msg.type
-            if t == MessageType.RELAY_REGISTER:
-                self.inbox.put(("connected", ("host", self.session_id), self.session_seq))
+                t = msg.type
+                if t == MessageType.RELAY_REGISTER:
+                    self.inbox.put(("connected", ("host", self.session_id), self.session_seq))
 
-            elif t == MessageType.RELAY_PEER_LIST:
-                self.inbox.put(("peer_joined", None, self.session_seq))
-                # Challenge-response auth: generate nonce, send to client
-                nonce = generate_nonce()
-                self._auth_nonce = nonce
-                await self._send_async(Message.auth_request(self.session_id, nonce=nonce))
+                elif t == MessageType.RELAY_PEER_LIST:
+                    self.inbox.put(("peer_joined", None, self.session_seq))
+                    # Challenge-response auth: generate nonce, send to client
+                    nonce = generate_nonce()
+                    self._auth_nonce = nonce
+                    await self._send_async(Message.auth_request(self.session_id, nonce=nonce))
 
-            elif t == MessageType.RELAY_DEVICE_LIST:
-                devices = msg.payload.get("devices", [])
-                self.inbox.put(("device_list", devices, self.session_seq))
+                elif t == MessageType.RELAY_DEVICE_LIST:
+                    devices = msg.payload.get("devices", [])
+                    self.inbox.put(("device_list", devices, self.session_seq))
 
-            elif t == MessageType.RELAY_DEVICE_UPDATE:
-                device = msg.payload.get("device", {})
-                online = msg.payload.get("online", False)
-                self.inbox.put(("device_update", (device, online), self.session_seq))
+                elif t == MessageType.RELAY_DEVICE_UPDATE:
+                    device = msg.payload.get("device", {})
+                    online = msg.payload.get("online", False)
+                    self.inbox.put(("device_update", (device, online), self.session_seq))
 
-            elif t == MessageType.AUTH_RESPONSE:
-                client_hash = msg.payload.get("nonce_hash", "")
-                success = verify_response(self._auth_nonce, self.password, client_hash)
-                if success:
-                    await self._send_async(Message.auth_ok())
-                    self.inbox.put(("auth_result", (True, "Authenticated"), self.session_seq))
-                else:
-                    await self._send_async(Message.auth_fail("Invalid credentials"))
-                    self.inbox.put(("auth_result", (False, "Invalid credentials"), self.session_seq))
+                elif t == MessageType.AUTH_RESPONSE:
+                    client_hash = msg.payload.get("nonce_hash", "")
+                    success = verify_response(self._auth_nonce, self.password, client_hash)
+                    if success:
+                        await self._send_async(Message.auth_ok())
+                        self.inbox.put(("auth_result", (True, "Authenticated"), self.session_seq))
+                    else:
+                        await self._send_async(Message.auth_fail("Invalid credentials"))
+                        self.inbox.put(("auth_result", (False, "Invalid credentials"), self.session_seq))
 
-            elif t == MessageType.VIDEO_REQUEST_KEYFRAME:
-                logger.debug("Peer requested keyframe (host)")
-                self.inbox.put(("keyframe_requested", None, self.session_seq))
+                elif t == MessageType.VIDEO_REQUEST_KEYFRAME:
+                    logger.debug("Peer requested keyframe (host)")
+                    self.inbox.put(("keyframe_requested", None, self.session_seq))
 
-            elif t == MessageType.DISCONNECT:
-                break
-
+                elif t == MessageType.DISCONNECT:
+                    break
+        finally:
+            await gen.aclose()
         self.inbox.put(("disconnected", None, self.session_seq))
 
     # ── client flow ─────────────────────────────────────────────────
@@ -261,99 +264,102 @@ class _RelaySession:
             {"lookup_device": self.session_id},
         ))
 
-        async for msg in self._read_loop():
-            self.inbox.put(("message", msg, self.session_seq))
+        gen = self._read_loop()
+        try:
+            async for msg in gen:
+                self.inbox.put(("message", msg, self.session_seq))
 
-            t = msg.type
-            if t == MessageType.RELAY_REGISTER:
-                if msg.payload.get("paired"):
-                    self.inbox.put(("connected", ("client", self.session_id), self.session_seq))
-                elif msg.payload.get("mode") == "host":
-                    # Session doesn't exist — we were registered as host instead
-                    logger.warning("Session %s not found on relay", self.session_id)
-                    self.inbox.put(("error", f"Session {self.session_id} not found", self.session_seq))
-                    self.inbox.put(("disconnected", None, self.session_seq))
+                t = msg.type
+                if t == MessageType.RELAY_REGISTER:
+                    if msg.payload.get("paired"):
+                        self.inbox.put(("connected", ("client", self.session_id), self.session_seq))
+                    elif msg.payload.get("mode") == "host":
+                        # Session doesn't exist — we were registered as host instead
+                        logger.warning("Session %s not found on relay", self.session_id)
+                        self.inbox.put(("error", f"Session {self.session_id} not found", self.session_seq))
+                        self.inbox.put(("disconnected", None, self.session_seq))
+                        break
+
+                elif t == MessageType.AUTH_REQUEST:
+                    nonce = msg.payload.get("nonce", "")
+                    nonce_hash = compute_response(nonce, self.password) if nonce else ""
+                    await self._send_async(Message.auth_response(nonce_hash))
+                    self.inbox.put(("auth_requested", None, self.session_seq))
+
+                elif t == MessageType.AUTH_OK:
+                    self.inbox.put(("auth_result", (True, "Authenticated"), self.session_seq))
+
+                elif t == MessageType.AUTH_FAIL:
+                    reason = msg.payload.get("reason", "Authentication failed")
+                    self.inbox.put(("auth_result", (False, reason), self.session_seq))
                     break
 
-            elif t == MessageType.AUTH_REQUEST:
-                nonce = msg.payload.get("nonce", "")
-                nonce_hash = compute_response(nonce, self.password) if nonce else ""
-                await self._send_async(Message.auth_response(nonce_hash))
-                self.inbox.put(("auth_requested", None, self.session_seq))
+                elif t == MessageType.RELAY_DEVICE_LIST:
+                    devices = msg.payload.get("devices", [])
+                    self.inbox.put(("device_list", devices, self.session_seq))
 
-            elif t == MessageType.AUTH_OK:
-                self.inbox.put(("auth_result", (True, "Authenticated"), self.session_seq))
+                elif t == MessageType.RELAY_DEVICE_UPDATE:
+                    device = msg.payload.get("device", {})
+                    online = msg.payload.get("online", False)
+                    self.inbox.put(("device_update", (device, online), self.session_seq))
 
-            elif t == MessageType.AUTH_FAIL:
-                reason = msg.payload.get("reason", "Authentication failed")
-                self.inbox.put(("auth_result", (False, reason), self.session_seq))
-                break
-
-            elif t == MessageType.RELAY_DEVICE_LIST:
-                devices = msg.payload.get("devices", [])
-                self.inbox.put(("device_list", devices, self.session_seq))
-
-            elif t == MessageType.RELAY_DEVICE_UPDATE:
-                device = msg.payload.get("device", {})
-                online = msg.payload.get("online", False)
-                self.inbox.put(("device_update", (device, online), self.session_seq))
-
-            elif t == MessageType.VIDEO_FRAME:
-                payload = msg.payload
-                width = payload.get("width", 0)
-                height = payload.get("height", 0)
-                data = payload.get("data")
-                is_keyframe = payload.get("keyframe", False)
-                logger.debug(
-                    "VIDEO_FRAME received: %dx%d, keyframe=%s, data_len=%d",
-                    width, height, is_keyframe, len(data) if data else 0,
-                )
-                if data and width > 0 and height > 0:
-                    if self._decoder is None:
-                        self._decoder = VideoDecoder()
-                    try:
-                        rgb = self._decoder.decode(
-                            data, width, height, is_keyframe=is_keyframe,
-                        )
-                        if rgb is not None:
-                            self.inbox.put(
-                                ("frame", (rgb.copy(), width, height), self.session_seq),
+                elif t == MessageType.VIDEO_FRAME:
+                    payload = msg.payload
+                    width = payload.get("width", 0)
+                    height = payload.get("height", 0)
+                    data = payload.get("data")
+                    is_keyframe = payload.get("keyframe", False)
+                    logger.debug(
+                        "VIDEO_FRAME received: %dx%d, keyframe=%s, data_len=%d",
+                        width, height, is_keyframe, len(data) if data else 0,
+                    )
+                    if data and width > 0 and height > 0:
+                        if self._decoder is None:
+                            self._decoder = VideoDecoder()
+                        try:
+                            rgb = self._decoder.decode(
+                                data, width, height, is_keyframe=is_keyframe,
                             )
-                            logger.debug(
-                                "Frame decoded successfully: %dx%d", width, height,
-                            )
-                        else:
-                            logger.warning(
-                                "Frame decode returned None%s",
-                                " — decoder not ready yet" if not is_keyframe else "",
-                            )
-                            # If we're getting non-keyframes without a prior
-                            # keyframe, ask the host to send one.
-                            if not is_keyframe and self._decoder is not None:
-                                self._decoder.reset()
-                                await self._send_async(
-                                    Message(MessageType.VIDEO_REQUEST_KEYFRAME, {}),
+                            if rgb is not None:
+                                self.inbox.put(
+                                    ("frame", (rgb.copy(), width, height), self.session_seq),
                                 )
-                    except Exception as e:
-                        logger.exception("Frame decode error: %s", e)
-                        self._decoder.reset()
-                        await self._send_async(
-                            Message(MessageType.VIDEO_REQUEST_KEYFRAME, {}),
-                        )
-            elif t == MessageType.VIDEO_REQUEST_KEYFRAME:
-                logger.debug("Keyframe requested by peer")
-                # Forward to host via inbox so the StreamService can
-                # force a keyframe on the encoder.
-                self.inbox.put(("keyframe_requested", None, self.session_seq))
+                                logger.debug(
+                                    "Frame decoded successfully: %dx%d", width, height,
+                                )
+                            else:
+                                logger.warning(
+                                    "Frame decode returned None%s",
+                                    " — decoder not ready yet" if not is_keyframe else "",
+                                )
+                                # If we're getting non-keyframes without a prior
+                                # keyframe, ask the host to send one.
+                                if not is_keyframe and self._decoder is not None:
+                                    self._decoder.reset()
+                                    await self._send_async(
+                                        Message(MessageType.VIDEO_REQUEST_KEYFRAME, {}),
+                                    )
+                        except Exception as e:
+                            logger.exception("Frame decode error: %s", e)
+                            self._decoder.reset()
+                            await self._send_async(
+                                Message(MessageType.VIDEO_REQUEST_KEYFRAME, {}),
+                            )
+                elif t == MessageType.VIDEO_REQUEST_KEYFRAME:
+                    logger.debug("Keyframe requested by peer")
+                    # Forward to host via inbox so the StreamService can
+                    # force a keyframe on the encoder.
+                    self.inbox.put(("keyframe_requested", None, self.session_seq))
 
-            elif t == MessageType.ERROR:
-                err = msg.payload.get("message", "Unknown relay error")
-                self.inbox.put(("error", err, self.session_seq))
-                break
+                elif t == MessageType.ERROR:
+                    err = msg.payload.get("message", "Unknown relay error")
+                    self.inbox.put(("error", err, self.session_seq))
+                    break
 
-            elif t == MessageType.DISCONNECT:
-                break
-
+                elif t == MessageType.DISCONNECT:
+                    break
+        finally:
+            await gen.aclose()
         self.inbox.put(("disconnected", None, self.session_seq))
 
     # ── I/O helpers ─────────────────────────────────────────────────
