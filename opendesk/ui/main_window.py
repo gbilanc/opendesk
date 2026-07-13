@@ -420,11 +420,13 @@ class MainWindow(QMainWindow):
     def _on_auth_result(self, success: bool, message: str) -> None:
         """Authentication result."""
         if success:
-            logger.info("Authentication successful")
+            logger.info("Authentication successful (role=%s)", self._relay.role)
             self._status_text.setText("Authentication successful")
             if self._relay.role == RelayRole.HOST:
+                logger.debug("Auth success → calling _start_host_streaming")
                 self._start_host_streaming()
             else:
+                logger.debug("Auth success → calling _set_connected(True)")
                 self._set_connected(True)
                 self._status_text.setText(f"Session active: {self._peer_id}")
 

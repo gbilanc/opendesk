@@ -223,6 +223,8 @@ class _RelaySession:
                     if success:
                         await self._send_async(Message.auth_ok())
                         self.inbox.put(("auth_result", (True, "Authenticated"), self.session_seq))
+                        logger.debug("Host auth OK sent — continuing loop")
+                        msg_type = t  # keep ref for post-auth logging
                     else:
                         await self._send_async(Message.auth_fail("Invalid credentials"))
                         self.inbox.put(("auth_result", (False, "Invalid credentials"), self.session_seq))
@@ -232,10 +234,15 @@ class _RelaySession:
                     self.inbox.put(("keyframe_requested", None, self.session_seq))
 
                 elif t == MessageType.DISCONNECT:
+                    logger.debug("Host received DISCONNECT — breaking loop")
                     break
+
+                else:
+                    logger.debug("Host received unhandled message type %s", t)
         finally:
             await gen.aclose()
         self.inbox.put(("disconnected", None, self.session_seq))
+        logger.debug("Host session ended: disconnected event queued")
 
     # ── client flow ─────────────────────────────────────────────────
 
@@ -353,14 +360,20 @@ class _RelaySession:
 
                 elif t == MessageType.ERROR:
                     err = msg.payload.get("message", "Unknown relay error")
+                    logger.debug("Client received ERROR: %s — breaking loop", err)
                     self.inbox.put(("error", err, self.session_seq))
                     break
 
                 elif t == MessageType.DISCONNECT:
+                    logger.debug("Client received DISCONNECT — breaking loop")
                     break
+
+                else:
+                    logger.debug("Client received unhandled message type %s", t)
         finally:
             await gen.aclose()
         self.inbox.put(("disconnected", None, self.session_seq))
+        logger.debug("Client session ended: disconnected event queued")
 
     # ── I/O helpers ─────────────────────────────────────────────────
 
