@@ -1,18 +1,22 @@
 """
 Relay-based P2P connection client.
 
-Provides ``RelayClient``, a QObject that runs an asyncio TCP connection
-to the relay server in a background thread.  Supports two roles:
+Provides ``RelayClient``, a QObject that runs asyncio TCP connections
+to the relay server in background threads.  Supports two independent
+session types:
 
-- **Host** — registers a session_id, waits for a client, authenticates,
-  streams video, receives input events.
-- **Client** — joins an existing session by session_id, authenticates,
-  receives video frames, sends input events.
+- **Host** (persistent) — registers a session_id, waits for clients,
+  authenticates, streams video, receives input events.  This session
+  runs in the background and stays alive even while the user connects
+  as a client to another device.
+- **Client** (on-demand) — joins an existing session by session_id
+  or device_id, authenticates, receives video frames, sends input events.
 
 Threading model:
   - ``RelayClient`` lives in the main (UI) thread, emits Qt signals.
-  - An asyncio event loop runs in a daemon thread for TCP I/O.
-  - A ``QTimer`` polls the inbox queue to deliver messages to the UI thread.
+  - Host and client asyncio event loops each run in their own daemon thread.
+  - A single ``QTimer`` polls both inbox queues to deliver messages
+    to the UI thread.
   - ``asyncio.run_coroutine_threadsafe()`` sends commands from UI → network thread.
 """
 
@@ -428,68 +432,126 @@ class _RelaySession:
 class RelayClient(QObject):
     """High-level relay client for Qt applications.
 
+    Supports independent host (persistent) and client (on-demand)
+    sessions.  The host session runs in the background and stays
+    alive even while the user connects as a client to another device.
+
     Usage::
 
         client = RelayClient()
-        client.connected.connect(lambda role, sid: print(f"Connected as {role}: {sid}"))
+        client.host_connected.connect(lambda sid: print(f"Hosting: {sid}"))
+        client.client_connected.connect(lambda sid: print(f"Client: {sid}"))
         client.frame_received.connect(viewer.display_frame)
 
         client.start_hosting("relay.example.com", 8474, "123456789", "mypass")
         client.join_session("relay.example.com", 8474, "123456789", "mypass")
     """
 
-    connected = Signal(str, str)  # role ("host" | "client"), session_id
-    disconnected = Signal()
-    peer_joined = Signal()
-    auth_requested = Signal()
-    auth_result = Signal(bool, str)  # success, message
+    # ── Host signals ──
+    host_connected = Signal(str, str)  # role ("host"), session_id
+    host_disconnected = Signal()
+    host_peer_joined = Signal()
+    host_auth_result = Signal(bool, str)  # success, message
+    host_keyframe_requested = Signal()  # remote peer needs a keyframe
+
+    # ── Client signals ──
+    client_connected = Signal(str, str)  # role ("client"), session_id
+    client_disconnected = Signal()
+    client_auth_requested = Signal()
+    client_auth_result = Signal(bool, str)  # success, message
     frame_received = Signal(np.ndarray, int, int)  # rgb_data, width, height
+    client_keyframe_requested = Signal()  # remote host needs a keyframe
+
+    # ── Shared signals (from both host and client) ──
     message_received = Signal(object)  # Message
     error = Signal(str)
     device_list_received = Signal(list)  # list[dict] — devices from relay
-    keyframe_requested = Signal()  # remote peer needs a keyframe
+    main_keyframe_requested = Signal()  # legacy alias for host_keyframe_requested
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
+
+        # ── Host session (persistent background) ──
+        self._host_session: _RelaySession | None = None
+        self._host_thread: threading.Thread | None = None
+        self._host_inbox: queue.Queue = queue.Queue()
+        self._host_seq: int = 0
+        self._host_role: RelayRole | None = None
+
+        # ── Client session (on-demand foreground) ──
         self._session: _RelaySession | None = None
         self._thread: threading.Thread | None = None
         self._inbox: queue.Queue = queue.Queue()
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._poll_inbox)
-        self._timer.start(_POLL_INTERVAL_MS)
-        self._role: RelayRole | None = None
         self._current_seq: int = 0
+        self._role: RelayRole | None = None
+
+        # ── Single timer to poll both inboxes ──
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._poll_inboxes)
+        self._timer.start(_POLL_INTERVAL_MS)
 
     # ── public API ──────────────────────────────────────────────────
 
-    def _drain_inbox(self) -> None:
-        """Discard any stale events left from a previous session."""
-        while not self._inbox.empty():
+    # ── drain helpers ──
+
+    @staticmethod
+    def _drain_queue(q: queue.Queue) -> None:
+        """Discard any stale events left in a queue."""
+        while not q.empty():
             try:
-                self._inbox.get_nowait()
+                q.get_nowait()
             except queue.Empty:
                 break
+
+    def _drain_inbox(self) -> None:
+        """Discard any stale events left from a previous client session."""
+        self._drain_queue(self._inbox)
+
+    def _drain_host_inbox(self) -> None:
+        """Discard any stale events left from a previous host session."""
+        self._drain_queue(self._host_inbox)
+
+    # ── hosting ──
 
     def start_hosting(self, host: str, port: int, session_id: str, password: str,
                       device_id: str = "", device_name: str = "",
                       trusted_device_ids: set[str] | None = None) -> None:
-        """Connect to relay and register as host."""
-        self._stop_session()
-        self._drain_inbox()
-        self._current_seq += 1
-        self._role = RelayRole.HOST
-        self._session = _RelaySession(
-            host, port, session_id, password, RelayRole.HOST, self._inbox,
+        """Connect to relay and register as host.
+
+        Creates an independent persistent host session.  Does NOT
+        affect any active client session.
+        """
+        self._stop_host_session()
+        self._drain_host_inbox()
+        self._host_seq += 1
+        self._host_role = RelayRole.HOST
+        self._host_session = _RelaySession(
+            host, port, session_id, password, RelayRole.HOST, self._host_inbox,
             device_id=device_id, device_name=device_name,
-            session_seq=self._current_seq,
+            session_seq=self._host_seq,
             trusted_device_ids=trusted_device_ids,
         )
-        self._start_thread()
+        self._start_host_thread()
+
+    def stop_hosting(self) -> None:
+        """Stop the persistent host session if active."""
+        self._stop_host_session()
+
+    def is_hosting(self) -> bool:
+        """Check if the host session is active and connected."""
+        return self._host_thread is not None and self._host_thread.is_alive()
+
+    # ── client connection ──
 
     def join_session(self, host: str, port: int, session_id: str, password: str,
                      device_id: str = "") -> None:
-        """Connect to relay and join a session as client."""
-        self._stop_session()
+        """Connect to relay and join a session as client.
+
+        Does NOT stop the host session — the host session continues
+        running in the background, accepting incoming connections.
+        """
+        # Only stop a previous CLIENT session, NOT the host session
+        self._stop_client_session()
         self._drain_inbox()
         self._current_seq += 1
         self._role = RelayRole.CLIENT
@@ -498,17 +560,28 @@ class RelayClient(QObject):
             device_id=device_id,
             session_seq=self._current_seq,
         )
-        self._start_thread()
+        self._start_client_thread()
+
+    # ── message sending ──
 
     def send_message(self, msg: Message) -> None:
-        """Send a protocol message."""
-        if self._session:
+        """Send a protocol message.
+
+        If the client session is active, sends through it;
+        otherwise falls back to the host session.
+        """
+        if self._session and self._thread and self._thread.is_alive():
             self._session.send_message(msg)
+        elif self._host_session and self._host_thread and self._host_thread.is_alive():
+            self._host_session.send_message(msg)
 
     def send_frame(self, data: bytes, width: int, height: int, pts: int, keyframe: bool = False) -> None:
-        """Send an encoded H.264 video frame over the relay (host only)."""
-        if self._session:
-            self._session.send_frame(data, width, height, pts, keyframe=keyframe)
+        """Send an encoded H.264 video frame over the relay (host only).
+
+        Always sent through the host session.
+        """
+        if self._host_session:
+            self._host_session.send_frame(data, width, height, pts, keyframe=keyframe)
 
     def send_mouse_event(
         self, x: int, y: int, button: int | None = None,
@@ -522,112 +595,201 @@ class RelayClient(QObject):
         self.send_message(Message.keyboard_event(key, pressed))
 
     def disconnect(self) -> None:
-        """Disconnect from the relay."""
-        self._stop_session()
+        """Disconnect from the relay — stops both host and client sessions."""
+        self._stop_host_session()
+        self._stop_client_session()
+        self._role = None
+        self._host_role = None
+
+    def disconnect_client(self) -> None:
+        """Disconnect only the client session; host session stays alive."""
+        self._stop_client_session()
+        self._role = None
+
+    # ── properties ──
 
     @property
     def is_connected(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
+        """Check if any session (host or client) is active."""
+        return (self._thread is not None and self._thread.is_alive()) or \
+               (self._host_thread is not None and self._host_thread.is_alive())
 
     @property
     def role(self) -> RelayRole | None:
+        """Return the role of the active client session, or None."""
         return self._role
 
-    # ── internal ────────────────────────────────────────────────────
+    @property
+    def host_role(self) -> RelayRole | None:
+        """Return HOST if the host session is active, else None."""
+        return self._host_role if self.is_hosting() else None
 
-    def _start_thread(self) -> None:
-        """Start the background thread for the session.
+    # ── host internals ──────────────────────────────────────────
 
-        If the previous thread is still alive (e.g. a stuck TCP
-        connection), we leave it running as a daemon — it will
-        terminate when the process exits or when the socket timeout
-        fires.  We create a fresh thread for the new session.
-        """
+    def _start_host_thread(self) -> None:
+        """Start the background thread for the host session."""
+        session = self._host_session
+        if session is None:
+            return
+        old_thread = self._host_thread
+        if old_thread and old_thread.is_alive():
+            logger.info(
+                "Previous host thread still alive — "
+                "creating new thread for session %s",
+                getattr(session, 'session_id', '?'),
+            )
+        self._host_thread = threading.Thread(target=session.start, daemon=True)
+        self._host_thread.start()
+
+    def _stop_host_session(self) -> None:
+        """Stop the host session if any."""
+        if self._host_session is None or self._host_thread is None:
+            return
+        self._host_session.stop()
+        self._host_session = None
+        self._host_thread.join(timeout=_STOP_JOIN_TIMEOUT)
+        if self._host_thread.is_alive():
+            logger.warning(
+                "Host relay thread did not stop within %.1fs — "
+                "the old one will terminate when its TCP socket timeout fires.",
+                _STOP_JOIN_TIMEOUT,
+            )
+        self._host_thread = None
+
+    # ── client internals ────────────────────────────────────────
+
+    def _start_client_thread(self) -> None:
+        """Start the background thread for the client session."""
         session = self._session
         if session is None:
             return
         old_thread = self._thread
         if old_thread and old_thread.is_alive():
             logger.info(
-                "Previous relay thread still alive — "
+                "Previous client thread still alive — "
                 "creating new thread for session %s",
                 getattr(session, 'session_id', '?'),
             )
         self._thread = threading.Thread(target=session.start, daemon=True)
         self._thread.start()
 
-    def _stop_session(self) -> None:
-        """Stop the current session if any.
-
-        Signals the event loop to stop and waits for the background
-        thread to finish (with a timeout) so that no stale coroutines
-        are left running when a new session starts.
-
-        If the thread refuses to stop, we cannot safely terminate it
-        (daemon threads cannot be killed).  Instead we mark it as
-        stale — the next ``_start_thread()`` check will skip stale
-        threads and let them die on their own.
-        """
+    def _stop_client_session(self) -> None:
+        """Stop the client session if any."""
         if self._session is None or self._thread is None:
             return
         self._session.stop()
         self._session = None
-        # Wait for the thread to finish
         self._thread.join(timeout=_STOP_JOIN_TIMEOUT)
         if self._thread.is_alive():
             logger.warning(
-                "Relay thread did not stop within %.1fs — "
-                "connection may be stuck.  A new session will create "
-                "a fresh thread; the old one will terminate when its "
-                "TCP socket timeout fires.",
+                "Client relay thread did not stop within %.1fs — "
+                "the old one will terminate when its TCP socket timeout fires.",
                 _STOP_JOIN_TIMEOUT,
             )
         self._thread = None
 
-    @Slot()
-    def _poll_inbox(self) -> None:
-        """Process messages from the network thread (runs in UI thread).
+    # ── inbox polling ───────────────────────────────────────────
 
-        Ignores events from stale sessions (e.g. a ``disconnected``
-        event from a previous session that was still flushing its
-        inbox after a new session was started).
+    @Slot()
+    def _poll_inboxes(self) -> None:
+        """Process messages from both host and client network threads.
+
+        Runs in the UI thread via QTimer.  Host events are routed to
+        host-specific signals; client events to client-specific signals.
+        Shared events (message, error, device_list) are emitted on the
+        common signals from both inboxes.
         """
+        self._poll_client_inbox()
+        self._poll_host_inbox()
+
+    def _poll_client_inbox(self) -> None:
+        """Process client inbox events."""
         while not self._inbox.empty():
             try:
                 event, data, seq = self._inbox.get_nowait()
             except queue.Empty:
                 break
 
-            # Skip stale events from a previous session
+            # Skip stale events from a previous client session
             if seq != self._current_seq:
                 logger.debug(
-                    "Skipping stale event '%s' (seq %d, current %d)",
+                    "Skipping stale client event '%s' (seq %d, current %d)",
                     event, seq, self._current_seq,
                 )
                 continue
 
-            if event == "connected":
-                role_str, sid = data
-                self.connected.emit(role_str, sid)
-            elif event == "disconnected":
-                self._session = None
-                self._thread = None
-                self.disconnected.emit()
-            elif event == "peer_joined":
-                self.peer_joined.emit()
-            elif event == "auth_requested":
-                self.auth_requested.emit()
-            elif event == "auth_result":
-                success, msg = data
-                self.auth_result.emit(success, msg)
-            elif event == "frame":
-                rgb, w, h = data
-                self.frame_received.emit(rgb, w, h)
-            elif event == "message":
-                self.message_received.emit(data)
-            elif event == "error":
-                self.error.emit(data)
-            elif event == "keyframe_requested":
-                self.keyframe_requested.emit()
-            elif event == "device_list":
-                self.device_list_received.emit(data)
+            self._route_client_event(event, data)
+
+    def _poll_host_inbox(self) -> None:
+        """Process host inbox events."""
+        while not self._host_inbox.empty():
+            try:
+                event, data, seq = self._host_inbox.get_nowait()
+            except queue.Empty:
+                break
+
+            # Skip stale events from a previous host session
+            if seq != self._host_seq:
+                logger.debug(
+                    "Skipping stale host event '%s' (seq %d, current %d)",
+                    event, seq, self._host_seq,
+                )
+                continue
+
+            self._route_host_event(event, data)
+
+    def _route_client_event(self, event: str, data: Any) -> None:
+        """Route a client inbox event to the appropriate signal."""
+        if event == "connected":
+            role_str, sid = data
+            self.client_connected.emit(role_str, sid)
+        elif event == "disconnected":
+            self._session = None
+            self._thread = None
+            self.client_disconnected.emit()
+        elif event == "auth_requested":
+            self.client_auth_requested.emit()
+        elif event == "auth_result":
+            success, msg = data
+            self.client_auth_result.emit(success, msg)
+        elif event == "frame":
+            rgb, w, h = data
+            self.frame_received.emit(rgb, w, h)
+        elif event == "keyframe_requested":
+            self.client_keyframe_requested.emit()
+        elif event == "message":
+            self.message_received.emit(data)
+        elif event == "error":
+            self.error.emit(data)
+        elif event == "device_list":
+            self.device_list_received.emit(data)
+        else:
+            logger.debug("Unhandled client event: %s", event)
+
+    def _route_host_event(self, event: str, data: Any) -> None:
+        """Route a host inbox event to the appropriate signal."""
+        if event == "connected":
+            role_str, sid = data
+            self.host_connected.emit(role_str, sid)
+        elif event == "disconnected":
+            self._host_session = None
+            self._host_thread = None
+            self.host_disconnected.emit()
+        elif event == "peer_joined":
+            self.host_peer_joined.emit()
+        elif event == "auth_result":
+            success, msg = data
+            self.host_auth_result.emit(success, msg)
+        elif event == "keyframe_requested":
+            self.host_keyframe_requested.emit()
+            self.main_keyframe_requested.emit()
+        elif event == "message":
+            self.message_received.emit(data)
+        elif event == "error":
+            self.error.emit(data)
+        elif event == "device_list":
+            self.device_list_received.emit(data)
+        elif event == "device_update":
+            self.device_list_received.emit(data)
+        else:
+            logger.debug("Unhandled host event: %s", event)

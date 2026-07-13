@@ -69,7 +69,7 @@ class StreamService(QObject):
         self._bw_estimated_kbps: float = 0.0
 
         # React when the remote peer requests a keyframe
-        self._relay.keyframe_requested.connect(self._force_keyframe)
+        self._relay.host_keyframe_requested.connect(self._force_keyframe)
 
     # ── properties ──────────────────────────────────────────────────
 

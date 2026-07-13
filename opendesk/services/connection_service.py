@@ -4,7 +4,10 @@ Gestisce:
 - Connessione/disconnessione dal relay (host/client)
 - Ciclo di vita della sessione (ID, password, auth)
 - Device registry e whitelist
-- Riconnessione con backoff
+- Riconnessione con backoff (solo per la sessione host)
+
+La sessione host è persistente: sopravvive anche quando l'utente
+si connette come client a un altro device.
 """
 
 from __future__ import annotations
@@ -31,6 +34,9 @@ logger = logging.getLogger(__name__)
 class ConnectionService(QObject):
     """Servizio di connessione al relay.
 
+    Mantiene una sessione host persistente che non viene terminata
+    quando l'utente si connette come client a un altro device.
+
     Signals emessi (da connettere in MainWindow o altri consumer)::
 
         connected(role: str, session_id: str)
@@ -49,7 +55,9 @@ class ConnectionService(QObject):
     disconnected = Signal()
     peer_joined = Signal()
     auth_requested = Signal()
-    auth_result = Signal(bool, str)
+    auth_result = Signal(bool, str)  # legacy: fire per tutti i casi
+    host_auth_result = Signal(bool, str)  # un client remoto si è autenticato a NOI (host)
+    client_auth_result = Signal(bool, str)  # NOI ci siamo autenticati a un host remoto (client)
     frame_received = Signal(np.ndarray, int, int)
     message_received = Signal(object)
     device_list_received = Signal(list)
@@ -75,23 +83,37 @@ class ConnectionService(QObject):
             self._device_name = f"Desktop-{self._device_id[:8]}"
             self._settings.setValue("device/name", self._device_name)
 
-        # Relay client
+        # Relay client with independent host + client sessions
         self._relay = RelayClient(self)
-        self._relay.connected.connect(self._on_relay_connected)
-        self._relay.disconnected.connect(self._on_relay_disconnected)
-        self._relay.peer_joined.connect(self.peer_joined.emit)
-        self._relay.auth_requested.connect(self.auth_requested.emit)
-        self._relay.auth_result.connect(self.auth_result.emit)
+
+        # ── Host signal wiring ──
+        self._relay.host_connected.connect(self._on_host_connected)
+        self._relay.host_disconnected.connect(self._on_host_disconnected)
+        self._relay.host_peer_joined.connect(self._on_host_peer_joined)
+        self._relay.host_auth_result.connect(self._on_host_auth_result)
+        self._relay.host_keyframe_requested.connect(self._on_host_keyframe_requested)
+
+        # ── Client signal wiring ──
+        self._relay.client_connected.connect(self._on_client_connected)
+        self._relay.client_disconnected.connect(self._on_client_disconnected)
+        self._relay.client_auth_requested.connect(self._on_client_auth_requested)
+        self._relay.client_auth_result.connect(self._on_client_auth_result)
+
+        # ── Shared signals (from both host and client) ──
         self._relay.frame_received.connect(self.frame_received.emit)
         self._relay.message_received.connect(self.message_received.emit)
-        self._relay.error.connect(self._on_relay_error_sent)
         self._relay.device_list_received.connect(self._on_device_list_from_relay)
+
+        # ── Error routing: host vs client ──
+        # We connect to error only for host errors; client errors are
+        # handled separately via client_auth_result or client_disconnected.
+        self._relay.error.connect(self._on_error)
 
         # Device registry
         self._device_registry = DeviceRegistry()
 
-        # Retry
-        self._relay_retries = 0
+        # Retry (solo per la sessione host)
+        self._host_retries = 0
 
     # ── properties ──────────────────────────────────────────────────
 
@@ -134,11 +156,24 @@ class ConnectionService(QObject):
 
     @property
     def role(self) -> RelayRole | None:
+        """Return the current CLIENT role if active, else None.
+
+        ``RelayClient`` now supports independent host + client sessions.
+        This property reflects the client session's role, so consumers
+        that check ``role == RelayRole.CLIENT`` still work.
+        """
         return self._relay.role
 
     @property
     def is_connected(self) -> bool:
-        return self._relay.is_connected
+        """Check if the CLIENT session is active and connected."""
+        return self._relay.role == RelayRole.CLIENT and \
+               self._relay.is_connected
+
+    @property
+    def is_hosting(self) -> bool:
+        """Check if the HOST session is active and connected."""
+        return self._relay.is_hosting()
 
     # ── session lifecycle ───────────────────────────────────────────
 
@@ -151,7 +186,11 @@ class ConnectionService(QObject):
         return self._session_id
 
     def start_hosting(self) -> None:
-        """Avvia l'hosting sul relay con la sessione corrente."""
+        """Avvia l'hosting sul relay con la sessione corrente.
+
+        La sessione host è persistente: non viene fermata quando
+        l'utente si connette come client ad un altro device.
+        """
         host, port = self._get_relay_config()
         self._host_session_id = self._session_id.replace(" ", "")
         logger.info("Starting host on relay %s:%s with session %s", host, port, self._host_session_id)
@@ -164,8 +203,16 @@ class ConnectionService(QObject):
             trusted_device_ids=trusted_ids,
         )
 
+    def stop_hosting(self) -> None:
+        """Ferma la sessione host."""
+        self._host_retries = 0
+        self._relay.stop_hosting()
+
     def join_session(self, peer_id: str, password: str) -> None:
-        """Connetti come client a una sessione remota."""
+        """Connetti come client a una sessione remota.
+
+        NON ferma la sessione host — l'hosting continua in background.
+        """
         clean_id = peer_id.replace(" ", "")
         host, port = self._get_relay_config()
         logger.info("Joining session %s on relay %s:%s", clean_id, host, port)
@@ -175,9 +222,13 @@ class ConnectionService(QObject):
         )
 
     def disconnect(self) -> None:
-        """Disconnetti dal relay."""
-        self._relay_retries = 0
+        """Disconnetti completamente: ferma sia host che client."""
+        self._host_retries = 0
         self._relay.disconnect()
+
+    def disconnect_client(self) -> None:
+        """Disconnetti solo la sessione client; l'hosting resta attivo."""
+        self._relay.disconnect_client()
 
     # ── relay config ────────────────────────────────────────────────
 
@@ -194,21 +245,25 @@ class ConnectionService(QObject):
             port = 8474
         return host, port
 
-    # ── retry ───────────────────────────────────────────────────────
+    # ── retry (solo per la sessione host) ───────────────────────────
 
     def schedule_retry(self, status_callback) -> None:
-        """Riprova la connessione con backoff esponenziale."""
-        if self._relay_retries >= 5:
+        """Riprova la connessione host con backoff esponenziale.
+
+        La sessione client NON viene ritentata automaticamente
+        (viene gestita dall'UI).
+        """
+        if self._host_retries >= 5:
             status_callback("⚠ Relay unavailable — local session only")
             return
-        delay = min(2 ** self._relay_retries * 2, 30)
-        self._relay_retries += 1
-        logger.info("Retrying relay in %ds (attempt %d/5)", delay, self._relay_retries)
+        delay = min(2 ** self._host_retries * 2, 30)
+        self._host_retries += 1
+        logger.info("Retrying relay in %ds (attempt %d/5)", delay, self._host_retries)
         QTimer.singleShot(int(delay * 1000), lambda: self._retry_now(status_callback))
 
     def _retry_now(self, status_callback) -> None:
-        # Guard: don't reconnect if the user explicitly disconnected
-        if not self._host_session_id or self._relay.is_connected:
+        # Guard: don't reconnect if hosting is already active
+        if not self._host_session_id or self._relay.is_hosting():
             return
         host, port = self._get_relay_config()
         status_callback("Reconnecting to relay...")
@@ -220,19 +275,86 @@ class ConnectionService(QObject):
             trusted_device_ids=trusted_ids,
         )
 
-    # ── relay event handlers → forward as signals ───────────────────
+    # ── host event handlers → forward as signals ────────────────────
 
     @Slot(str, str)
-    def _on_relay_connected(self, role: str, session_id: str) -> None:
-        self._relay_retries = 0
+    def _on_host_connected(self, role: str, session_id: str) -> None:
+        """Host session connected to relay."""
+        self._host_retries = 0
+        # Emit connected only if there's no active client session
+        if self._relay.role != RelayRole.CLIENT:
+            self.connected.emit(role, session_id)
+
+    @Slot()
+    def _on_host_disconnected(self) -> None:
+        """Host session disconnected from relay."""
+        logger.info("Host session disconnected from relay")
+        # Schedule retry for host session
+        if self._host_session_id:
+            self.schedule_retry(lambda m: logger.info("Host retry: %s", m))
+        # Emit disconnected only if there's no active client session
+        if self._relay.role != RelayRole.CLIENT:
+            self.disconnected.emit()
+
+    @Slot()
+    def _on_host_peer_joined(self) -> None:
+        """A remote peer joined our hosted session."""
+        self.peer_joined.emit()
+
+    @Slot(bool, str)
+    def _on_host_auth_result(self, success: bool, message: str) -> None:
+        """Authentication result for a connecting client.
+
+        A remote client successfully authenticated to OUR hosted session.
+        """
+        self.auth_result.emit(success, message)
+        self.host_auth_result.emit(success, message)
+
+    @Slot()
+    def _on_host_keyframe_requested(self) -> None:
+        """Remote peer requested a keyframe from our host stream.
+
+        StreamService connects directly to RelayClient.host_keyframe_requested,
+        so we just log here.
+        """
+        logger.debug("Host keyframe request received (relayed by RelayClient.host_keyframe_requested)")
+
+    # ── client event handlers → forward as signals ──────────────────
+
+    @Slot(str, str)
+    def _on_client_connected(self, role: str, session_id: str) -> None:
+        """Client session connected to relay."""
         self.connected.emit(role, session_id)
 
     @Slot()
-    def _on_relay_disconnected(self) -> None:
+    def _on_client_disconnected(self) -> None:
+        """Client session disconnected from relay."""
+        logger.info("Client session disconnected")
         self.disconnected.emit()
 
+    @Slot()
+    def _on_client_auth_requested(self) -> None:
+        """Authentication requested by remote host."""
+        self.auth_requested.emit()
+
+    @Slot(bool, str)
+    def _on_client_auth_result(self, success: bool, message: str) -> None:
+        """Authentication result for the client connection.
+
+        WE authenticated to a remote host's session.
+        """
+        self.auth_result.emit(success, message)
+        self.client_auth_result.emit(success, message)
+
+    # ── shared event handlers ──────────────────────────────────────
+
     @Slot(str)
-    def _on_relay_error_sent(self, error_msg: str) -> None:
+    def _on_error(self, error_msg: str) -> None:
+        """Handle errors from the relay (host or client).
+
+        For host errors we forward to the error signal.
+        Client errors are handled via client_auth_result/disconnected.
+        """
         self.error.emit(error_msg)
 
     @Slot(list)

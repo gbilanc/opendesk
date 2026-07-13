@@ -86,7 +86,8 @@ class MainWindow(QMainWindow):
         self._connection.disconnected.connect(self._on_relay_disconnected)
         self._connection.peer_joined.connect(self._on_peer_joined)
         self._connection.auth_requested.connect(self._on_auth_requested)
-        self._connection.auth_result.connect(self._on_auth_result)
+        self._connection.host_auth_result.connect(self._on_host_auth_result)
+        self._connection.client_auth_result.connect(self._on_client_auth_result)
         self._connection.frame_received.connect(self._on_frame_received)
         self._connection.message_received.connect(self._on_relay_message)
         self._connection.error.connect(self._on_relay_error)
@@ -387,11 +388,17 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_relay_disconnected(self) -> None:
-        """Relay connection lost."""
-        was_host = self._relay.role == RelayRole.HOST
+        """Relay connection lost (host or client session).
+
+        Host and client sessions are now independent.  This handler
+        checks ``is_hosting()`` to know which session disconnected:
+        - If still hosting → only the client session dropped
+        - If not hosting → the host session dropped (schedule retry)
+        """
+        was_hosting = self._connection.is_hosting
         logger.info(
-            "Relay disconnected (was_host=%s, host_session=%s)",
-            was_host, self._host_session_id,
+            "Relay disconnected (was_hosting=%s, host_session=%s)",
+            was_hosting, self._host_session_id,
         )
         self._clipboard_sync.stop()
         self.act_send_file.setEnabled(False)
@@ -400,9 +407,8 @@ class MainWindow(QMainWindow):
         self._set_connected(False)
         self._peer_id = ""
 
-        if was_host and self._host_session_id:
+        if not was_hosting and self._host_session_id:
             # Host connection dropped unexpectedly — auto-retry
-            # instead of leaving the session in "Disconnected" state.
             self._status_text.setText("⚠ Relay disconnected — reconnecting...")
             self._connection.schedule_retry(
                 lambda m: self._status_text.setText(m)
@@ -420,18 +426,32 @@ class MainWindow(QMainWindow):
         logger.debug("Auth requested by host")
 
     @Slot(bool, str)
-    def _on_auth_result(self, success: bool, message: str) -> None:
-        """Authentication result."""
+    def _on_host_auth_result(self, success: bool, message: str) -> None:
+        """Authentication result for a REMOTE client connecting to US (host)."""
         if success:
-            logger.info("Authentication successful (role=%s)", self._relay.role)
+            logger.info("Remote client authenticated to our session")
             self._status_text.setText("Authentication successful")
-            if self._relay.role == RelayRole.HOST:
-                logger.debug("Auth success → calling _start_host_streaming")
-                self._start_host_streaming()
-            else:
-                logger.debug("Auth success → calling _set_connected(True)")
-                self._set_connected(True)
-                self._status_text.setText(f"Session active: {self._peer_id}")
+            self._start_host_streaming()
+
+            # Enable file transfer
+            self.act_send_file.setEnabled(True)
+            self._file_transfer_send_fn = self._send_file_message_async
+
+            # Start clipboard sync if enabled in settings
+            if self._settings.value("general/clipboard_sync", False, type=bool):
+                self._clipboard_sync.start(self._send_clipboard_message)
+        else:
+            logger.warning("Client authentication failed: %s", message)
+            self._status_text.setText("Client authentication failed")
+
+    @Slot(bool, str)
+    def _on_client_auth_result(self, success: bool, message: str) -> None:
+        """Authentication result for US connecting to a remote host (client)."""
+        if success:
+            logger.info("We authenticated to remote host")
+            self._status_text.setText("Authentication successful")
+            self._set_connected(True)
+            self._status_text.setText(f"Session active: {self._peer_id}")
 
             # Enable file transfer
             self.act_send_file.setEnabled(True)
@@ -446,7 +466,7 @@ class MainWindow(QMainWindow):
                 self, "Authentication Failed",
                 f"Failed to authenticate with the remote computer:\n{message}",
             )
-            self._connection.disconnect()
+            self._connection.disconnect_client()
 
     @Slot(np.ndarray, int, int)
     def _on_frame_received(self, rgb_data: np.ndarray, width: int, height: int) -> None:
@@ -533,17 +553,20 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_relay_error(self, error_msg: str) -> None:
-        """Relay error occurred."""
+        """Relay error occurred (host or client)."""
         logger.error("Relay error: %s", error_msg)
-        if self._relay.role == RelayRole.CLIENT:
+        # If we have an active client session, this is likely a client error
+        if self._connection.role == RelayRole.CLIENT:
             QMessageBox.critical(self, "Connection Error", error_msg)
-            self._on_disconnect()
-        else:
-            # Host: stay alive and retry instead of fully disconnecting
+            self._connection.disconnect_client()
+        elif self._connection.is_hosting:
+            # Host error: stay alive and retry
             self._status_text.setText("⚠ Relay unavailable — will retry")
             self._connection.schedule_retry(
                 lambda m: self._status_text.setText(m)
             )
+        else:
+            self._status_text.setText(f"⚠ Error: {error_msg}")
 
     @Slot(list)
     def _on_device_list_received(self, devices: list[dict]) -> None:
@@ -647,7 +670,11 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_disconnect(self) -> None:
-        """Disconnect the current session."""
+        """Disconnect the current session.
+
+        If a client session is active, only disconnects that.
+        The host session (if any) stays alive in the background.
+        """
         if not self._connected and not self._relay.is_connected:
             return
         if self._disconnecting:
@@ -656,7 +683,8 @@ class MainWindow(QMainWindow):
         try:
             logger.info("Disconnecting session: %s", self._peer_id)
             self._stop_streaming()
-            self._connection.disconnect()
+            # Disconnect only the client session; hosting persists
+            self._connection.disconnect_client()
             self._set_connected(False)
             self._status_text.setText("Disconnected")
             self._peer_id = ""
