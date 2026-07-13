@@ -315,7 +315,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._session_info)
 
         # Connection panel (device list + manual entry)
-        self._connection_panel = ConnectionPanel(central)
+        self._connection_panel = ConnectionPanel(
+            device_registry=self._device_registry,
+            parent=central,
+        )
         self._connection_panel.connection_requested.connect(self._on_connection_requested)
         layout.addWidget(self._connection_panel, 1)
 

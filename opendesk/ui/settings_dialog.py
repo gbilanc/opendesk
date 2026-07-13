@@ -154,6 +154,9 @@ class SettingsDialog(QDialog):
         auth_dev_layout.addWidget(self._trusted_list)
 
         btn_row = QHBoxLayout()
+        self._add_trusted_btn = QPushButton("Add device...")
+        self._add_trusted_btn.clicked.connect(self._add_trusted_device)
+        btn_row.addWidget(self._add_trusted_btn)
         self._remove_trusted_btn = QPushButton("Remove")
         self._remove_trusted_btn.clicked.connect(self._remove_trusted_device)
         btn_row.addWidget(self._remove_trusted_btn)
@@ -264,6 +267,35 @@ class SettingsDialog(QDialog):
             item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, dev.device_id)
             self._trusted_list.addItem(item)
+
+    @Slot()
+    def _add_trusted_device(self) -> None:
+        """Aggiunge manualmente un dispositivo alla lista trusted."""
+        from PySide6.QtWidgets import QInputDialog, QLineEdit
+
+        device_id, ok = QInputDialog.getText(
+            self, "Aggiungi dispositivo pre-autorizzato",
+            "Inserisci l'ID del dispositivo:\n(puoi trovarlo nel pannello Connessioni "
+            "o chiederlo al proprietario del dispositivo remoto)",
+            QLineEdit.EchoMode.Normal,
+        )
+        if not ok or not device_id.strip():
+            return
+        device_id = device_id.strip()
+
+        # Se il dispositivo esiste già nel registry, impostalo come trusted
+        existing = self._registry.get(device_id) if self._registry else None
+        if existing:
+            self._registry.set_trusted(device_id, True)
+        else:
+            # Altrimenti crea un nuovo entry con solo l'ID
+            self._registry.upsert(
+                device_id,
+                device_name=device_id[:8],
+                trusted=True,
+                online=False,
+            )
+        self._populate_trusted_devices()
 
     @Slot()
     def _remove_trusted_device(self) -> None:

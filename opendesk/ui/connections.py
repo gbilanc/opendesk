@@ -18,7 +18,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QColor, QFont, QPainter, QBrush, QPen, QPalette
 from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QVBoxLayout, QLabel, QLineEdit,
-    QListView, QStyledItemDelegate, QStyleOptionViewItem,
+    QListView, QMenu, QStyledItemDelegate, QStyleOptionViewItem,
     QMessageBox, QPushButton, QWidget, QSizePolicy, QInputDialog,
     QAbstractItemView,
 )
@@ -193,9 +193,14 @@ class ConnectionPanel(QWidget):
 
     connection_requested = Signal(str, str)  # session_id, password
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        device_registry=None,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self._model = DeviceListModel(self)
+        self._registry = device_registry
         self._setup_ui()
         self._setup_connections()
 
@@ -308,6 +313,8 @@ class ConnectionPanel(QWidget):
     def _setup_connections(self) -> None:
         self._list_view.selectionModel().selectionChanged.connect(self._on_selection_changed)
         self._list_view.doubleClicked.connect(self._on_double_clicked)
+        self._list_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._list_view.customContextMenuRequested.connect(self._on_context_menu)
         self._model.countChanged.connect(self._on_count_changed)
 
     # ── public API ──────────────────────────────────────────────────
@@ -315,6 +322,33 @@ class ConnectionPanel(QWidget):
     def update_device_list(self, devices: list[DeviceEntry]) -> None:
         """Update the displayed device list (called from MainWindow)."""
         self._model.set_devices(devices)
+
+    # ── context menu ───────────────────────────────────────────────
+
+    @Slot()
+    def _on_context_menu(self, pos) -> None:
+        """Mostra menu contestuale per un dispositivo."""
+        index = self._list_view.indexAt(pos)
+        if not index.isValid():
+            return
+
+        device_id = index.data(Qt.ItemDataRole.UserRole) or ""
+        device_name = index.data(Qt.ItemDataRole.UserRole + 4) or ""
+        trusted = index.data(Qt.ItemDataRole.UserRole + 2) or False
+
+        menu = QMenu(self)
+        if trusted:
+            action = menu.addAction("❌ Revoca pre-autorizzazione")
+        else:
+            action = menu.addAction("✅ Pre-autorizza dispositivo")
+
+        selected = menu.exec(self._list_view.viewport().mapToGlobal(pos))
+        if selected == action and self._registry:
+            self._registry.set_trusted(device_id, not trusted)
+            # Aggiorna la visualizzazione
+            if hasattr(self, '_model'):
+                devices = self._registry.all()
+                self._model.set_devices(devices)
 
     @property
     def model(self) -> DeviceListModel:
