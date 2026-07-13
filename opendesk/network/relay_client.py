@@ -371,7 +371,12 @@ class _RelaySession:
                 msg = await Message.from_reader(self._reader)
                 yield msg
             except (ConnectionError, asyncio.IncompleteReadError) as e:
-                logger.warning("Connection lost: %s", e)
+                # If _running was cleared by _stop_async() this is an
+                # intentional shutdown — log at DEBUG, not WARNING.
+                if self._running.is_set():
+                    logger.warning("Connection lost: %s", e)
+                else:
+                    logger.debug("Connection closed (session stopped)")
                 break
             except asyncio.CancelledError:
                 logger.debug("Read cancelled (shutting down)")
