@@ -111,6 +111,9 @@ class MainWindow(QMainWindow):
         self._file_transfer = FileTransferManager()
         self._file_transfer_send_fn = None  # set after connection
 
+        # Clipboard sync (instantiated but only started when enabled in settings)
+        self._clipboard_sync = ClipboardSync(self)
+
         # Build UI
         self._setup_actions()
         self._setup_menus()
