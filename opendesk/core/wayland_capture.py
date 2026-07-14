@@ -252,27 +252,15 @@ class WaylandScreenCast:
         return Variant(sig, value)
 
     async def _create_session(self) -> None:
-        """Create a ScreenCast session via D-Bus."""
+        """Create a ScreenCast session via D-Bus.
+
+        CreateSession returns the session handle directly in the
+        method reply — no signal handling needed.
+        """
         await self._ensure_bus()
-        from dbus_next import Message
 
         self._request_token += 1
         token = f"opendesk{self._request_token}"
-        sender_name = self._bus.unique_name[1:].replace(".", "_")
-
-        request_path = f"/org/freedesktop/portal/desktop/request/{sender_name}/{token}"
-
-        # Handle response via Signal
-        def _on_signal(signal_name: str, args: list) -> None:
-            if signal_name == "Response" and args:
-                logger.debug("CreateSession response: %s", args)
-
-        self._bus.on_signal(
-            "org.freedesktop.portal.Request",
-            "Response",
-            _on_signal,
-            path=request_path,
-        )
 
         msg = self._make_msg(
             "/org/freedesktop/portal/desktop",
