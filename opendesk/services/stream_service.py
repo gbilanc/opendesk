@@ -44,6 +44,7 @@ class StreamService(QObject):
 
     frame_ready = Signal(object, int, int)  # np.ndarray, width, height
     bitrate_changed = Signal(float)
+    input_unavailable = Signal(str)  # non-fatal: input backend could not start
     error = Signal(str)
 
     def __init__(self, relay: RelayClient, parent: QObject | None = None) -> None:
@@ -122,8 +123,7 @@ class StreamService(QObject):
             except Exception as e:
                 logger.warning("Input backend unavailable — remote input disabled: %s", e)
                 self._input_backend = None
-                # Emit a non-fatal error so the UI can show a warning
-                self.error.emit(f"Remote input disabled: {e}")
+                self.input_unavailable.emit(str(e))
 
             # Reset bandwidth
             self._bw_measure_bytes = 0

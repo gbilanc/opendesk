@@ -93,6 +93,7 @@ class MainWindow(QMainWindow):
         self._connection.error.connect(self._on_relay_error)
         self._connection.device_list_received.connect(self._on_device_list_received)
         self._stream.error.connect(self._on_stream_error)
+        self._stream.input_unavailable.connect(self._on_input_unavailable)
 
         # Backward-compatible aliases (delegate to services)
         self._relay = self._connection.relay
@@ -492,6 +493,15 @@ class MainWindow(QMainWindow):
         logger.error("Stream error: %s", error_msg)
         self._status_text.setText(f"⚠ Streaming error: {error_msg}")
         self._stop_streaming()
+
+    @Slot(str)
+    def _on_input_unavailable(self, error_msg: str) -> None:
+        """Non-fatal: input backend could not start (e.g. uinput missing).
+
+        Shows a warning in the status bar but does NOT stop streaming.
+        """
+        logger.warning("Input backend unavailable: %s", error_msg)
+        self._status_text.setText(f"⚠ Remote input disabled: {error_msg}")
 
     @Slot(object)
     def _on_relay_message(self, msg: Message) -> None:
