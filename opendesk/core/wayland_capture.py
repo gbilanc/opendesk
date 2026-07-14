@@ -95,7 +95,7 @@ class WaylandScreenCast:
         import subprocess
         try:
             r = subprocess.run(
-                ["busctl", "list", "--no-pager"],
+                ["busctl", "--user", "list", "--no-pager"],
                 capture_output=True, text=True, timeout=2,
             )
             if "org.freedesktop.portal.Desktop" in r.stdout:
@@ -245,6 +245,12 @@ class WaylandScreenCast:
             body=body or [],
         )
 
+    @staticmethod
+    def _v(sig: str, value):  # noqa: ANN401
+        """Shortcut for dbus-next Variant creation."""
+        from dbus_next import Variant
+        return Variant(sig, value)
+
     async def _create_session(self) -> None:
         """Create a ScreenCast session via D-Bus."""
         await self._ensure_bus()
@@ -274,7 +280,7 @@ class WaylandScreenCast:
             "CreateSession",
             "a{sv}",
             [{
-                "session_handle_token": ("s", token),
+                "session_handle_token": self._v("s", token),
             }],
         )
         response = await self._bus.call(msg)
@@ -287,56 +293,91 @@ class WaylandScreenCast:
             raise RuntimeError("Failed to create ScreenCast session")
 
     async def _select_sources(self) -> None:
-        """Select which monitor(s) to capture."""
+        """Select which monitor(s) to capture.
+
+        Called on the main portal object with the session handle
+        as the first argument (per the xdg-desktop-portal API).
+        """
         if self._session is None:
             raise RuntimeError("No session")
 
         msg = self._make_msg(
-            self._session.session_handle,
+            "/org/freedesktop/portal/desktop",
             "org.freedesktop.portal.ScreenCast",
             "SelectSources",
-            "a{sv}",
-            [{
-                "types": ("u", 1),  # 1 = MONITOR (not WINDOW)
-                "multiple": ("b", False),
-            }],
+            "oa{sv}",
+            [
+                self._session.session_handle,
+                {
+                    "types": self._v("u", 1),  # 1 = MONITOR
+                    "multiple": self._v("b", False),
+                },
+            ],
         )
         await self._bus.call(msg)
         logger.debug("ScreenCast sources selected")
 
     async def _start_session(self) -> None:
-        """Start the screencast session, receive PipeWire fd, launch helper."""
+        """Start the screencast session, receive PipeWire fd, launch helper.
+
+        Called on the main portal object with the session handle
+        as the first argument (per the xdg-desktop-portal API).
+
+        After Start returns a request handle, calls OpenPipeWireRemote
+        to obtain the actual PipeWire file descriptor.
+        """
         if self._session is None:
             raise RuntimeError("No session")
 
+        # 1) Start the session
         msg = self._make_msg(
-            self._session.session_handle,
+            "/org/freedesktop/portal/desktop",
             "org.freedesktop.portal.ScreenCast",
             "Start",
-            "a{sv}",
-            [{"handle_token": ("s", "start")}],
+            "osa{sv}",
+            [
+                self._session.session_handle,
+                "",  # parent_window (empty = no parent)
+                {},
+            ],
         )
         response = await self._bus.call(msg)
         if not response.body:
-            raise RuntimeError("Failed to start ScreenCast session")
+            raise RuntimeError("ScreenCast Start returned empty body")
+        request_handle = response.body[0]
+        logger.debug("Start request handle: %s", request_handle)
 
-        results = response.body[0]
-        pw_node_id = results.get("pipewire_node_id", ("u", 0))[1]
-        pw_fd = results.get("pipewire_fd", ("h", -1))[1]
+        # Give the portal a moment to set up the stream
+        await asyncio.sleep(0.5)
 
-        # Prefer the fd passed as ancillary data
-        if hasattr(response, "unix_fds") and response.unix_fds:
-            pw_fd = response.unix_fds[0]
+        # 2) Open the PipeWire remote to get the fd
+        msg2 = self._make_msg(
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.ScreenCast",
+            "OpenPipeWireRemote",
+            "oa{sv}",
+            [
+                self._session.session_handle,
+                {},
+            ],
+        )
+        response2 = await self._bus.call(msg2)
 
-        self._session.pipewire_node = pw_node_id
+        # The fd comes as ancillary data (unix_fds)
+        if not (hasattr(response2, "unix_fds") and response2.unix_fds):
+            raise RuntimeError("OpenPipeWireRemote did not return a file descriptor")
+
+        # Dup the fd so it survives the D-Bus message being freed.
+        # We'll pass the dup'd fd to the child via pass_fds.
+        raw_fd = response2.unix_fds[0]
+        pw_fd = os.dup(raw_fd)
+        os.close(raw_fd)  # close the message-owned fd, keep our dup
+
+        self._session.pipewire_node = 0
         self._session.pipewire_fd = pw_fd
-        logger.info("PipeWire node: %d, fd: %d", pw_node_id, pw_fd)
+        logger.info("PipeWire fd obtained: %d (duped from %d)", pw_fd, raw_fd)
 
-        # ------------------------------------------------------------------
-        # Launch the GStreamer helper subprocess with the portal-issued fd.
-        # This reuses the existing portal session so the user does NOT need
-        # to approve a second screen-selection dialog.
-        # ------------------------------------------------------------------
+        # Launch the GStreamer helper with the portal-issued fd
         await self._launch_pipewire_helper()
 
     # ── GStreamer helper subprocess ─────────────────────────────────
@@ -360,19 +401,25 @@ class WaylandScreenCast:
             )
 
         helper = Path(__file__).parent / "_pipewire_helper.py"
-        logger.info("Launching PipeWire helper: %s with fd=%d", helper, self._session.pipewire_fd)
+        fd_num = self._session.pipewire_fd
+        logger.info("Launching PipeWire helper: %s with fd=%d", helper, fd_num)
 
         self._helper_process = subprocess.Popen(
             [
                 system_python, str(helper),
-                # pass_fds remaps the parent fd to fd 3 in the child
-                "--fd", "3",
+                "--fd", str(fd_num),
                 "--fps", "30",
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            pass_fds=(self._session.pipewire_fd,),
+            pass_fds=(fd_num,),
         )
+
+        # Close our copy of the fd — the child has its own now
+        try:
+            os.close(fd_num)
+        except OSError:
+            pass
 
         # Read header: 8 bytes → width, height (uint32 LE)
         header = b""
