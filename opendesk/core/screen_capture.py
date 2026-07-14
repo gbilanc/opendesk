@@ -335,7 +335,7 @@ class PipeWireCapture:
 def _detect_capture_method() -> CaptureMethod:
     plat = current_platform()
     if plat == Platform.LINUX and is_wayland():
-        # 1) Prefer D-Bus portal if available (avoids double dialog)
+        # 1) Prefer D-Bus portal (avoids double portal dialog)
         try:
             from opendesk.core.wayland_capture import WaylandScreenCast
             wsc = WaylandScreenCast()
@@ -344,7 +344,7 @@ def _detect_capture_method() -> CaptureMethod:
                 return CaptureMethod.PORTAL
         except Exception:
             pass
-        # 2) Fall back to GStreamer pipewiresrc (shows its own portal dialog)
+        # 2) GStreamer pipewiresrc (works but shows its own dialog)
         pw = PipeWireCapture()
         if pw.is_available():
             logger.info("Capture backend: PIPEWIRE (GStreamer pipewiresrc)")
@@ -563,7 +563,7 @@ class ScreenCapture:
 
         The D-Bus setup + portal dialog is synchronous-blocking because
         we run ``asyncio.run()`` internally.  Called once on first
-        capture.
+        capture.  Has a 30-second timeout for the portal dialog.
         """
         if self._portal is not None:
             return self._portal
@@ -586,30 +586,36 @@ class ScreenCapture:
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(lambda: asyncio.run(wsc.setup()))
-                ok = future.result(timeout=60)
+                ok = future.result(timeout=30)
         else:
             ok = asyncio.run(wsc.setup())
 
         if not ok:
-            raise RuntimeError("WaylandScreenCast setup failed")
+            raise RuntimeError("WaylandScreenCast setup failed (portal rejected or timed out)")
 
         self._portal = wsc
         return wsc
 
     def _capture_portal(self, monitor_index: int = 0) -> CapturedFrame:
-        """Capture a single frame via the PORTAL backend."""
+        """Capture a single frame via the PORTAL backend.
+
+        On any failure (timeout, no frames, helper crash) falls back
+        transparently to PIPEWIRE.
+        """
         try:
             wsc = self._get_portal()
         except Exception as e:
             logger.warning("PORTAL init failed: %s — falling back to PIPEWIRE", e)
+            self._release_portal()
             self._method = CaptureMethod.PIPEWIRE
             return self.capture_one(monitor_index)
 
         rgb = wsc.capture_frame_sync()
         if rgb is None:
-            # Helper may have exited — try MSS fallback
-            logger.warning("PORTAL capture returned None")
-            raise RuntimeError("PORTAL frame capture failed")
+            logger.warning("PORTAL capture returned None — falling back to PIPEWIRE")
+            self._release_portal()
+            self._method = CaptureMethod.PIPEWIRE
+            return self.capture_one(monitor_index)
 
         w, h = wsc.width, wsc.height
         return CapturedFrame(

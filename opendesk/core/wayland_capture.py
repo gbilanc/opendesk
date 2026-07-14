@@ -365,7 +365,8 @@ class WaylandScreenCast:
         self._helper_process = subprocess.Popen(
             [
                 system_python, str(helper),
-                "--fd", str(self._session.pipewire_fd),
+                # pass_fds remaps the parent fd to fd 3 in the child
+                "--fd", "3",
                 "--fps", "30",
             ],
             stdout=subprocess.PIPE,
@@ -390,12 +391,20 @@ class WaylandScreenCast:
                 header += chunk
 
         if len(header) < 8:
+            # Capture stderr before stopping the process
+            err_output = ""
+            if self._helper_process and self._helper_process.stderr:
+                try:
+                    err_output = self._helper_process.stderr.read().decode(errors="replace")
+                except Exception:
+                    pass
             self._stop_helper()
-            stderr = self._helper_process and self._helper_process.stderr
-            if stderr:
-                err = stderr.read().decode(errors="replace")
-                logger.warning("PipeWire helper stderr: %s", err)
-            raise RuntimeError("PipeWire helper did not produce a frame header")
+            if err_output:
+                logger.warning("PipeWire helper stderr: %s", err_output)
+            raise RuntimeError(
+                f"PipeWire helper did not produce a frame header (got {len(header)} bytes). "
+                "Check that xdg-desktop-portal and GStreamer pipewire plugin are installed."
+            )
 
         self._helper_width, self._helper_height = struct.unpack("<II", header)
         logger.info(
