@@ -251,6 +251,35 @@ class WaylandScreenCast:
         from dbus_next import Variant
         return Variant(sig, value)
 
+    async def _wait_for_response(self, request_path: str, timeout: float = 30.0) -> tuple[int, dict]:
+        """Wait for a portal ``Response`` signal on *request_path*.
+
+        Returns a ``(response_code, results)`` tuple.
+        ``response_code``: 0 = success, 1 = cancelled, 2 = other error.
+        """
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+
+        def _handler(msg):
+            if future.done():
+                return
+            if msg.interface == "org.freedesktop.portal.Request" and \
+               msg.member == "Response" and \
+               msg.path == request_path:
+                code = msg.body[0] if msg.body else 2
+                results = msg.body[1] if len(msg.body) > 1 else {}
+                future.set_result((code, results))
+
+        self._bus.add_message_handler(_handler)
+        try:
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"Timeout waiting for portal response on {request_path}"
+            )
+        finally:
+            self._bus.remove_message_handler(_handler)
+
     async def _create_session(self) -> None:
         """Create a ScreenCast session via D-Bus.
 
@@ -284,7 +313,8 @@ class WaylandScreenCast:
         """Select which monitor(s) to capture.
 
         Called on the main portal object with the session handle
-        as the first argument (per the xdg-desktop-portal API).
+        as the first argument.  Returns a request path and then
+        waits for the ``Response`` signal before proceeding.
         """
         if self._session is None:
             raise RuntimeError("No session")
@@ -302,7 +332,19 @@ class WaylandScreenCast:
                 },
             ],
         )
-        await self._bus.call(msg)
+        response = await self._bus.call(msg)
+        if not response.body:
+            raise RuntimeError("SelectSources returned empty body")
+
+        request_path = response.body[0]
+        logger.debug("SelectSources request path: %s", request_path)
+
+        # Wait for the Response signal on the request path
+        code, results = await self._wait_for_response(request_path)
+        if code != 0:
+            raise RuntimeError(
+                f"SelectSources rejected (response={code})"
+            )
         logger.debug("ScreenCast sources selected")
 
     async def _start_session(self) -> None:
@@ -335,8 +377,13 @@ class WaylandScreenCast:
         request_handle = response.body[0]
         logger.debug("Start request handle: %s", request_handle)
 
-        # Give the portal a moment to set up the stream
-        await asyncio.sleep(0.5)
+        # Wait for the Start Response signal
+        code, results = await self._wait_for_response(request_handle)
+        if code != 0:
+            raise RuntimeError(
+                f"ScreenCast Start rejected (response={code})"
+            )
+        logger.debug("Start response: %s", results)
 
         # 2) Open the PipeWire remote to get the fd
         msg2 = self._make_msg(
