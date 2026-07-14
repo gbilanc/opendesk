@@ -9,6 +9,7 @@ automatic monitor enumeration.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -124,11 +125,15 @@ class PipeWireCapture:
         self._resolved_w: int = 0
         self._resolved_h: int = 0
         self._started: bool = False
+        # State: None = unstarted, False = waiting for header, True = streaming
+        self._header_ready: bool | None = None
+        self._start_ts: float = 0.0
+        self._pipewire_selected: bool = False  # true after first attempt
 
     # ── availability ────────────────────────────────────────────────
 
     def is_available(self) -> bool:
-        """Check if GStreamer + pipewiresrc are available on the system."""
+        """Check if GStreamer + pipewiresrc + GstApp are available on the system."""
         if self._available is not None:
             return self._available
 
@@ -140,10 +145,12 @@ class PipeWireCapture:
 
         import subprocess
         try:
+            # Check GStreamer + pipewiresrc + GstApp (all needed by _pipewire_helper.py)
             r = subprocess.run(
                 [system_python, "-c",
                  "import gi; gi.require_version('Gst', '1.0');"
-                 "from gi.repository import Gst; Gst.init(None);"
+                 "gi.require_version('GstApp', '1.0');"
+                 "from gi.repository import Gst, GstApp; Gst.init(None);"
                  "e = Gst.ElementFactory.make('pipewiresrc', None);"
                  "exit(0 if e else 1)"],
                 capture_output=True, text=True, timeout=5,
@@ -151,8 +158,10 @@ class PipeWireCapture:
             if r.returncode == 0:
                 self._available = True
                 return True
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            pass
+            else:
+                logger.debug("PipeWire: GStreamer check failed: %s", r.stderr.strip())
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+            logger.debug("PipeWire: GStreamer check exception: %s", e)
 
         logger.debug("PipeWire: GStreamer pipewiresrc not available")
         self._available = False
@@ -161,15 +170,19 @@ class PipeWireCapture:
     # ── public API ──────────────────────────────────────────────────
 
     def start(self, monitor_index: int = 0) -> None:
-        """Start the capture subprocess.
+        """Launch the GStreamer helper subprocess (non-blocking).
 
-        This launches a GStreamer pipeline in a subprocess (using the
-        system Python).  The portal will show a screen-selection dialog
-        to the user.
+        Returns immediately after spawning.  The portal dialog may
+        appear asynchronously — ``capture_one()`` will return None
+        until the user approves the screen-selection dialog and the
+        first frame header arrives.
         """
         if self._started:
             return
         self._started = True
+        self._header_ready = False  # waiting
+        self._start_ts = time.monotonic()
+        self._pipewire_selected = True
 
         import subprocess
         from pathlib import Path
@@ -179,6 +192,8 @@ class PipeWireCapture:
         system_python = _find_system_python()
         if not system_python:
             logger.warning("PipeWire: system Python not found, cannot start")
+            self._started = False
+            self._header_ready = None  # failed
             return
 
         logger.info(
@@ -194,70 +209,157 @@ class PipeWireCapture:
             stderr=subprocess.PIPE,
         )
 
-        # Read header (first 8 bytes = width, height as uint32 LE)
-        # Timeout: if the portal dialog is not approved, fail after 30 s
-        import struct
-        import select
-        header = b""
-        deadline = time.monotonic() + 30.0
-        while len(header) < 8 and time.monotonic() < deadline:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            r, _, _ = select.select([self._helper_process.stdout], [], [], min(remaining, 1.0))
-            if r:
-                chunk = self._helper_process.stdout.read(8 - len(header))
-                if not chunk:
-                    break
-                header += chunk
-
-        if len(header) < 8:
-            logger.error("PipeWire: failed to read frame header (timeout or portal not approved)")
-            stderr = self._helper_process.stderr.read() if self._helper_process.stderr else b""
-            if stderr:
-                logger.warning("PipeWire helper stderr: %s", stderr.decode(errors="replace"))
-            self.release()
-            return
-
-        self._resolved_w, self._resolved_h = struct.unpack("<II", header)
-        logger.info(
-            "PipeWire capture started: %dx%d",
-            self._resolved_w, self._resolved_h,
-        )
+        # Make stdout non-blocking for header read attempts
+        import fcntl
+        if self._helper_process.stdout:
+            fd = self._helper_process.stdout.fileno()
+            fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+        if self._helper_process.stderr:
+            fd = self._helper_process.stderr.fileno()
+            fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
 
     def capture_one(self, monitor_index: int = 0) -> CapturedFrame | None:
-        """Capture a single frame from the running subprocess."""
+        """Capture a single frame from the running subprocess.
+
+        Returns None while waiting for portal approval (non-blocking).
+        The caller should keep calling until frames arrive or a
+        timeout is reached.
+        """
         if not self._started:
             self.start(monitor_index)
+            return None  # start() is non-blocking now
 
+        # Still waiting for header?
+        if self._header_ready is False:
+            return self._try_read_header()
+
+        # Failed (header_ready is None)
+        if self._header_ready is None:
+            return None
+
+        # Streaming — read a frame
         if self._helper_process is None or self._helper_process.stdout is None:
             return None
 
         # Check if process is still alive
-        if self._helper_process.poll() is not None:
+        poll = self._helper_process.poll()
+        if poll is not None:
+            err_text = ""
+            try:
+                if self._helper_process.stderr:
+                    err_text = self._helper_process.stderr.read().decode(errors="replace")
+            except Exception:
+                pass
             logger.warning(
-                "PipeWire helper exited with code %d",
-                self._helper_process.returncode,
+                "PipeWire helper exited with code %d: %s",
+                poll, err_text.strip() or "(no output)",
             )
-            stderr = self._helper_process.stderr.read() if self._helper_process.stderr else b""
-            if stderr:
-                logger.warning("PipeWire helper stderr: %s", stderr.decode(errors="replace"))
             self.release()
             return None
 
-        frame_size = self._resolved_w * self._resolved_h * 3
-        data = self._helper_process.stdout.read(frame_size)
-        if len(data) < frame_size:
-            logger.warning("PipeWire: incomplete frame read (%d < %d)", len(data), frame_size)
-            return None
+        # Lazy init frame buffer
+        if not hasattr(self, '_frame_buf'):
+            self._frame_buf = b""
 
-        rgb = np.frombuffer(data, dtype=np.uint8).reshape(self._resolved_h, self._resolved_w, 3)
+        frame_size = self._resolved_w * self._resolved_h * 3
+        needed = frame_size - len(self._frame_buf)
+        try:
+            chunk = self._helper_process.stdout.read(needed)
+        except BlockingIOError:
+            return None  # no data yet
+
+        if chunk:
+            self._frame_buf += chunk
+
+        if len(self._frame_buf) < frame_size:
+            return None  # still accumulating
+
+        # Complete frame received
+        data = self._frame_buf[:frame_size]
+        self._frame_buf = self._frame_buf[frame_size:]  # keep overflow
+
+        rgb = np.frombuffer(data, dtype=np.uint8).reshape(
+            self._resolved_h, self._resolved_w, 3,
+        )
         return CapturedFrame(
             data=rgb.copy(),
             monitor_index=monitor_index,
             timestamp=time.time(),
             region=(0, 0, self._resolved_w, self._resolved_h),
         )
+
+    def _try_read_header(self) -> CapturedFrame | None:
+        """Try to read the frame header non-blockingly.
+
+        Accumulates partial reads until 8 bytes (width + height uint32 LE)
+        are received.  Returns None until the header is complete or the
+        helper fails.
+        """
+        import struct
+
+        # Lazy init header buffer
+        if not hasattr(self, '_header_buf'):
+            self._header_buf = b""
+
+        if self._helper_process is None or self._helper_process.stdout is None:
+            self._header_ready = None
+            return None
+
+        # Check if helper died
+        poll = self._helper_process.poll()
+        if poll is not None:
+            err_text = ""
+            try:
+                if self._helper_process.stderr:
+                    err_text = self._helper_process.stderr.read().decode(errors="replace")
+            except Exception:
+                pass
+            logger.error(
+                "PipeWire helper exited with code %d: %s",
+                poll, err_text.strip() or "(no output)",
+            )
+            self.release()
+            self._header_ready = None
+            return None
+
+        # Timeout after 10 s
+        if time.monotonic() - self._start_ts > 10.0:
+            err_text = ""
+            try:
+                if self._helper_process.stderr:
+                    err_text = self._helper_process.stderr.read().decode(errors="replace")
+            except Exception:
+                pass
+            logger.error(
+                "PipeWire: timed out waiting for portal approval (10 s). "
+                "stderr: %s", err_text.strip() or "(no output)",
+            )
+            self.release()
+            self._header_ready = None
+            return None
+
+        # Accumulate header bytes
+        try:
+            chunk = self._helper_process.stdout.read(8 - len(self._header_buf))
+        except BlockingIOError:
+            return None
+
+        if chunk:
+            self._header_buf += chunk
+
+        if len(self._header_buf) < 8:
+            return None
+
+        self._resolved_w, self._resolved_h = struct.unpack("<II", self._header_buf[:8])
+        self._header_buf = b""  # reset for next use
+        self._header_ready = True
+        logger.info(
+            "PipeWire capture started: %dx%d",
+            self._resolved_w, self._resolved_h,
+        )
+        return None
 
     def capture_loop(self, monitor_index: int = 0):
         """Generator that yields frames from the PipeWire subprocess."""
@@ -313,6 +415,10 @@ class PipeWireCapture:
     def release(self) -> None:
         """Stop the capture helper subprocess."""
         self._started = False
+        self._header_ready = None
+        self._pipewire_selected = False
+        self._header_buf = b""
+        self._frame_buf = b""
         if self._helper_process:
             try:
                 self._helper_process.terminate()
@@ -325,6 +431,11 @@ class PipeWireCapture:
             self._helper_process = None
         self._resolved_w = 0
         self._resolved_h = 0
+
+    @property
+    def has_failed(self) -> bool:
+        """True if PipeWire was tried and failed."""
+        return self._pipewire_selected and self._header_ready is None and not self._started
 
 
 # ---------------------------------------------------------------------------
@@ -438,8 +549,12 @@ class ScreenCapture:
                     return f
             except Exception as e:
                 logger.warning("PipeWire capture failed: %s", e)
-            logger.warning("PipeWire failed, falling back to MSS")
-            self._method = CaptureMethod.MSS
+            # None means "still waiting" or "failed"; check which
+            if pw.has_failed:
+                logger.warning("PipeWire failed, falling back to MSS")
+                self._method = CaptureMethod.MSS
+            # else: still waiting for portal — return None, caller will retry
+            return None
         try:
             return self._capture_mss(monitor_index)
         except Exception as e:
@@ -540,13 +655,24 @@ class ScreenCapture:
     def _loop_pipewire(self, monitor_index: int = 0) -> Iterator[CapturedFrame]:
         pw = self._get_pw()
         pw.start(monitor_index)
+        consecutive_none = 0
         while True:
             t0 = time.perf_counter()
             frame = pw.capture_one(monitor_index)
             if frame is None:
-                logger.warning("PipeWire ended, falling back to MSS")
-                yield from self._loop_mss(monitor_index)
-                return
+                if pw.has_failed:
+                    logger.warning("PipeWire failed, falling back to MSS")
+                    yield from self._loop_mss(monitor_index)
+                    return
+                # Still waiting for portal — brief sleep, keep trying
+                consecutive_none += 1
+                if consecutive_none > 300:  # ~10 s at 30 fps
+                    logger.warning("PipeWire timed out, falling back to MSS")
+                    yield from self._loop_mss(monitor_index)
+                    return
+                time.sleep(0.01)
+                continue
+            consecutive_none = 0
             prev = self._prev_frames.get(monitor_index)
             diff = frame_diff_ratio(frame.data, prev, threshold=12)
             self._prev_frames[monitor_index] = frame.data
@@ -729,7 +855,7 @@ def release_screenshot_capture() -> None:
 
 
 def _find_system_python() -> str | None:
-    """Find a Python interpreter that has GStreamer gi bindings."""
+    """Find a Python interpreter that has GStreamer + GstApp gi bindings."""
     import shutil
     import subprocess
 
@@ -739,7 +865,9 @@ def _find_system_python() -> str | None:
             continue
         try:
             r = subprocess.run(
-                [py, "-c", "import gi; gi.require_version('Gst', '1.0');"
+                [py, "-c",
+                 "import gi; gi.require_version('Gst', '1.0');"
+                 "gi.require_version('GstApp', '1.0');"
                  "from gi.repository import Gst; Gst.init(None);"
                  "print('ok')"],
                 capture_output=True, text=True, timeout=3,
