@@ -151,9 +151,44 @@ class _RelaySession:
 
     # ── sending ─────────────────────────────────────────────────────
 
+    # Message types that are internal to the relay protocol and must be
+    # sent directly (not wrapped in RELAY_ROUTE).
+    _RELAY_CONTROL_TYPES = frozenset({
+        MessageType.HELLO,
+        MessageType.HELLO_ACK,
+        MessageType.KEY_EXCHANGE,
+        MessageType.KEY_EXCHANGE_ACK,
+        MessageType.AUTH_REQUEST,
+        MessageType.AUTH_RESPONSE,
+        MessageType.AUTH_OK,
+        MessageType.AUTH_FAIL,
+        MessageType.SESSION_INFO,
+        MessageType.PING,
+        MessageType.PONG,
+        MessageType.DISCONNECT,
+        MessageType.ERROR,
+        MessageType.RELAY_REGISTER,
+        MessageType.RELAY_ROUTE,
+        MessageType.RELAY_PEER_LIST,
+        MessageType.RELAY_DEVICE_LIST,
+        MessageType.RELAY_DEVICE_UPDATE,
+    })
+
     def send_message(self, msg: Message) -> None:
-        """Send a message over the relay connection (thread-safe)."""
+        """Send a message over the relay connection (thread-safe).
+
+        Peer-to-peer messages (video frames, input events, clipboard,
+        file transfer, chat, audio) are automatically wrapped in
+        ``RELAY_ROUTE`` so the relay server forwards them to the
+        paired peer.  Relay-internal control messages are sent as-is.
+        """
         if self._loop and self._running.is_set():
+            # Wrap peer-to-peer messages in RELAY_ROUTE
+            if msg.type not in self._RELAY_CONTROL_TYPES:
+                msg = Message.relay_route(
+                    inner_type=msg.type.value,
+                    inner_payload=msg.payload,
+                )
             asyncio.run_coroutine_threadsafe(self._send_async(msg), self._loop)
 
     async def _send_async(self, msg: Message) -> None:
