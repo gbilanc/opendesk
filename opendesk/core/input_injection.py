@@ -248,7 +248,8 @@ class WaylandInputBackend(InputBackend):
             from evdev import UInput, ecodes as e
         except ImportError as exc:
             raise RuntimeError(
-                "Wayland input requires python-evdev: pip install evdev"
+                "Wayland input requires python-evdev. "
+                "Install it with: pip install evdev"
             ) from exc
 
         self._e = e
@@ -260,6 +261,35 @@ class WaylandInputBackend(InputBackend):
         self._ydotool = _find_ydotool()
         if self._ydotool:
             logger.info("Wayland: ydotool detected — absolute mouse supported")
+
+        # Check that /dev/uinput exists and we can write to it
+        import os
+        import stat
+        uinput_path = "/dev/uinput"
+        if not os.path.exists(uinput_path):
+            raise RuntimeError(
+                f"{uinput_path} does not exist. "
+                "Load the uinput kernel module: sudo modprobe uinput"
+            )
+        uinput_stat = os.stat(uinput_path)
+        if not os.access(uinput_path, os.W_OK):
+            import pwd
+            import grp
+            group_info = grp.getgrgid(uinput_stat.st_gid) if uinput_stat.st_gid != 0 else None
+            group_name = group_info.gr_name if group_info else "input"
+            raise PermissionError(
+                f"No write permission on {uinput_path}.\n"
+                f"Add your user to the '{group_name}' group:\n"
+                f"  sudo usermod -aG {group_name} $USER\n"
+                f"Then log out and log back in."
+            )
+
+        # Check that the uinput module is actually loaded
+        if not os.path.exists("/sys/module/uinput"):
+            raise RuntimeError(
+                "uinput kernel module not loaded. "
+                "Run: sudo modprobe uinput"
+            )
 
         try:
             capabilities = {
@@ -285,6 +315,13 @@ class WaylandInputBackend(InputBackend):
                     e.KEY_APOSTROPHE, e.KEY_GRAVE, e.KEY_MINUS,
                     e.KEY_EQUAL, e.KEY_LEFTBRACE, e.KEY_RIGHTBRACE,
                     e.KEY_BACKSLASH, e.KEY_SLASH,
+                    e.KEY_INSERT, e.KEY_PRINT, e.KEY_SCROLLLOCK,
+                    e.KEY_PAUSE, e.KEY_SYSRQ,
+                    e.KEY_NUMLOCK, e.KEY_KPSLASH, e.KEY_KPASTERISK,
+                    e.KEY_KPMINUS, e.KEY_KPPLUS, e.KEY_KPENTER,
+                    e.KEY_KP0, e.KEY_KP1, e.KEY_KP2, e.KEY_KP3,
+                    e.KEY_KP4, e.KEY_KP5, e.KEY_KP6, e.KEY_KP7,
+                    e.KEY_KP8, e.KEY_KP9, e.KEY_KPDOT,
                 ),
                 e.EV_REL: (e.REL_X, e.REL_Y, e.REL_WHEEL, e.REL_HWHEEL),
                 e.EV_SYN: (e.SYN_REPORT,),
@@ -292,11 +329,12 @@ class WaylandInputBackend(InputBackend):
             self._ui = UInput(capabilities, name="OpenDesk Virtual Input", version=0x1)
             logger.info("Wayland uinput device created")
         except PermissionError:
-            logger.error(
-                "Cannot create uinput device. "
-                "Add user to the 'input' group: sudo usermod -aG input $USER"
-            )
             raise
+        except OSError as e:
+            raise RuntimeError(
+                f"Failed to create uinput device: {e}\n"
+                "Ensure the uinput kernel module is loaded: sudo modprobe uinput"
+            ) from e
 
     def _key_to_evdev(self, key: str | int) -> int:
         from evdev import ecodes as e
@@ -311,6 +349,16 @@ class WaylandInputBackend(InputBackend):
             "space": e.KEY_SPACE, "ctrl": e.KEY_LEFTCTRL, "alt": e.KEY_LEFTALT,
             "shift": e.KEY_LEFTSHIFT, "super": e.KEY_LEFTMETA, "menu": e.KEY_MENU,
             "capslock": e.KEY_CAPSLOCK,
+            "insert": e.KEY_INSERT, "print": e.KEY_PRINT,
+            "scrolllock": e.KEY_SCROLLLOCK, "pause": e.KEY_PAUSE,
+            "numlock": e.KEY_NUMLOCK,
+            "f1": e.KEY_F1, "f2": e.KEY_F2, "f3": e.KEY_F3, "f4": e.KEY_F4,
+            "f5": e.KEY_F5, "f6": e.KEY_F6, "f7": e.KEY_F7, "f8": e.KEY_F8,
+            "f9": e.KEY_F9, "f10": e.KEY_F10, "f11": e.KEY_F11, "f12": e.KEY_F12,
+            "f13": e.KEY_F13, "f14": e.KEY_F14, "f15": e.KEY_F15,
+            "f16": e.KEY_F16, "f17": e.KEY_F17, "f18": e.KEY_F18,
+            "f19": e.KEY_F19, "f20": e.KEY_F20,
+            "f21": e.KEY_F21, "f22": e.KEY_F22, "f23": e.KEY_F23, "f24": e.KEY_F24,
         }
         lower_key = key.lower()
         if lower_key in key_map:
@@ -319,10 +367,12 @@ class WaylandInputBackend(InputBackend):
             return getattr(e, f"KEY_{lower_key.upper()}")
         if len(key) == 1 and "0" <= key <= "9":
             return getattr(e, f"KEY_{key}")
-        sym_map = {",": e.KEY_COMMA, ".": e.KEY_DOT, ";": e.KEY_SEMICOLON,
-                   "'": e.KEY_APOSTROPHE, "`": e.KEY_GRAVE, "-": e.KEY_MINUS,
-                   "=": e.KEY_EQUAL, "[": e.KEY_LEFTBRACE, "]": e.KEY_RIGHTBRACE,
-                   "\\": e.KEY_BACKSLASH, "/": e.KEY_SLASH}
+        sym_map = {
+            ",": e.KEY_COMMA, ".": e.KEY_DOT, ";": e.KEY_SEMICOLON,
+            "'": e.KEY_APOSTROPHE, "`": e.KEY_GRAVE, "-": e.KEY_MINUS,
+            "=": e.KEY_EQUAL, "[": e.KEY_LEFTBRACE, "]": e.KEY_RIGHTBRACE,
+            "\\": e.KEY_BACKSLASH, "/": e.KEY_SLASH,
+        }
         if key in sym_map:
             return sym_map[key]
         logger.warning("Unknown key '%s'", key)

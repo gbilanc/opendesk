@@ -120,8 +120,10 @@ class StreamService(QObject):
             try:
                 self._input_backend = create_input_backend()
             except Exception as e:
-                logger.warning("Input backend unavailable (%s) — remote input disabled", e)
+                logger.warning("Input backend unavailable — remote input disabled: %s", e)
                 self._input_backend = None
+                # Emit a non-fatal error so the UI can show a warning
+                self.error.emit(f"Remote input disabled: {e}")
 
             # Reset bandwidth
             self._bw_measure_bytes = 0

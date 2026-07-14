@@ -275,22 +275,24 @@ class RemoteViewer(QGraphicsView):
             super().wheelEvent(event)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
-        """Forward mouse press."""
-        if event.button() == Qt.MouseButton.LeftButton:
+        """Forward mouse press (all buttons)."""
+        btn = self._qt_button_to_remote(event.button())
+        if btn is not None:
             scene_pos = self.mapToScene(event.pos())
             self.remote_mouse_event.emit(
                 int(scene_pos.x()), int(scene_pos.y()),
-                1, True, True,
+                btn, True, True,
             )
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
-        """Forward mouse release."""
-        if event.button() == Qt.MouseButton.LeftButton:
+        """Forward mouse release (all buttons)."""
+        btn = self._qt_button_to_remote(event.button())
+        if btn is not None:
             scene_pos = self.mapToScene(event.pos())
             self.remote_mouse_event.emit(
                 int(scene_pos.x()), int(scene_pos.y()),
-                1, False, True,
+                btn, False, True,
             )
         super().mouseReleaseEvent(event)
 
@@ -387,6 +389,21 @@ class RemoteViewer(QGraphicsView):
         self._frame_count_since_hud = 0
         self._last_hud_update = now
         self.viewport().update()  # trigger paintEvent for HUD
+
+    def _qt_button_to_remote(self, qt_button) -> int | None:
+        """Convert a Qt mouse button to remote button code.
+
+        Returns
+        -------
+        int or None
+            1 = left, 2 = middle, 3 = right, None if unsupported.
+        """
+        btn_map = {
+            Qt.MouseButton.LeftButton: 1,
+            Qt.MouseButton.MiddleButton: 2,
+            Qt.MouseButton.RightButton: 3,
+        }
+        return btn_map.get(qt_button)
 
     def _key_to_name(self, qt_key: int) -> str | None:
         """Convert a Qt key code to a remote key name."""
