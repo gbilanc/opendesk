@@ -8,7 +8,6 @@ of the main window, with copy buttons and a refresh action.
 from __future__ import annotations
 
 import logging
-import random
 import string
 
 from PySide6.QtCore import Qt, QTimer, Signal, Slot
@@ -330,5 +329,6 @@ class SessionInfoWidget(QWidget):
     @staticmethod
     def _generate_password() -> str:
         """Generate a random 8-character alphanumeric password."""
+        import secrets
         alphabet = string.ascii_uppercase + string.digits
-        return "".join(random.choices(alphabet, k=8))
+        return "".join(secrets.choice(alphabet) for _ in range(8))

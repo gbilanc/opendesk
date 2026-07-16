@@ -140,6 +140,7 @@ class AudioManager:
         self._send_fn: Callable | None = None
         self._capture_task: asyncio.Task | None = None
         self._playback_stream = None
+        self._playback_device = None  # reusable speaker context
 
     # ── properties ──────────────────────────────────────────────────
 
@@ -187,6 +188,7 @@ class AudioManager:
             self._capture_task = None
 
         self._opus.release()
+        self._playback_device = None
         logger.info("Audio manager stopped")
 
     # ── audio capture loop ──────────────────────────────────────────
@@ -254,10 +256,17 @@ class AudioManager:
             return
 
         try:
-            speaker = sc.default_speaker()
-            speaker.play(pcm, samplerate=self._config.sample_rate, channels=self._config.channels)
+            # Reuse the speaker device across frames
+            if self._playback_device is None:
+                self._playback_device = sc.default_speaker()
+
+            self._playback_device.play(
+                pcm, samplerate=self._config.sample_rate,
+                channels=self._config.channels,
+            )
         except Exception as e:
             logger.warning("Audio playback error: %s", e)
+            self._playback_device = None  # reset on error
 
     # ── cleanup ─────────────────────────────────────────────────────
 

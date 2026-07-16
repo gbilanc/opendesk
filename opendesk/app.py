@@ -109,12 +109,13 @@ def get_current_theme() -> str:
 def main() -> None:
     """Start the OpenDesk application."""
     setup_logging()
-    logger.info("Starting OpenDesk v%s", __import__("opendesk").__version__)
+    version = __import__("opendesk").__version__
+    logger.info("Starting OpenDesk v%s", version)
 
     app = QApplication(sys.argv)
     app.setApplicationName("OpenDesk")
     app.setOrganizationName("OpenDesk")
-    app.setApplicationVersion(__import__("opendesk").__version__)
+    app.setApplicationVersion(version)
     app.setWindowIcon(QIcon(str(_QSS_LIGHT.parent / "opendesk.svg")))
 
     app.setStyle("Fusion")

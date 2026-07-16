@@ -15,17 +15,28 @@ import time
 from PySide6.QtCore import QObject, QSettings, QTimer, Signal, Slot
 
 from opendesk.core.screen_capture import ScreenCapture, CapturedFrame
-from opendesk.core.video_codec import VideoEncoder, EncoderConfig, QualityLevel, _QUALITY_BITRATE
+from opendesk.core.video_codec import VideoEncoder, EncoderConfig, QualityLevel
 from opendesk.core.input_injection import (
     InputBackend,
     MouseButton,
     KeyState,
     create_input_backend,
 )
+import cv2
+import numpy as np
+
 from opendesk.network.protocol import Message, MessageType
 from opendesk.network.relay_client import RelayClient
 
 logger = logging.getLogger(__name__)
+
+# Bitrate defaults per quality level (mirrors video_codec._QUALITY_BITRATE)
+_DEFAULT_BITRATES = {
+    QualityLevel.LOW: 500_000,
+    QualityLevel.MEDIUM: 2_000_000,
+    QualityLevel.HIGH: 8_000_000,
+    QualityLevel.LOSSLESS: 20_000_000,
+}
 
 # ═══════════════════════════════════════════════════════════════════
 # Tile grid constants
@@ -128,7 +139,7 @@ class StreamService(QObject):
                     width=width,
                     height=height,
                     fps=fps,
-                    bitrate=_QUALITY_BITRATE[quality],
+                    bitrate=_DEFAULT_BITRATES[quality],
                     quality=quality,
                 )
             )
@@ -285,8 +296,6 @@ class StreamService(QObject):
             self._send_full_keyframe(current, w, h, pts)
             self._prev_frame = current.copy()
             return
-
-        import cv2
 
         tile_size = _TILE_SIZE
         threshold = _TILE_THRESHOLD

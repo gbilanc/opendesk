@@ -15,7 +15,7 @@ from pathlib import Path
 import av
 import numpy as np
 
-from opendesk.core.video_codec import VideoEncoder, EncoderConfig, QualityLevel
+from opendesk.core.video_codec import QualityLevel
 
 logger = logging.getLogger(__name__)
 
@@ -114,14 +114,7 @@ class ScreenRecorder:
         if self._output_path.exists():
             logger.warning("Overwriting existing recording: %s", self._output_path)
 
-        # Create encoder
-        config = EncoderConfig(
-            width=width, height=height, fps=fps, bitrate=bitrate,
-            quality=QualityLevel.HIGH,
-        )
-        self._encoder = VideoEncoder(config)
-
-        # Open the output file for writing
+        # Open the output container and configure the H.264 stream
         self._av_container = av.open(str(self._output_path), mode="w")
         rate_int = max(1, int(round(fps)))
         self._av_stream = self._av_container.add_stream("h264", rate=rate_int)
@@ -154,7 +147,7 @@ class ScreenRecorder:
         bool
             ``True`` if the frame was written successfully.
         """
-        if not self._status.active or self._encoder is None:
+        if not self._status.active or self._av_stream is None:
             return False
 
         try:
@@ -213,7 +206,6 @@ class ScreenRecorder:
             self._status.file_size_mb,
         )
 
-        self._encoder = None
         self._av_container = None
         self._av_stream = None
 
@@ -225,4 +217,5 @@ class ScreenRecorder:
         if self._output_path and self._output_path.exists():
             self._output_path.unlink(missing_ok=True)
             logger.info("Recording cancelled: %s removed", self._output_path)
-        self._encoder = None
+        self._av_container = None
+        self._av_stream = None

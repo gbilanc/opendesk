@@ -95,9 +95,9 @@ class ClipboardSync(QObject):
         """Toggle sync on/off. Returns the new state."""
         if self._enabled:
             self.stop()
-        else:
-            # Must call start() with a send_fn first
-            pass
+        elif self._send_fn is not None:
+            self.start(self._send_fn)
+        # If _send_fn is None, toggle() can't enable — caller must use start()
         return self._enabled
 
     async def receive_from_remote(self, msg: Message) -> None:

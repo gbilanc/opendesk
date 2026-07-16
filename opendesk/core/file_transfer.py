@@ -124,6 +124,10 @@ class FileTransferManager:
     def completed_jobs(self) -> list[TransferJob]:
         return [j for j in self._jobs.values() if j.state == TransferState.COMPLETED]
 
+    def get_job(self, job_id: str) -> TransferJob | None:
+        """Look up a transfer job by ID."""
+        return self._jobs.get(job_id)
+
     # ── sending ─────────────────────────────────────────────────────
 
     async def send_files(

@@ -176,17 +176,10 @@ class E2EEncryption:
             raise RuntimeError("Remote public key not set — call set_remote_key() first")
 
         nonce = sodium.randombytes(NONCE_SIZE)
-        ciphertext = self._box.encrypt(plaintext, nonce).ciphertext
-        # Box.encrypt returns nonce + ciphertext, but we generate our own nonce
-        # Actually Box.encrypt already prepends a random nonce. Let's use the low-level API.
-        ciphertext = self._box.encrypt(plaintext, nonce)
-        # ciphertext is bytes(nonce) + bytes(ciphertext)
-        actual_nonce = bytes(ciphertext[:NONCE_SIZE])
-        actual_ct = bytes(ciphertext[NONCE_SIZE:])
-
+        encrypted = self._box.encrypt(plaintext, nonce)
         return EncryptedMessage(
-            ciphertext=actual_ct,
-            nonce=actual_nonce,
+            ciphertext=encrypted.ciphertext,
+            nonce=nonce,
             sender_public_key=self._key_pair.public_bytes,
         )
 

@@ -127,10 +127,15 @@ class MainWindow(QMainWindow):
         self._setup_fullscreen_shortcuts()
 
         # Create initial session and start hosting
-        import string, random
-        alphabet = string.ascii_uppercase + string.digits
-        initial_pwd = "".join(random.choices(alphabet, k=8))
-        self._connection.create_session(initial_pwd)
+        # Use persisted password if available, otherwise generate one
+        saved_pwd = self._settings.value("session/password", "")
+        if not saved_pwd:
+            import string
+            import secrets
+            alphabet = string.ascii_uppercase + string.digits
+            saved_pwd = "".join(secrets.choice(alphabet) for _ in range(8))
+            self._settings.setValue("session/password", saved_pwd)
+        self._connection.create_session(saved_pwd)
         self._session_info.set_session(
             self._connection.session_id,
             self._connection.password,
@@ -370,6 +375,7 @@ class MainWindow(QMainWindow):
     def _on_session_refreshed(self, session_id: str, password: str) -> None:
         """Called when user clicks 'Nuova sessione' — create new session and re-host."""
         self._connection.create_session(password)
+        self._settings.setValue("session/password", password)
         self._session_info.set_session(
             self._connection.session_id,
             self._connection.password,
@@ -532,18 +538,18 @@ class MainWindow(QMainWindow):
             job_id = self._file_transfer.handle_file_request(msg)
             if job_id:
                 self._relay.send_message(Message.file_accept(job_id))
-                job = self._file_transfer._jobs.get(job_id)
+                job = self._file_transfer.get_job(job_id)
                 if job:
                     self._transfer_dock.add_transfer(job)
         elif msg.type == MessageType.FILE_CHUNK:
             self._file_transfer.handle_chunk(msg)
             job_id = msg.payload.get("job_id", "")
-            job = self._file_transfer._jobs.get(job_id)
+            job = self._file_transfer.get_job(job_id)
             if job:
                 self._transfer_dock.add_transfer(job)
         elif msg.type == MessageType.FILE_ACCEPT:
             job_id = msg.payload.get("job_id", "")
-            job = self._file_transfer._jobs.get(job_id)
+            job = self._file_transfer.get_job(job_id)
             if job and self._file_transfer_send_fn:
                 import asyncio
                 asyncio.ensure_future(
@@ -552,14 +558,14 @@ class MainWindow(QMainWindow):
         elif msg.type == MessageType.FILE_REJECT:
             job_id = msg.payload.get("job_id", "")
             reason = msg.payload.get("reason", "Rejected by remote")
-            job = self._file_transfer._jobs.get(job_id)
+            job = self._file_transfer.get_job(job_id)
             if job:
                 job.state = TransferState.CANCELLED
                 job.error = reason
                 self._transfer_dock.add_transfer(job)
         elif msg.type in (MessageType.FILE_COMPLETE, MessageType.FILE_ERROR):
             job_id = msg.payload.get("job_id", "")
-            job = self._file_transfer._jobs.get(job_id)
+            job = self._file_transfer.get_job(job_id)
             if job:
                 if msg.type == MessageType.FILE_COMPLETE:
                     job.state = TransferState.COMPLETED

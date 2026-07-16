@@ -103,11 +103,11 @@ class DeviceRegistry:
             # Match prefisso UUID
             elif did.startswith(q):
                 results.append((d, 1))
+            # Match nome inizia con (più specifico di "contiene")
+            elif dname.startswith(q):
+                results.append((d, 2))
             # Match nome contiene
             elif q in dname:
-                results.append((d, 2))
-            # Match nome inizia con
-            elif dname.startswith(q):
                 results.append((d, 3))
 
         # Ordina per rilevanza (priorità crescente)

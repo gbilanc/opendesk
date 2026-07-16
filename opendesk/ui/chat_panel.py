@@ -87,13 +87,13 @@ class ChatPanel(QDialog):
         timestamp = time.strftime("%H:%M")
         prefix = "←" if is_remote else "→"
 
-        # Truncate if too many messages
+        # Truncate if too many messages — remove the oldest <div> block
         doc = self._display.document()
         if doc.blockCount() > _MAX_MESSAGES:
-            # Remove first block
             cursor = self._display.textCursor()
             cursor.movePosition(cursor.MoveOperation.Start)
-            cursor.movePosition(cursor.MoveOperation.Down, cursor.MoveMode.KeepAnchor)
+            # Select until the next </div> to remove a full message block
+            cursor.movePosition(cursor.MoveOperation.Down, cursor.MoveMode.KeepAnchor, 3)
             cursor.removeSelectedText()
 
         # Style differently for local vs remote
