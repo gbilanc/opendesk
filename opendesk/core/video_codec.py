@@ -520,6 +520,11 @@ class VideoDecoder:
         self._needs_keyframe = True
         self._buffer = b""
 
+    @property
+    def codec_name(self) -> str:
+        """The resolved codec name (e.g. ``h264``, ``hevc``)."""
+        return self._codec_name
+
     def decode(
         self,
         data: bytes,
