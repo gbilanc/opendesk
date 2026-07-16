@@ -136,15 +136,15 @@ class VideoEncoder:
         self._ensure_initialised(frame.shape[1], frame.shape[0])
 
         # Force keyframe on the very first frame
-        # NOTE: check _pts BEFORE calling _make_av_frame (which increments it).
         force_keyframe = self._pts == 0 or self._force_next_keyframe
         self._force_next_keyframe = False
 
-        # Convert RGB → YUV420P
-        yuv = self._rgb_to_yuv(frame)
-
-        # Create a VideoFrame from the YUV planes
-        av_frame = self._make_av_frame(yuv)
+        # Create a VideoFrame from RGB — PyAV handles the RGB→YUV
+        # conversion with the correct color matrices (ITU-R BT.601),
+        # avoiding the quality loss from manual OpenCV conversion.
+        av_frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
+        av_frame.pts = self._pts
+        self._pts += 1
 
         if force_keyframe:
             av_frame.pict_type = 1  # PictureType.I (IDR / keyframe)
@@ -236,35 +236,7 @@ class VideoEncoder:
         self._pts = 0
         self._ensure_initialised(self._config.width, self._config.height)
 
-    def _rgb_to_yuv(self, rgb: np.ndarray) -> np.ndarray:
-        """Convert RGB (H, W, 3) uint8 to YUV420P planar.
 
-        Uses OpenCV for fast conversion.
-        """
-        import cv2
-
-        # OpenCV uses BGR internally, but cvtColor handles RGB→YUV
-        yuv = cv2.cvtColor(rgb, cv2.COLOR_RGB2YUV)
-        # YUV420 planar: full Y, quarter U, quarter V
-        h, w = yuv.shape[:2]
-        y = yuv[:, :, 0]
-        u = yuv[::2, ::2, 1]
-        v = yuv[::2, ::2, 2]
-        # Pack planes contiguously
-        return np.ascontiguousarray(np.concatenate([y.ravel(), u.ravel(), v.ravel()]))
-
-    def _make_av_frame(self, yuv_planes: np.ndarray) -> Any:  # noqa: ANN401
-        """Build an av.VideoFrame from a YUV420P byte array."""
-        h, w = self._config.height, self._config.width
-        frame = av.VideoFrame(w, h, "yuv420p")
-        y_size = w * h
-        u_size = (w // 2) * (h // 2)
-        frame.planes[0].update(yuv_planes[:y_size])
-        frame.planes[1].update(yuv_planes[y_size : y_size + u_size])
-        frame.planes[2].update(yuv_planes[y_size + u_size :])
-        frame.pts = self._pts
-        self._pts += 1
-        return frame
 
     def _packet_from_av(self, packet: Any) -> EncodedPacket:  # noqa: ANN401
         """Convert an av.Packet to an EncodedPacket."""

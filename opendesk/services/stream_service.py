@@ -334,6 +334,7 @@ class StreamService(QObject):
                     change_ratio * 100,
                 )
                 self._send_full_keyframe(current, w, h, pts)
+                self._frame_count = 0
                 return
 
         # Send all changed tiles
