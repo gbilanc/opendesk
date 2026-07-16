@@ -56,6 +56,7 @@ class MessageType(IntEnum):
     # ── Video ──
     VIDEO_FRAME = 0x10  # H.264 encoded frame
     VIDEO_REQUEST_KEYFRAME = 0x11  # Receiver requests keyframe
+    VIDEO_TILE = 0x12  # Tile-based incremental frame update
 
     # ── Input ──
     MOUSE_EVENT = 0x20  # Mouse movement / click
@@ -366,6 +367,21 @@ class Message:
         return cls(
             MessageType.RELAY_DEVICE_LIST,
             {"devices": devices},
+        )
+
+    @classmethod
+    def video_tile(cls, data: bytes, x: int, y: int, width: int, height: int, pts: int) -> Message:
+        """An incremental tile update (JPEG-encoded sub-region)."""
+        return cls(
+            MessageType.VIDEO_TILE,
+            {
+                "data": data,
+                "x": x,
+                "y": y,
+                "width": width,
+                "height": height,
+                "pts": pts,
+            },
         )
 
     @classmethod

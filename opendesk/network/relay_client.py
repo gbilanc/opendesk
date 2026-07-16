@@ -106,6 +106,11 @@ class _RelaySession:
         self._decoder: VideoDecoder | None = None
         self._auth_nonce: str = ""  # challenge nonce for challenge-response auth
 
+        # Tile grid compositing (client side)
+        self._reference_frame: np.ndarray | None = None
+        self._frame_width: int = 0
+        self._frame_height: int = 0
+
     # ── lifecycle ───────────────────────────────────────────────────
 
     def start(self) -> None:
@@ -397,6 +402,10 @@ class _RelaySession:
                                 data, width, height, is_keyframe=is_keyframe,
                             )
                             if rgb is not None:
+                                # Update reference frame for tile compositing
+                                self._reference_frame = rgb.copy()
+                                self._frame_width = width
+                                self._frame_height = height
                                 self.inbox.put(
                                     ("frame", (rgb.copy(), width, height), self.session_seq),
                                 )
@@ -418,9 +427,45 @@ class _RelaySession:
                         except Exception as e:
                             logger.exception("Frame decode error: %s", e)
                             self._decoder.reset()
+                            self._reference_frame = None
                             await self._send_async(
                                 Message(MessageType.VIDEO_REQUEST_KEYFRAME, {}),
                             )
+
+                elif t == MessageType.VIDEO_TILE:
+                    payload = msg.payload
+                    data = payload.get("data")
+                    tx = payload.get("x", 0)
+                    ty = payload.get("y", 0)
+                    tw = payload.get("width", 0)
+                    th = payload.get("height", 0)
+                    if data and tw > 0 and th > 0 and self._reference_frame is not None:
+                        try:
+                            import cv2
+                            import numpy as np
+                            arr = np.frombuffer(data, dtype=np.uint8)
+                            tile_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                            if tile_bgr is not None and tile_bgr.shape[0] == th and tile_bgr.shape[1] == tw:
+                                tile_rgb = cv2.cvtColor(tile_bgr, cv2.COLOR_BGR2RGB)
+                                # Composite onto reference frame
+                                ref_h, ref_w = self._reference_frame.shape[:2]
+                                if ty + th <= ref_h and tx + tw <= ref_w:
+                                    self._reference_frame[ty:ty+th, tx:tx+tw] = tile_rgb
+                                    self.inbox.put(
+                                        ("frame", (
+                                            self._reference_frame.copy(),
+                                            self._frame_width,
+                                            self._frame_height,
+                                        ), self.session_seq),
+                                    )
+                            else:
+                                logger.warning(
+                                    "Tile decode mismatch: expected %dx%d, got %s",
+                                    tw, th,
+                                    tile_bgr.shape[:2] if tile_bgr is not None else "None",
+                                )
+                        except Exception as e:
+                            logger.warning("Tile decode/composite error: %s", e)
                 elif t == MessageType.VIDEO_REQUEST_KEYFRAME:
                     logger.debug("Keyframe requested by peer")
                     # Forward to host via inbox so the StreamService can
@@ -629,6 +674,15 @@ class RelayClient(QObject):
         """
         if self._host_session:
             self._host_session.send_frame(data, width, height, pts, keyframe=keyframe)
+
+    def send_tile(self, data: bytes, x: int, y: int, width: int, height: int, pts: int) -> None:
+        """Send a JPEG-encoded tile update over the relay (host only).
+
+        Always sent through the host session.
+        """
+        if self._host_session:
+            msg = Message.video_tile(data, x, y, width, height, pts)
+            self._host_session.send_message(msg)
 
     def send_mouse_event(
         self, x: int, y: int, button: int | None = None,
