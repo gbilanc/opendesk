@@ -216,10 +216,9 @@ class VideoEncoder:
             self._stream.gop_size = self._config.gop_size
             self._stream.max_b_frames = 0  # lower latency
             self._stream.options = {
-                "preset": "veryfast",  # balance speed/quality
+                "preset": "medium",  # better quality/speed balance
                 "tune": "zerolatency",
-                "crf": "23",  # constant quality mode fallback
-                "profile": "baseline",
+                "profile": "high",
             }
             self._config.width = width
             self._config.height = height
