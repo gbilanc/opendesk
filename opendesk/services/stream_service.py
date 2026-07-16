@@ -42,17 +42,18 @@ _DEFAULT_BITRATES = {
 # Tile grid constants
 # ═══════════════════════════════════════════════════════════════════
 
-_TILE_SIZE = 64  # tile width/height in pixels
+_TILE_SIZE = 128  # tile width/height in pixels (64 → 128 = 75% fewer tiles)
 _TILE_THRESHOLD = 16  # pixel difference threshold for change detection
 _TILE_MAX_CHANGED_RATIO = 0.30  # if more tiles changed, send full frame
 _KEYFRAME_INTERVAL = 60  # send full keyframe every N frames (every ~2s at 30fps)
-# PNG compression level per quality preset (0=fast/no compression, 9=max).
-# PNG is lossless — compression level only affects file size vs speed.
-_TILE_PNG_COMPRESSION: dict[QualityLevel, int] = {
-    QualityLevel.LOW: 1,
-    QualityLevel.MEDIUM: 3,
-    QualityLevel.HIGH: 6,
-    QualityLevel.LOSSLESS: 9,
+# JPEG quality per quality preset.
+# JPEG is lossy but ~10× faster to encode than PNG and produces
+# far smaller payloads for photographic / gradient-heavy content.
+_TILE_JPEG_QUALITY: dict[QualityLevel, int] = {
+    QualityLevel.LOW: 50,
+    QualityLevel.MEDIUM: 65,
+    QualityLevel.HIGH: 80,
+    QualityLevel.LOSSLESS: 95,
 }
 
 
@@ -190,7 +191,7 @@ class StreamService(QObject):
 
             # Start timers (always, even if encoder not yet ready)
             self._stream_timer.start(int(1000 / fps))
-            self._bw_timer.start(3000)
+            self._bw_timer.start(1000)  # bandwidth adaptation every 1s (was 3s)
             logger.info("Streaming started at %d FPS (tile grid: %dx%d tiles)", fps,
                         _TILE_SIZE, _TILE_SIZE)
         except Exception as e:
@@ -245,15 +246,23 @@ class StreamService(QObject):
             if frame is None:
                 return
 
-            # Lazy encoder initialisation
-            if self._encoder is None:
-                if not self._lazy_init_encoder(frame.width, frame.height):
-                    return
-
+            # ── Resolution scaling ──
+            scale = float(self._settings.value("video/resolution_scale", 1.0))
             current = frame.data  # (H, W, 3) RGB
+            if scale < 1.0:
+                h, w = current.shape[:2]
+                nw, nh = int(w * scale), int(h * scale)
+                if nw > 0 and nh > 0:
+                    current = cv2.resize(current, (nw, nh), interpolation=cv2.INTER_LINEAR)
+
             h, w = current.shape[:2]
             pts = int(frame.timestamp * 1000)
             self._frame_count += 1
+
+            # Lazy encoder initialisation (uses scaled resolution)
+            if self._encoder is None:
+                if not self._lazy_init_encoder(w, h):
+                    return
 
             # Decide whether to send a full keyframe or tiles
             send_full = (
@@ -305,7 +314,7 @@ class StreamService(QObject):
         threshold = _TILE_THRESHOLD
         quality_name = self._settings.value("video/quality", "HIGH")
         quality = getattr(QualityLevel, quality_name, QualityLevel.HIGH)
-        png_level = _TILE_PNG_COMPRESSION[quality]
+        jpeg_quality = _TILE_JPEG_QUALITY[quality]
 
         changed_tiles: list[tuple[bytes, int, int, int, int]] = []
         total_tiles = 0
@@ -329,8 +338,8 @@ class StreamService(QObject):
                     cur_tile = current[y:y + th, x:x + tw]
                     tile_bgr = cv2.cvtColor(cur_tile, cv2.COLOR_RGB2BGR)
                     success, encoded = cv2.imencode(
-                        '.png', tile_bgr,
-                        [cv2.IMWRITE_PNG_COMPRESSION, png_level],
+                        '.jpg', tile_bgr,
+                        [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality],
                     )
                     if success:
                         changed_tiles.append((encoded.tobytes(), x, y, tw, th))

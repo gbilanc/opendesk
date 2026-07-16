@@ -54,6 +54,11 @@ class EncoderConfig:
     quality: QualityLevel = QualityLevel.MEDIUM
     gop_size: int = 60  # keyframe interval (in frames)
     pixel_format: str = "yuv420p"
+    options: dict[str, str] = field(default_factory=lambda: {
+        "preset": "veryfast",
+        "tune": "zerolatency",
+        "profile": "baseline",
+    })
 
 
 @dataclass
@@ -115,6 +120,21 @@ class VideoEncoder:
         """Set a predefined quality level and adjust bitrate."""
         self._config.quality = level
         self.actual_bitrate = _QUALITY_BITRATE[level]
+
+    def set_encoder_preset(self, preset: str) -> None:
+        """Change encoder speed/quality preset (ultrafast, veryfast, faster, fast, medium, slow, veryslow).
+
+        Call before encoding starts or use with reinitialisation.
+        """
+        valid = {"ultrafast", "veryfast", "faster", "fast", "medium", "slow", "veryslow"}
+        if preset not in valid:
+            raise ValueError(f"Invalid preset '{preset}'. Choose from {valid}")
+        self._config.options = {
+            **self._config.options,
+            "preset": preset,
+        }
+        if self._initialised:
+            self._reinitialise()
 
     # ── encoding ────────────────────────────────────────────────────
 
@@ -215,11 +235,7 @@ class VideoEncoder:
             self._stream.bit_rate = self._actual_bitrate
             self._stream.gop_size = self._config.gop_size
             self._stream.max_b_frames = 0  # lower latency
-            self._stream.options = {
-                "preset": "medium",  # better quality/speed balance
-                "tune": "zerolatency",
-                "profile": "baseline",
-            }
+            self._stream.options = dict(self._config.options)
             self._config.width = width
             self._config.height = height
             self._initialised = True

@@ -79,8 +79,16 @@ class SettingsDialog(QDialog):
         self._quality_combo = QComboBox()
         for q in QualityLevel:
             self._quality_combo.addItem(q.name.title(), q.value)
-        self._quality_combo.setCurrentIndex(1)  # MEDIUM default
+        self._quality_combo.setCurrentIndex(2)  # HIGH default
         video_layout.addRow("Quality:", self._quality_combo)
+
+        self._resolution_scale = QComboBox()
+        self._resolution_scale.addItem("Full (1:1)", 1.0)
+        self._resolution_scale.addItem("75%", 0.75)
+        self._resolution_scale.addItem("50%", 0.5)
+        self._resolution_scale.addItem("25%", 0.25)
+        self._resolution_scale.setCurrentIndex(0)
+        video_layout.addRow("Resolution:", self._resolution_scale)
 
         self._fps_spin = QSpinBox()
         self._fps_spin.setRange(1, 60)
@@ -216,6 +224,11 @@ class SettingsDialog(QDialog):
         if idx >= 0:
             self._quality_combo.setCurrentIndex(idx)
 
+        scale = float(self._settings.value("video/resolution_scale", 1.0))
+        scale_idx = self._resolution_scale.findData(scale)
+        if scale_idx >= 0:
+            self._resolution_scale.setCurrentIndex(scale_idx)
+
         self._fps_spin.setValue(int(self._settings.value("video/max_fps", 30)))
         self._adaptive_fps.setChecked(
             self._settings.value("video/adaptive_fps", True, type=bool)
@@ -344,6 +357,10 @@ class SettingsDialog(QDialog):
         self._settings.setValue(
             "video/quality",
             self._quality_combo.currentText().upper(),
+        )
+        self._settings.setValue(
+            "video/resolution_scale",
+            self._resolution_scale.currentData(),
         )
         self._settings.setValue("video/max_fps", self._fps_spin.value())
         self._settings.setValue("video/adaptive_fps", self._adaptive_fps.isChecked())
