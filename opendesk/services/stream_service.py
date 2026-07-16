@@ -174,8 +174,19 @@ class StreamService(QObject):
             def _on_send(data: bytes) -> None:
                 self._bw_measure_bytes += len(data)
 
+            # Callback per errori della pipeline (CaptureWorker / EncoderWorker)
+            def _on_pipeline_error(msg: str) -> None:
+                logger.error("Pipeline error: %s", msg)
+                self.error.emit(msg)
+                self.stop_streaming()
+
             # Crea e avvia la pipeline
-            self._pipeline = StreamingPipeline(config, self._relay.send_frame, self._relay.send_tile)
+            self._pipeline = StreamingPipeline(
+                config,
+                self._relay.send_frame,
+                self._relay.send_tile,
+                on_error=_on_pipeline_error,
+            )
             self._pipeline.on_keyframe_sent = lambda data, w, h, pts, kf: _on_send(data)
             self._pipeline.on_tile_sent = lambda data, x, y, tw, th, pts: _on_send(data)
             self._pipeline.start()

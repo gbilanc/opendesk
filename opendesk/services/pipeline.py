@@ -64,6 +64,9 @@ class CaptureWorker(threading.Thread):
     dalla velocità dell'encoder.  Se l'encoder è più lento,
     ``frame_queue`` si riempie fino a ``_FRAME_QUEUE_MAX`` e poi
     il worker salta frame (back-pressure naturale).
+
+    In caso di errore critico chiama ``on_error`` (se fornito)
+    per permettere al chiamante di arrestare la pipeline.
     """
 
     def __init__(
@@ -71,11 +74,13 @@ class CaptureWorker(threading.Thread):
         config: PipelineConfig,
         frame_queue: queue.Queue,
         stop_event: threading.Event,
+        on_error: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__(name="CaptureWorker", daemon=True)
         self._config = config
         self._frame_queue = frame_queue
         self._stop_event = stop_event
+        self._on_error = on_error
         self._capture: ScreenCapture | None = None
 
     def run(self) -> None:
@@ -83,7 +88,10 @@ class CaptureWorker(threading.Thread):
         try:
             self._capture = ScreenCapture()
         except Exception as e:
-            logger.error("CaptureWorker: ScreenCapture init failed: %s", e)
+            msg = f"ScreenCapture init failed: {e}"
+            logger.error("CaptureWorker: %s", msg)
+            if self._on_error:
+                self._on_error(msg)
             return
         interval = 1.0 / max(self._config.fps, 1)
 
@@ -139,10 +147,13 @@ class CaptureWorker(threading.Thread):
 
 
 class EncoderWorker(threading.Thread):
-    """Thread che prende frame dalla coda e li codifica in H.264.
+    """Thread che prende frame dalla coda e li codifica in H.264/H.265.
 
     Supporta sia full keyframe che tile JPEG.
     Emette packet sulla ``pkt_queue`` per il NetworkWorker.
+
+    Watchdog: se non arrivano frame per 5s (CaptureWorker morto),
+    chiama ``on_error`` per arrestare la pipeline.
     """
 
     def __init__(
@@ -153,6 +164,7 @@ class EncoderWorker(threading.Thread):
         stop_event: threading.Event,
         on_send_full_keyframe: Callable | None = None,
         on_send_tile: Callable | None = None,
+        on_error: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__(name="EncoderWorker", daemon=True)
         self._config = config
@@ -161,6 +173,7 @@ class EncoderWorker(threading.Thread):
         self._stop_event = stop_event
         self._on_send_full_keyframe = on_send_full_keyframe
         self._on_send_tile = on_send_tile
+        self._on_error = on_error
 
         self._encoder: VideoEncoder | None = None
         self._prev_frame: np.ndarray | None = None
@@ -169,11 +182,20 @@ class EncoderWorker(threading.Thread):
 
     def run(self) -> None:
         logger.info("EncoderWorker started")
+        last_frame_time = time.monotonic()
 
         while not self._stop_event.is_set():
             try:
                 data, timestamp = self._frame_queue.get(block=True, timeout=0.5)
+                last_frame_time = time.monotonic()
             except queue.Empty:
+                # Watchdog: se non arrivano frame per 5s, CaptureWorker e' morto
+                if time.monotonic() - last_frame_time > 5.0:
+                    msg = "CaptureWorker died — no frames for 5s"
+                    logger.error("EncoderWorker: %s", msg)
+                    if self._on_error:
+                        self._on_error(msg)
+                    break
                 continue
 
             if data is None:
@@ -220,7 +242,6 @@ class EncoderWorker(threading.Thread):
                     self._do_tiles(data, w, h, pts)
             except Exception as e:
                 logger.exception("EncoderWorker: encode error: %s", e)
-                # Reset encoder on failure — will be re-initialised on next frame
                 if self._encoder:
                     self._encoder.release()
                     self._encoder = None
@@ -384,13 +405,17 @@ class StreamingPipeline:
         config: PipelineConfig,
         send_frame_fn: Callable,
         send_tile_fn: Callable,
+        on_error: Callable[[str], None] | None = None,
     ) -> None:
         self._config = config
         self._frame_queue: queue.Queue = queue.Queue(maxsize=_FRAME_QUEUE_MAX)
         self._pkt_queue: queue.Queue = queue.Queue(maxsize=_PKT_QUEUE_MAX)
         self._stop_event = threading.Event()
 
-        self._capture_worker = CaptureWorker(config, self._frame_queue, self._stop_event)
+        self._capture_worker = CaptureWorker(
+            config, self._frame_queue, self._stop_event,
+            on_error=on_error,
+        )
         self._encoder_worker = EncoderWorker(
             config,
             self._frame_queue,
@@ -398,6 +423,7 @@ class StreamingPipeline:
             self._stop_event,
             on_send_full_keyframe=self._on_send_full_keyframe,
             on_send_tile=self._on_send_tile,
+            on_error=on_error,
         )
         self._network_worker = NetworkWorker(
             self._pkt_queue,
