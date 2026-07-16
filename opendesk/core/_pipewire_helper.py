@@ -126,18 +126,8 @@ def main() -> None:
             continue
 
         data = map_info.data  # bytes
-
-        # Get video info to handle stride (row alignment padding).
-        # GStreamer may add stride alignment to GPU buffers; we
-        # need to strip it so the reader gets tightly-packed RGB.
-        video_info = Gst.VideoInfo()
-        has_stride = video_info.from_caps(caps)
-        if has_stride:
-            stride = video_info.stride[0]  # bytes per row (may include padding)
-            row_size = width * 3  # actual pixel data per row
-        else:
-            stride = 0
-            row_size = 0
+        buf_size = len(data)
+        expected_size = width * height * 3
 
         buf.unmap(map_info)
 
@@ -147,8 +137,13 @@ def main() -> None:
             sys.stdout.buffer.write(header)
             sent_header = True
 
-        # Write frame data, stripping stride padding if present
-        if has_stride and stride != row_size:
+        # Handle stride (row alignment padding).
+        # GStreamer may add stride padding to GPU buffers; if the
+        # buffer is larger than expected, calculate stride and
+        # write only the actual pixel data row by row.
+        if buf_size > expected_size:
+            stride = buf_size // height
+            row_size = width * 3
             for y in range(height):
                 row_start = y * stride
                 sys.stdout.buffer.write(data[row_start:row_start + row_size])
