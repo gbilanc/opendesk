@@ -34,12 +34,14 @@ logger = logging.getLogger(__name__)
 _TILE_SIZE = 64  # tile width/height in pixels
 _TILE_THRESHOLD = 16  # pixel difference threshold for change detection
 _TILE_MAX_CHANGED_RATIO = 0.30  # if more tiles changed, send full frame
-_KEYFRAME_INTERVAL = 120  # send full keyframe every N frames
-_JPEG_QUALITY: dict[QualityLevel, int] = {
-    QualityLevel.LOW: 50,
-    QualityLevel.MEDIUM: 70,
-    QualityLevel.HIGH: 85,
-    QualityLevel.LOSSLESS: 95,
+_KEYFRAME_INTERVAL = 60  # send full keyframe every N frames (every ~2s at 30fps)
+# PNG compression level per quality preset (0=fast/no compression, 9=max).
+# PNG is lossless — compression level only affects file size vs speed.
+_TILE_PNG_COMPRESSION: dict[QualityLevel, int] = {
+    QualityLevel.LOW: 1,
+    QualityLevel.MEDIUM: 3,
+    QualityLevel.HIGH: 6,
+    QualityLevel.LOSSLESS: 9,
 }
 
 
@@ -290,7 +292,7 @@ class StreamService(QObject):
         threshold = _TILE_THRESHOLD
         quality_name = self._settings.value("video/quality", "HIGH")
         quality = getattr(QualityLevel, quality_name, QualityLevel.HIGH)
-        jpeg_quality = _JPEG_QUALITY[quality]
+        png_level = _TILE_PNG_COMPRESSION[quality]
 
         changed_tiles: list[tuple[bytes, int, int, int, int]] = []
         total_tiles = 0
@@ -311,11 +313,11 @@ class StreamService(QObject):
                 change_ratio = float(changed.sum()) / changed.size
 
                 if change_ratio > 0.005:  # 0.5% of pixels changed
-                    # Encode tile as JPEG
+                    # Encode tile as PNG (lossless — no drift accumulation)
                     tile_bgr = cv2.cvtColor(cur_tile, cv2.COLOR_RGB2BGR)
                     success, encoded = cv2.imencode(
-                        '.jpg', tile_bgr,
-                        [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality],
+                        '.png', tile_bgr,
+                        [cv2.IMWRITE_PNG_COMPRESSION, png_level],
                     )
                     if success:
                         changed_tiles.append((encoded.tobytes(), x, y, tw, th))
