@@ -218,7 +218,7 @@ class VideoEncoder:
             self._stream.options = {
                 "preset": "medium",  # better quality/speed balance
                 "tune": "zerolatency",
-                "profile": "high",
+                "profile": "baseline",
             }
             self._config.width = width
             self._config.height = height

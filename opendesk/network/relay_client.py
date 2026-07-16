@@ -427,7 +427,12 @@ class _RelaySession:
                         except Exception as e:
                             logger.exception("Frame decode error: %s", e)
                             self._decoder.reset()
-                            self._reference_frame = None
+                            # Keep the old reference frame — setting it to None
+                            # would cause ALL subsequent tiles to be skipped,
+                            # and the viewer would show a gray placeholder after
+                            # the frame timeout (10s).  The keyframe request
+                            # below will cause the host to send a fresh keyframe
+                            # which will update the reference frame on success.
                             await self._send_async(
                                 Message(MessageType.VIDEO_REQUEST_KEYFRAME, {}),
                             )
