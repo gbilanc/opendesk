@@ -75,7 +75,7 @@ class CaptureWorker(threading.Thread):
         super().__init__(name="CaptureWorker", daemon=True)
         self._config = config
         self._frame_queue = frame_queue
-        self._stop = stop_event
+        self._stop_event = stop_event
         self._capture: ScreenCapture | None = None
 
     def run(self) -> None:
@@ -87,7 +87,7 @@ class CaptureWorker(threading.Thread):
             return
         interval = 1.0 / max(self._config.fps, 1)
 
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             t0 = time.perf_counter()
 
             try:
@@ -130,7 +130,7 @@ class CaptureWorker(threading.Thread):
         logger.info("CaptureWorker stopped")
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -158,7 +158,7 @@ class EncoderWorker(threading.Thread):
         self._config = config
         self._frame_queue = frame_queue
         self._pkt_queue = pkt_queue
-        self._stop = stop_event
+        self._stop_event = stop_event
         self._on_send_full_keyframe = on_send_full_keyframe
         self._on_send_tile = on_send_tile
 
@@ -170,7 +170,7 @@ class EncoderWorker(threading.Thread):
     def run(self) -> None:
         logger.info("EncoderWorker started")
 
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 data, timestamp = self._frame_queue.get(block=True, timeout=0.5)
             except queue.Empty:
@@ -327,13 +327,13 @@ class NetworkWorker(threading.Thread):
     ) -> None:
         super().__init__(name="NetworkWorker", daemon=True)
         self._pkt_queue = pkt_queue
-        self._stop = stop_event
+        self._stop_event = stop_event
         self._send_frame = send_frame_fn
         self._send_tile = send_tile_fn
 
     def run(self) -> None:
         logger.info("NetworkWorker started")
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 item = self._pkt_queue.get(block=True, timeout=0.5)
             except queue.Empty:
@@ -388,20 +388,20 @@ class StreamingPipeline:
         self._config = config
         self._frame_queue: queue.Queue = queue.Queue(maxsize=_FRAME_QUEUE_MAX)
         self._pkt_queue: queue.Queue = queue.Queue(maxsize=_PKT_QUEUE_MAX)
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
 
-        self._capture_worker = CaptureWorker(config, self._frame_queue, self._stop)
+        self._capture_worker = CaptureWorker(config, self._frame_queue, self._stop_event)
         self._encoder_worker = EncoderWorker(
             config,
             self._frame_queue,
             self._pkt_queue,
-            self._stop,
+            self._stop_event,
             on_send_full_keyframe=self._on_send_full_keyframe,
             on_send_tile=self._on_send_tile,
         )
         self._network_worker = NetworkWorker(
             self._pkt_queue,
-            self._stop,
+            self._stop_event,
             send_frame_fn,
             send_tile_fn,
         )
@@ -413,7 +413,7 @@ class StreamingPipeline:
     def start(self) -> None:
         """Avvia tutti e 3 i worker thread."""
         logger.info("Starting streaming pipeline (3 threads)")
-        self._stop.clear()
+        self._stop_event.clear()
         self._capture_worker.start()
         self._encoder_worker.start()
         self._network_worker.start()
@@ -421,7 +421,7 @@ class StreamingPipeline:
     def stop(self) -> None:
         """Arresta tutti i worker (con drain code)."""
         logger.info("Stopping streaming pipeline")
-        self._stop.set()
+        self._stop_event.set()
         # Svuota le code per sbloccare i thread in attesa
         self._drain_queue(self._frame_queue)
         self._drain_queue(self._pkt_queue)
