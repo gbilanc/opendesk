@@ -418,14 +418,14 @@ class _RelaySession:
                     height = payload.get("height", 0)
                     data = payload.get("data")
                     is_keyframe = payload.get("keyframe", False)
-                    logger.info(
-                        "📺 VIDEO_FRAME: %dx%d keyframe=%s len=%d",
+                    logger.debug(
+                        "VIDEO_FRAME: %dx%d keyframe=%s len=%d",
                         width, height, is_keyframe, len(data) if data else 0,
                     )
                     if data and width > 0 and height > 0:
                         if self._decoder is None:
-                            self._decoder = VideoDecoder(codec="")  # auto-detects H.264 vs HEVC
-                            logger.info("VideoDecoder created (codec auto-detect)")
+                            self._decoder = VideoDecoder(codec="")
+                            logger.info("VideoDecoder initialised (auto-detect)")
                         try:
                             rgb = self._decoder.decode(
                                 data, width, height, is_keyframe=is_keyframe,
@@ -438,14 +438,14 @@ class _RelaySession:
                                 self.inbox.put(
                                     ("frame", (rgb.copy(), width, height), self.session_seq),
                                 )
-                                logger.info(
-                                    "✅ Frame decoded: %dx%d (codec=%s)",
+                                logger.debug(
+                                    "Frame decoded: %dx%d (%s)",
                                     width, height, self._decoder.codec_name,
                                 )
                             else:
                                 logger.warning(
-                                    "❌ Frame decode returned None%s",
-                                    " — decoder not ready yet" if not is_keyframe else "",
+                                    "Frame decode returned None%s",
+                                    " - decoder not ready" if not is_keyframe else "",
                                 )
                                 if not is_keyframe and self._decoder is not None:
                                     self._decoder.reset()
@@ -453,13 +453,13 @@ class _RelaySession:
                                         Message(MessageType.VIDEO_REQUEST_KEYFRAME, {}),
                                     )
                         except Exception as e:
-                            logger.exception("❌ Frame decode error: %s", e)
+                            logger.error("Frame decode error: %s", e)
                             self._decoder.reset()
                             await self._send_async(
                                 Message(MessageType.VIDEO_REQUEST_KEYFRAME, {}),
                             )
                     else:
-                        logger.warning("📺 VIDEO_FRAME with empty data")
+                        logger.warning("VIDEO_FRAME with empty data")
 
                 elif t == MessageType.VIDEO_TILE:
                     payload = msg.payload
@@ -501,8 +501,8 @@ class _RelaySession:
                         except Exception as e:
                             logger.warning("Tile decode/composite error: %s", e)
                     elif self._reference_frame is None:
-                        logger.warning(
-                            "🧩 Tile dropped — no reference frame (waiting for keyframe)"
+                        logger.debug(
+                            "Tile dropped - no reference frame (waiting for keyframe)"
                         )
                 elif t == MessageType.VIDEO_REQUEST_KEYFRAME:
                     logger.debug("Keyframe requested by peer")
