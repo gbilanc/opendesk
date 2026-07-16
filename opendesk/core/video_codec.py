@@ -401,8 +401,9 @@ class VideoEncoder:
                 opts["rc_mode"] = "CQP"
 
             if use_crf:
-                # CRF mode: constant quality, variable bitrate
-                self._stream.bit_rate = None
+                # CRF mode: constant quality, variable bitrate.
+                # Non impostare bit_rate (PyAV vuole un int, None fallisce).
+                # Il CRF nel dict options basta per libx264/libx265.
                 self._stream.options = opts
                 self._stream.options["crf"] = str(self._actual_crf)
                 if is_hevc and codec in ("hevc",):
