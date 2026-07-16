@@ -292,6 +292,9 @@ class WaylandInputBackend(InputBackend):
             )
 
         try:
+            # NOTE: EV_SYN / SYN_REPORT must NOT be included — the kernel
+            # implicitly supports them for every device.  Enabling them
+            # explicitly causes UI_SET_EVBIT to fail with EINVAL.
             capabilities = {
                 e.EV_KEY: (
                     e.BTN_LEFT, e.BTN_MIDDLE, e.BTN_RIGHT,
@@ -324,7 +327,6 @@ class WaylandInputBackend(InputBackend):
                     e.KEY_KP8, e.KEY_KP9, e.KEY_KPDOT,
                 ),
                 e.EV_REL: (e.REL_X, e.REL_Y, e.REL_WHEEL, e.REL_HWHEEL),
-                e.EV_SYN: (e.SYN_REPORT,),
             }
             self._ui = UInput(capabilities, name="OpenDesk Virtual Input", version=0x1)
             logger.info("Wayland uinput device created")
