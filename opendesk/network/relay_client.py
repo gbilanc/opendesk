@@ -291,8 +291,14 @@ class _RelaySession:
 
                 elif t == MessageType.ERROR:
                     err = msg.payload.get("message", "Unknown relay error")
-                    logger.warning("Host received ERROR from relay: %s", err)
-                    self.inbox.put(("error", err, self.session_seq))
+                    # "Peer disconnected" is expected when the remote client leaves.
+                    # Treat it as a peer event, not a relay error.
+                    if "Peer disconnected" in err:
+                        logger.info("Peer disconnected from our session")
+                        self.inbox.put(("peer_disconnected", None, self.session_seq))
+                    else:
+                        logger.warning("Host received ERROR from relay: %s", err)
+                        self.inbox.put(("error", err, self.session_seq))
 
                 elif t == MessageType.DISCONNECT:
                     logger.debug("Host received DISCONNECT — breaking loop")
@@ -493,6 +499,7 @@ class RelayClient(QObject):
     host_peer_joined = Signal()
     host_auth_result = Signal(bool, str)  # success, message
     host_keyframe_requested = Signal()  # remote peer needs a keyframe
+    host_peer_disconnected = Signal()  # remote peer left our hosted session
 
     # ── Client signals ──
     client_connected = Signal(str, str)  # role ("client"), session_id
@@ -820,6 +827,8 @@ class RelayClient(QObject):
         elif event == "auth_result":
             success, msg = data
             self.host_auth_result.emit(success, msg)
+        elif event == "peer_disconnected":
+            self.host_peer_disconnected.emit()
         elif event == "keyframe_requested":
             self.host_keyframe_requested.emit()
             self.main_keyframe_requested.emit()

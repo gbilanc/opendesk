@@ -85,6 +85,7 @@ class MainWindow(QMainWindow):
         self._connection.connected.connect(self._on_relay_connected)
         self._connection.disconnected.connect(self._on_relay_disconnected)
         self._connection.peer_joined.connect(self._on_peer_joined)
+        self._connection.peer_disconnected.connect(self._on_peer_disconnected)
         self._connection.auth_requested.connect(self._on_auth_requested)
         self._connection.host_auth_result.connect(self._on_host_auth_result)
         self._connection.client_auth_result.connect(self._on_client_auth_result)
@@ -423,6 +424,14 @@ class MainWindow(QMainWindow):
         self._status_text.setText("Authenticating remote peer...")
 
     @Slot()
+    def _on_peer_disconnected(self) -> None:
+        """Remote peer (client) disconnected from our hosted session."""
+        logger.info("Remote peer disconnected from our session")
+        self._stop_streaming()
+        self._set_connected(False)
+        self._status_text.setText("Remote client disconnected — waiting for new connections")
+
+    @Slot()
     def _on_auth_requested(self) -> None:
         logger.debug("Auth requested by host")
 
@@ -563,18 +572,31 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_relay_error(self, error_msg: str) -> None:
-        """Relay error occurred (host or client)."""
+        """Relay error occurred (host or client).
+
+        Note: "Peer disconnected" errors are now handled via the
+        ``peer_disconnected`` signal and should NOT arrive here.
+        This is a defensive fallback.
+        """
+        # Defensive fallback: "Peer disconnected" should be routed via
+        # ``peer_disconnected`` signal at a lower level, but just in case
+        # it leaks through, handle it gracefully.
+        if "Peer disconnected" in error_msg:
+            logger.info("Peer disconnected (via fallback error handler)")
+            self._stop_streaming()
+            self._set_connected(False)
+            self._status_text.setText("Remote client disconnected — waiting for connections")
+            return
+
         logger.error("Relay error: %s", error_msg)
         # If we have an active client session, this is likely a client error
         if self._connection.role == RelayRole.CLIENT:
             QMessageBox.critical(self, "Connection Error", error_msg)
             self._connection.disconnect_client()
         elif self._connection.is_hosting:
-            # Host error: stay alive and retry
-            self._status_text.setText("⚠ Relay unavailable — will retry")
-            self._connection.schedule_retry(
-                lambda m: self._status_text.setText(m)
-            )
+            # Host error: informational — do NOT retry. The host session
+            # is still alive and can accept new clients.
+            self._status_text.setText(f"⚠ {error_msg}")
         else:
             self._status_text.setText(f"⚠ Error: {error_msg}")
 
@@ -682,8 +704,12 @@ class MainWindow(QMainWindow):
     def _on_disconnect(self) -> None:
         """Disconnect the current session.
 
-        If a client session is active, only disconnects that.
-        The host session (if any) stays alive in the background.
+        Behaviour depends on the active role:
+        - If a CLIENT session is active (we're viewing a remote screen),
+          only that session is disconnected; hosting persists.
+        - If we're HOSTING with a remote client connected,
+          stop streaming; the host session stays alive for future connections.
+        - If neither, this is a no-op.
         """
         if not self._connected and not self._relay.is_connected:
             return
@@ -691,10 +717,17 @@ class MainWindow(QMainWindow):
             return
         self._disconnecting = True
         try:
-            logger.info("Disconnecting session: %s", self._peer_id)
+            logger.info("Disconnecting session")
             self._stop_streaming()
-            # Disconnect only the client session; hosting persists
-            self._connection.disconnect_client()
+
+            if self._connection.role == RelayRole.CLIENT:
+                # We're the client — disconnect from the remote host
+                logger.info("Disconnecting client session: %s", self._peer_id)
+                self._connection.disconnect_client()
+            elif self._connection.is_hosting and self._connected:
+                # We're hosting and a client was connected
+                logger.info("Stopping host stream (client was connected)")
+
             self._set_connected(False)
             self._status_text.setText("Disconnected")
             self._peer_id = ""

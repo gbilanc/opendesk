@@ -54,6 +54,7 @@ class ConnectionService(QObject):
     connected = Signal(str, str)
     disconnected = Signal()
     peer_joined = Signal()
+    peer_disconnected = Signal()  # remote peer left our hosted session
     auth_requested = Signal()
     auth_result = Signal(bool, str)  # legacy: fire per tutti i casi
     host_auth_result = Signal(bool, str)  # un client remoto si è autenticato a NOI (host)
@@ -90,6 +91,7 @@ class ConnectionService(QObject):
         self._relay.host_connected.connect(self._on_host_connected)
         self._relay.host_disconnected.connect(self._on_host_disconnected)
         self._relay.host_peer_joined.connect(self._on_host_peer_joined)
+        self._relay.host_peer_disconnected.connect(self._on_host_peer_disconnected)
         self._relay.host_auth_result.connect(self._on_host_auth_result)
         self._relay.host_keyframe_requested.connect(self._on_host_keyframe_requested)
 
@@ -300,6 +302,12 @@ class ConnectionService(QObject):
     def _on_host_peer_joined(self) -> None:
         """A remote peer joined our hosted session."""
         self.peer_joined.emit()
+
+    @Slot()
+    def _on_host_peer_disconnected(self) -> None:
+        """A remote peer disconnected from our hosted session."""
+        logger.info("Remote peer disconnected from our session")
+        self.peer_disconnected.emit()
 
     @Slot(bool, str)
     def _on_host_auth_result(self, success: bool, message: str) -> None:
