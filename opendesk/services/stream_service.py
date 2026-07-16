@@ -186,10 +186,13 @@ class StreamService(QObject):
                 self._bw_measure_bytes += len(data)
 
             # Callback per errori della pipeline (CaptureWorker / EncoderWorker)
+            # Usa QTimer.singleShot per deferire al main thread Qt:
+            # stop_streaming() chiama pipeline.stop() che fa join() sui thread
+            # worker — se chiamato dal worker stesso causa RuntimeError.
             def _on_pipeline_error(msg: str) -> None:
                 logger.error("Pipeline error: %s", msg)
                 self.error.emit(msg)
-                self.stop_streaming()
+                QTimer.singleShot(0, self.stop_streaming)
 
             # Crea e avvia la pipeline
             self._pipeline = StreamingPipeline(
