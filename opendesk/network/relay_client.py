@@ -392,6 +392,11 @@ class _RelaySession:
 
                 elif t == MessageType.AUTH_OK:
                     self.inbox.put(("auth_result", (True, "Authenticated"), self.session_seq))
+                    # Richiedi subito un keyframe per avviare lo streaming
+                    logger.info("Auth OK — requesting first keyframe from host")
+                    await self._send_async(
+                        Message(MessageType.VIDEO_REQUEST_KEYFRAME, {}),
+                    )
 
                 elif t == MessageType.AUTH_FAIL:
                     reason = msg.payload.get("reason", "Authentication failed")
@@ -413,19 +418,19 @@ class _RelaySession:
                     height = payload.get("height", 0)
                     data = payload.get("data")
                     is_keyframe = payload.get("keyframe", False)
-                    logger.debug(
-                        "VIDEO_FRAME received: %dx%d, keyframe=%s, data_len=%d",
+                    logger.info(
+                        "📺 VIDEO_FRAME: %dx%d keyframe=%s len=%d",
                         width, height, is_keyframe, len(data) if data else 0,
                     )
                     if data and width > 0 and height > 0:
                         if self._decoder is None:
                             self._decoder = VideoDecoder(codec="")  # auto-detects H.264 vs HEVC
+                            logger.info("VideoDecoder created (codec auto-detect)")
                         try:
                             rgb = self._decoder.decode(
                                 data, width, height, is_keyframe=is_keyframe,
                             )
                             if rgb is not None:
-                                # Update reference frame for tile compositing
                                 self._reference_frame = rgb.copy()
                                 self._frame_width = width
                                 self._frame_height = height
@@ -433,33 +438,28 @@ class _RelaySession:
                                 self.inbox.put(
                                     ("frame", (rgb.copy(), width, height), self.session_seq),
                                 )
-                                logger.debug(
-                                    "Frame decoded successfully: %dx%d", width, height,
+                                logger.info(
+                                    "✅ Frame decoded: %dx%d (codec=%s)",
+                                    width, height, self._decoder.codec_name,
                                 )
                             else:
                                 logger.warning(
-                                    "Frame decode returned None%s",
+                                    "❌ Frame decode returned None%s",
                                     " — decoder not ready yet" if not is_keyframe else "",
                                 )
-                                # If we're getting non-keyframes without a prior
-                                # keyframe, ask the host to send one.
                                 if not is_keyframe and self._decoder is not None:
                                     self._decoder.reset()
                                     await self._send_async(
                                         Message(MessageType.VIDEO_REQUEST_KEYFRAME, {}),
                                     )
                         except Exception as e:
-                            logger.exception("Frame decode error: %s", e)
+                            logger.exception("❌ Frame decode error: %s", e)
                             self._decoder.reset()
-                            # Keep the old reference frame — setting it to None
-                            # would cause ALL subsequent tiles to be skipped,
-                            # and the viewer would show a gray placeholder after
-                            # the frame timeout (10s).  The keyframe request
-                            # below will cause the host to send a fresh keyframe
-                            # which will update the reference frame on success.
                             await self._send_async(
                                 Message(MessageType.VIDEO_REQUEST_KEYFRAME, {}),
                             )
+                    else:
+                        logger.warning("📺 VIDEO_FRAME with empty data")
 
                 elif t == MessageType.VIDEO_TILE:
                     payload = msg.payload
@@ -468,6 +468,11 @@ class _RelaySession:
                     ty = payload.get("y", 0)
                     tw = payload.get("width", 0)
                     th = payload.get("height", 0)
+                    logger.debug(
+                        "🧩 VIDEO_TILE: %dx%d+%d+%d len=%d ref=%s",
+                        tw, th, tx, ty, len(data) if data else 0,
+                        "yes" if self._reference_frame is not None else "no",
+                    )
                     if data and tw > 0 and th > 0 and self._reference_frame is not None:
                         try:
                             import cv2
@@ -495,6 +500,10 @@ class _RelaySession:
                                 )
                         except Exception as e:
                             logger.warning("Tile decode/composite error: %s", e)
+                    elif self._reference_frame is None:
+                        logger.warning(
+                            "🧩 Tile dropped — no reference frame (waiting for keyframe)"
+                        )
                 elif t == MessageType.VIDEO_REQUEST_KEYFRAME:
                     logger.debug("Keyframe requested by peer")
                     # Forward to host via inbox so the StreamService can

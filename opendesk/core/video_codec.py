@@ -595,7 +595,10 @@ class VideoDecoder:
             self._buffer = b""
             logger.debug("VideoDecoder reset — awaiting keyframe")
 
+
+
     def release(self) -> None:
+        """Release decoder resources."""
         with self._lock:
             self._codec = None
             self._buffer = b""
