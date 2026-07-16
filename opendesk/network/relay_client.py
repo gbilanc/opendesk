@@ -111,6 +111,7 @@ class _RelaySession:
         self._frame_width: int = 0
         self._frame_height: int = 0
         self._last_keyframe_time: float = 0.0  # for watchdog
+        self._start_time: float = time.time()
 
     # ── lifecycle ───────────────────────────────────────────────────
 
@@ -348,9 +349,16 @@ class _RelaySession:
         async def _keyframe_watchdog():
             while self._running.is_set():
                 await asyncio.sleep(3.0)
-                if self._last_keyframe_time > 0 and \
-                   time.time() - self._last_keyframe_time > 5.0:
-                    logger.info("No keyframe for 5s — requesting one")
+                elapsed_since_last = 0.0
+                if self._last_keyframe_time > 0:
+                    elapsed_since_last = time.time() - self._last_keyframe_time
+                elif self._last_keyframe_time == 0:
+                    # No keyframe EVER received — started waiting at
+                    # session start, not after first keyframe
+                    elapsed_since_last = time.time() - self._start_time
+                if elapsed_since_last > 5.0:
+                    logger.info("No keyframe for %.0fs — requesting one",
+                                elapsed_since_last)
                     self._last_keyframe_time = time.time()
                     await self._send_async(
                         Message(MessageType.VIDEO_REQUEST_KEYFRAME, {}),
@@ -411,7 +419,7 @@ class _RelaySession:
                     )
                     if data and width > 0 and height > 0:
                         if self._decoder is None:
-                            self._decoder = VideoDecoder(codec="h264")  # auto-detects HEVC if needed
+                            self._decoder = VideoDecoder(codec="")  # auto-detects H.264 vs HEVC
                         try:
                             rgb = self._decoder.decode(
                                 data, width, height, is_keyframe=is_keyframe,

@@ -80,7 +80,11 @@ class CaptureWorker(threading.Thread):
 
     def run(self) -> None:
         logger.info("CaptureWorker started")
-        self._capture = ScreenCapture()
+        try:
+            self._capture = ScreenCapture()
+        except Exception as e:
+            logger.error("CaptureWorker: ScreenCapture init failed: %s", e)
+            return
         interval = 1.0 / max(self._config.fps, 1)
 
         while not self._stop.is_set():
@@ -179,41 +183,47 @@ class EncoderWorker(threading.Thread):
             pts = int(timestamp * 1000)
             self._frame_count += 1
 
-            # Lazy init encoder
-            if self._encoder is None:
-                # Determina CRF: per qualità HIGH usa CRF 23
-                crf = self._config.crf
-                if crf is None:
-                    crf = _QUALITY_CRF.get(self._config.quality)
-                self._encoder = VideoEncoder(
-                    EncoderConfig(
-                        width=w,
-                        height=h,
-                        fps=self._config.fps,
-                        bitrate=self._config.bitrate,
-                        quality=self._config.quality,
-                        codec=self._config.codec,
-                        crf=crf,
+            try:
+                # Lazy init encoder
+                if self._encoder is None:
+                    crf = self._config.crf
+                    if crf is None:
+                        crf = _QUALITY_CRF.get(self._config.quality)
+                    self._encoder = VideoEncoder(
+                        EncoderConfig(
+                            width=w,
+                            height=h,
+                            fps=self._config.fps,
+                            bitrate=self._config.bitrate,
+                            quality=self._config.quality,
+                            codec=self._config.codec,
+                            crf=crf,
+                        )
                     )
+                    if self._encoder.codec_name:
+                        logger.info("EncoderWorker: using %s CRF=%s",
+                                    self._encoder.codec_name, crf or "(bitrate)")
+
+                # Decidi se inviare full keyframe o tile
+                send_full = (
+                    self._prev_frame is None
+                    or self._force_full_keyframe
+                    or self._frame_count >= 60  # KEYFRAME_INTERVAL
                 )
-                if self._encoder.codec_name:
-                    logger.info("EncoderWorker: using %s CRF=%s",
-                                self._encoder.codec_name, crf or "(bitrate)")
 
-            # Decidi se inviare full keyframe o tile
-            send_full = (
-                self._prev_frame is None
-                or self._force_full_keyframe
-                or self._frame_count >= 60  # KEYFRAME_INTERVAL
-            )
-
-            if send_full:
-                self._do_full_keyframe(data, w, h, pts)
-                self._prev_frame = data.copy()
-                self._frame_count = 0
-                self._force_full_keyframe = False
-            else:
-                self._do_tiles(data, w, h, pts)
+                if send_full:
+                    self._do_full_keyframe(data, w, h, pts)
+                    self._prev_frame = data.copy()
+                    self._frame_count = 0
+                    self._force_full_keyframe = False
+                else:
+                    self._do_tiles(data, w, h, pts)
+            except Exception as e:
+                logger.exception("EncoderWorker: encode error: %s", e)
+                # Reset encoder on failure — will be re-initialised on next frame
+                if self._encoder:
+                    self._encoder.release()
+                    self._encoder = None
 
         # Flush encoder residuals
         if self._encoder:
