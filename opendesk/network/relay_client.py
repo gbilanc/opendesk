@@ -110,6 +110,7 @@ class _RelaySession:
         self._reference_frame: np.ndarray | None = None
         self._frame_width: int = 0
         self._frame_height: int = 0
+        self._last_keyframe_time: float = 0.0  # for watchdog
 
     # ── lifecycle ───────────────────────────────────────────────────
 
@@ -343,6 +344,20 @@ class _RelaySession:
             {"lookup_device": self.session_id},
         ))
 
+        # Periodic task that requests a keyframe if none received
+        async def _keyframe_watchdog():
+            while self._running.is_set():
+                await asyncio.sleep(3.0)
+                if self._last_keyframe_time > 0 and \
+                   time.time() - self._last_keyframe_time > 5.0:
+                    logger.info("No keyframe for 5s — requesting one")
+                    self._last_keyframe_time = time.time()
+                    await self._send_async(
+                        Message(MessageType.VIDEO_REQUEST_KEYFRAME, {}),
+                    )
+
+        watchdog_task = asyncio.create_task(_keyframe_watchdog())
+
         gen = self._read_loop()
         try:
             async for msg in gen:
@@ -406,6 +421,7 @@ class _RelaySession:
                                 self._reference_frame = rgb.copy()
                                 self._frame_width = width
                                 self._frame_height = height
+                                self._last_keyframe_time = time.time()
                                 self.inbox.put(
                                     ("frame", (rgb.copy(), width, height), self.session_seq),
                                 )
@@ -490,6 +506,7 @@ class _RelaySession:
                 else:
                     logger.debug("Client received unhandled message type %s", t)
         finally:
+            watchdog_task.cancel()
             await gen.aclose()
         self.inbox.put(("disconnected", None, self.session_seq))
         logger.debug("Client session ended: disconnected event queued")
