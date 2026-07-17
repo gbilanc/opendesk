@@ -211,17 +211,6 @@ class MainWindow(QMainWindow):
         self.act_send_file.setEnabled(False)
         self.act_send_file.triggered.connect(self._on_send_file)
 
-        # ── Window ──
-        self.act_show_chat = QAction("&Chat Panel", self)
-        self.act_show_chat.setCheckable(True)
-        self.act_show_chat.setChecked(True)
-        self.act_show_chat.triggered.connect(self._on_toggle_chat)
-
-        self.act_show_transfers = QAction("&File Transfers", self)
-        self.act_show_transfers.setCheckable(True)
-        self.act_show_transfers.setChecked(True)
-        self.act_show_transfers.triggered.connect(self._on_toggle_transfers)
-
         # ── Help ──
         self.act_about = QAction("&About OpenDesk", self)
         self.act_about.triggered.connect(self._on_about)
@@ -248,11 +237,6 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.act_fullscreen)
         view_menu.addSeparator()
         view_menu.addAction(self.act_toggle_theme)
-
-        # ── Window ──
-        window_menu = menubar.addMenu("&Window")
-        window_menu.addAction(self.act_show_chat)
-        window_menu.addAction(self.act_show_transfers)
 
         # ── Tools ──
         tools_menu = menubar.addMenu("&Tools")
@@ -336,6 +320,7 @@ class MainWindow(QMainWindow):
         )
         self._connection_panel.connection_requested.connect(self._on_connection_requested)
         self._connection_panel.file_transfer_requested.connect(self._on_file_transfer_requested)
+        self._connection_panel.chat_toggled.connect(self._on_chat_toggled)
         layout.addWidget(self._connection_panel, 1)
 
         self.setCentralWidget(central)
@@ -874,14 +859,14 @@ class MainWindow(QMainWindow):
     # ── Slots: window ──────────────────────────────────────────────
 
     @Slot()
-    def _on_toggle_chat(self) -> None:
+    def _on_chat_toggled(self) -> None:
         """Show/hide the chat window."""
-        if self.act_show_chat.isChecked():
+        if self._chat_panel.isVisible():
+            self._chat_panel.hide()
+        else:
             self._chat_panel.show()
             self._chat_panel.raise_()
             self._chat_panel.activateWindow()
-        else:
-            self._chat_panel.hide()
 
     @Slot()
     def _ensure_transfer_dock(self) -> FileBrowserDock:
@@ -902,16 +887,6 @@ class MainWindow(QMainWindow):
                 self._on_browser_remote_listing
             )
         return self._transfer_dock
-
-    def _on_toggle_transfers(self) -> None:
-        """Show/hide the file transfers window."""
-        dock = self._ensure_transfer_dock()
-        if self.act_show_transfers.isChecked():
-            dock.show()
-            dock.raise_()
-            dock.activateWindow()
-        else:
-            dock.hide()
 
     def _send_file_message(self, msg: Message) -> None:
         """Send a message via the relay (used as send_fn by FileTransferManager).
@@ -1048,6 +1023,9 @@ class MainWindow(QMainWindow):
             self._show_viewer_window()
         elif not connected:
             self._hide_viewer_window()
+
+        # Enable/disable Chat button based on connection state
+        self._connection_panel.set_connected(connected)
 
         # Update session status widget
         if connected:

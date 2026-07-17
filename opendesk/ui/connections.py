@@ -193,6 +193,7 @@ class ConnectionPanel(QWidget):
 
     connection_requested = Signal(str, str)  # session_id, password
     file_transfer_requested = Signal(str, str)  # device_id, password
+    chat_toggled = Signal()  # toggle chat panel visibility
 
     def __init__(
         self,
@@ -275,6 +276,28 @@ class ConnectionPanel(QWidget):
         self._transfer_btn.clicked.connect(self._on_file_transfer)
         btn_row.addWidget(self._transfer_btn)
 
+        self._chat_btn = QPushButton("Chat")
+        self._chat_btn.setEnabled(False)
+        self._chat_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #7c3aed;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 6px 18px;
+                font-weight: 600;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: #6d28d9;
+            }
+            QPushButton:disabled {
+                background-color: #94a3b8;
+            }
+        """)
+        self._chat_btn.clicked.connect(self._on_chat)
+        btn_row.addWidget(self._chat_btn)
+
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
@@ -344,6 +367,10 @@ class ConnectionPanel(QWidget):
 
     def update_device_list(self, devices: list[DeviceEntry]) -> None:
         """Update the displayed device list (called from MainWindow)."""
+
+    def set_connected(self, connected: bool) -> None:
+        """Enable/disable the Chat button based on connection state."""
+        self._chat_btn.setEnabled(connected)
         self._model.set_devices(devices)
 
     # ── context menu ───────────────────────────────────────────────
@@ -408,6 +435,7 @@ class ConnectionPanel(QWidget):
         can_connect = bool(session_id)
         self._connect_btn.setEnabled(can_connect)
         self._transfer_btn.setEnabled(can_connect)
+        # Chat button is controlled by connection state, not selection
 
         if trusted and can_connect:
             self._on_connect()
@@ -488,6 +516,11 @@ class ConnectionPanel(QWidget):
         password = "" if trusted else self._prompt_password(device_id)
         if password is not None:
             self.file_transfer_requested.emit(device_id, password)
+
+    @Slot()
+    def _on_chat(self) -> None:
+        """Toggle the chat panel visibility."""
+        self.chat_toggled.emit()
 
     def _prompt_password(self, device_id: str) -> str | None:
         pwd, ok = QInputDialog.getText(
