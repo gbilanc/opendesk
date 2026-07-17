@@ -58,7 +58,8 @@ _TILE_JPEG_QUALITY: dict[QualityLevel, int] = {
     QualityLevel.LOW: 50,
     QualityLevel.MEDIUM: 65,
     QualityLevel.HIGH: 80,
-    QualityLevel.LOSSLESS: 95,
+    QualityLevel.SHARP: 95,
+    QualityLevel.LOSSLESS: 98,
 }
 
 
@@ -175,9 +176,9 @@ class StreamService(QObject):
             crf = _QUALITY_CRF.get(quality)
 
             # Pixel format: yuv444p per testo nitido (full chroma)
-            pixel_format = self._settings.value("video/pixel_format", "yuv420p")
+            pixel_format = self._settings.value("video/pixel_format", "yuv444p")
             if pixel_format not in ("yuv420p", "yuv444p"):
-                pixel_format = "yuv420p"
+                pixel_format = "yuv444p"
 
             # Encoder preset: empty = auto by quality level
             encoder_preset = self._settings.value("video/encoder_preset", "")

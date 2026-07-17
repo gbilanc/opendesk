@@ -79,7 +79,7 @@ class SettingsDialog(QDialog):
         self._quality_combo = QComboBox()
         for q in QualityLevel:
             self._quality_combo.addItem(q.name.title(), q.value)
-        self._quality_combo.setCurrentIndex(2)  # HIGH default
+        self._quality_combo.setCurrentIndex(3)  # SHARP default
         video_layout.addRow("Quality:", self._quality_combo)
 
         self._resolution_scale = QComboBox()
@@ -102,8 +102,8 @@ class SettingsDialog(QDialog):
 
         # ── Pixel format ──
         self._pixel_format = QComboBox()
-        self._pixel_format.addItem("Standard (yuv420p)", "yuv420p")
-        self._pixel_format.addItem("Full color (yuv444p — sharper text)", "yuv444p")
+        self._pixel_format.addItem("Full color (yuv444p — sharp text, recommended)", "yuv444p")
+        self._pixel_format.addItem("Standard (yuv420p — less bandwidth)", "yuv420p")
         self._pixel_format.setCurrentIndex(0)
         video_layout.addRow("Pixel format:", self._pixel_format)
 
@@ -280,7 +280,7 @@ class SettingsDialog(QDialog):
 
     def _load_settings(self) -> None:
         """Load current values from QSettings."""
-        quality = self._settings.value("video/quality", "MEDIUM")
+        quality = self._settings.value("video/quality", "SHARP")
         idx = self._quality_combo.findText(quality.title())
         if idx >= 0:
             self._quality_combo.setCurrentIndex(idx)
@@ -303,7 +303,7 @@ class SettingsDialog(QDialog):
             self._settings.value("video/hw_encoding", True, type=bool)
         )
 
-        pixel_fmt = self._settings.value("video/pixel_format", "yuv420p")
+        pixel_fmt = self._settings.value("video/pixel_format", "yuv444p")
         pf_idx = self._pixel_format.findData(pixel_fmt)
         if pf_idx >= 0:
             self._pixel_format.setCurrentIndex(pf_idx)

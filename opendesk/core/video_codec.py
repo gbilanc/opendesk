@@ -415,10 +415,13 @@ class VideoEncoder:
             opts = dict(self._config.options)
 
             # Adjust preset based on quality level
+            # Slower presets = better compression efficiency = same quality at lower bitrate
             quality = self._config.quality
             if quality == QualityLevel.LOSSLESS:
                 opts["preset"] = opts.get("preset", "medium")
-            elif quality == QualityLevel.SHARP or quality == QualityLevel.HIGH:
+            elif quality == QualityLevel.SHARP:
+                opts["preset"] = opts.get("preset", "medium")
+            elif quality == QualityLevel.HIGH:
                 opts["preset"] = opts.get("preset", "fast")
             else:
                 opts["preset"] = opts.get("preset", "veryfast")

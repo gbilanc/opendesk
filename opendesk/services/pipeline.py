@@ -316,7 +316,7 @@ class EncoderWorker(threading.Thread):
             QualityLevel.MEDIUM: 65,
             QualityLevel.HIGH: 80,
             QualityLevel.SHARP: 95,
-            QualityLevel.LOSSLESS: 95,
+            QualityLevel.LOSSLESS: 98,
         }[quality]
 
         # Full-frame diff (vectorised)
