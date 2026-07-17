@@ -214,9 +214,11 @@ class EncoderWorker(threading.Thread):
                 data, timestamp = self._frame_queue.get(block=True, timeout=0.5)
                 last_frame_time = time.monotonic()
             except queue.Empty:
-                # Watchdog: se non arrivano frame per 5s, CaptureWorker e' morto
-                if time.monotonic() - last_frame_time > 5.0:
-                    msg = "CaptureWorker died — no frames for 5s"
+                # Watchdog: se non arrivano frame per 60s, CaptureWorker e' morto
+                # Il timeout è alto per coprire l'avvio lento di Wayland
+                # (PORTAL dialog 30s + PIPEWIRE startup 10s).
+                if time.monotonic() - last_frame_time > 60.0:
+                    msg = "CaptureWorker died — no frames for 60s"
                     logger.error("EncoderWorker: %s", msg)
                     if self._on_error:
                         self._on_error(msg)
