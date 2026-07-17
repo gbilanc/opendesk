@@ -82,7 +82,9 @@ class TestVideoCodec:
         frame[50:130, 100:220] = (200, 100, 50)
 
         packets = enc.encode(frame)
-        decoded = dec.decode(packets[0].data, 320, 180)
+        decoded = dec.decode(
+            packets[0].data, 320, 180, is_keyframe=packets[0].is_keyframe,
+        )
 
         assert decoded is not None
         assert decoded.shape == (180, 320, 3)
