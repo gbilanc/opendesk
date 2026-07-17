@@ -74,6 +74,7 @@ class MainWindow(QMainWindow):
         self._disconnecting: bool = False
         self._fullscreen: bool = False
         self._peer_id: str = ""  # remote session ID when acting as client
+        self._file_transfer_mode: bool = False  # True when connecting for file-transfer-only
 
         # Settings
         self._settings = QSettings("OpenDesk", "OpenDesk")
@@ -334,6 +335,7 @@ class MainWindow(QMainWindow):
             parent=central,
         )
         self._connection_panel.connection_requested.connect(self._on_connection_requested)
+        self._connection_panel.file_transfer_requested.connect(self._on_file_transfer_requested)
         layout.addWidget(self._connection_panel, 1)
 
         self.setCentralWidget(central)
@@ -454,11 +456,22 @@ class MainWindow(QMainWindow):
     def _on_host_auth_result(self, success: bool, message: str) -> None:
         """Authentication result for a REMOTE client connecting to US (host)."""
         if success:
-            logger.info("Remote client authenticated to our session")
+            # Check if the client connected in file-transfer-only mode
+            client_mode = self._connection.client_connection_mode
+            is_ft_only = client_mode == "file_transfer"
+            logger.info(
+                "Remote client authenticated (mode=%s)", client_mode,
+            )
             self._status_text.setText("Authentication successful")
-            self._start_host_streaming()
 
-            # Enable file transfer
+            if not is_ft_only:
+                # Full desktop mode — start streaming
+                self._start_host_streaming()
+            else:
+                # File-transfer-only mode — skip streaming
+                self._status_text.setText("File transfer session active")
+
+            # Enable file transfer (always, regardless of mode)
             self.act_send_file.setEnabled(True)
             self._file_transfer_send_fn = self._send_file_message
             if self._transfer_dock is not None:
@@ -481,8 +494,13 @@ class MainWindow(QMainWindow):
         if success:
             logger.info("We authenticated to remote host")
             self._status_text.setText("Authentication successful")
-            self._set_connected(True)
-            self._status_text.setText(f"Session active: {self._peer_id}")
+            self._set_connected(True, show_viewer=not self._file_transfer_mode)
+            status_msg = (
+                "File transfer session active"
+                if self._file_transfer_mode
+                else f"Session active: {self._peer_id}"
+            )
+            self._status_text.setText(status_msg)
 
             # Enable file transfer
             self.act_send_file.setEnabled(True)
@@ -497,8 +515,14 @@ class MainWindow(QMainWindow):
             # Request initial remote file listing
             if self._file_transfer_send_fn:
                 self._file_transfer.request_remote_listing("/", self._file_transfer_send_fn)
+
+            # If file-transfer-only, open the file transfer dock now
+            if self._file_transfer_mode:
+                self._show_file_transfer_dock()
+                self._file_transfer_mode = False  # reset for next connection
         else:
             logger.warning("Authentication failed: %s", message)
+            self._file_transfer_mode = False
             QMessageBox.warning(
                 self, "Authentication Failed",
                 f"Failed to authenticate with the remote computer:\n{message}",
@@ -738,10 +762,20 @@ class MainWindow(QMainWindow):
     def _on_connection_requested(self, peer_id: str, password: str) -> None:
         """Handle a connection request from the dialog."""
         logger.info("Connection requested: peer=%s", peer_id)
+        self._file_transfer_mode = False
         self._peer_id = peer_id
         self._status_text.setText(f"Connecting to {peer_id}...")
         self._connection.join_session(peer_id, password)
         self._show_viewer_window(peer_name=peer_id)
+
+    @Slot(str, str)
+    def _on_file_transfer_requested(self, peer_id: str, password: str) -> None:
+        """Handle a file-transfer-only connection request."""
+        logger.info("File transfer requested: peer=%s", peer_id)
+        self._file_transfer_mode = True
+        self._peer_id = peer_id
+        self._status_text.setText(f"Connecting to {peer_id} (file transfer)...")
+        self._connection.join_session(peer_id, password, connection_mode="file_transfer")
 
     @Slot()
     def _on_disconnect(self) -> None:
@@ -980,8 +1014,29 @@ class MainWindow(QMainWindow):
             self._caps_lock_label.setStyleSheet(MainWindow._CAPS_OFF_STYLE)
         self._caps_lock_label.setVisible(active)
 
-    def _set_connected(self, connected: bool) -> None:
-        """Update all UI state to reflect connection status."""
+    def _show_file_transfer_dock(self) -> None:
+        """Show the file transfer dock and bring it to front."""
+        dock = self._ensure_transfer_dock()
+        dock.show()
+        dock.raise_()
+        dock.activateWindow()
+        # Refresh remote listing now that we're connected
+        if self._file_transfer_send_fn:
+            dock.set_connected(True)
+            dock.set_status("Connected — browsing remote files...")
+            self._file_transfer.request_remote_listing("/", self._file_transfer_send_fn)
+
+    def _set_connected(self, connected: bool, show_viewer: bool = True) -> None:
+        """Update all UI state to reflect connection status.
+
+        Parameters
+        ----------
+        connected : bool
+            Whether we are connected.
+        show_viewer : bool
+            Whether to show the remote desktop viewer window.
+            Pass ``False`` for file-transfer-only connections.
+        """
         self._connected = connected
 
         # Enable/disable actions
@@ -989,7 +1044,7 @@ class MainWindow(QMainWindow):
         self.act_disconnect.setEnabled(connected)
 
         # Show/hide viewer window
-        if connected and self._viewer_window is None:
+        if connected and self._viewer_window is None and show_viewer:
             self._show_viewer_window()
         elif not connected:
             self._hide_viewer_window()

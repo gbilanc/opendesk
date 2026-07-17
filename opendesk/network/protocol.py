@@ -219,7 +219,8 @@ class Message:
         })
 
     @classmethod
-    def auth_response(cls, nonce_hash: str, device_id: str = "") -> Message:
+    def auth_response(cls, nonce_hash: str, device_id: str = "",
+                      connection_mode: str = "remote_desktop") -> Message:
         """Respond to an authentication challenge.
 
         Parameters
@@ -231,10 +232,14 @@ class Message:
         device_id : str
             The client's device ID, used by the host to check
             for pre-authorized (trusted) devices.
+        connection_mode : str
+            "remote_desktop" (default) for full remote desktop,
+            "file_transfer" for file-transfer-only mode (no streaming).
         """
         return cls(MessageType.AUTH_RESPONSE, {
             "nonce_hash": nonce_hash,
             "device_id": device_id,
+            "connection_mode": connection_mode,
         })
 
     @classmethod

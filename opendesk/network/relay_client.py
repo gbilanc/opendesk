@@ -87,6 +87,7 @@ class _RelaySession:
         device_name: str = "",
         session_seq: int = 0,
         trusted_device_ids: set[str] | None = None,
+        connection_mode: str = "remote_desktop",
     ) -> None:
         self.host = host
         self.port = port
@@ -97,6 +98,7 @@ class _RelaySession:
         self.device_id = device_id
         self.device_name = device_name
         self.session_seq = session_seq
+        self.connection_mode = connection_mode
         self._trusted_device_ids: set[str] = trusted_device_ids or set()
 
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -268,6 +270,8 @@ class _RelaySession:
                 elif t == MessageType.AUTH_RESPONSE:
                     client_hash = msg.payload.get("nonce_hash", "")
                     client_device_id = msg.payload.get("device_id", "")
+                    client_connection_mode = msg.payload.get("connection_mode", "remote_desktop")
+                    self.connection_mode = client_connection_mode
 
                     # Trusted device bypass: skip password verification
                     if client_device_id and client_device_id in self._trusted_device_ids:
@@ -287,7 +291,9 @@ class _RelaySession:
                     if success:
                         await self._send_async(Message.auth_ok())
                         self.inbox.put(("auth_result", (True, "Authenticated"), self.session_seq))
-                        logger.debug("Host auth OK sent — continuing loop")
+                        logger.debug(
+                            "Host auth OK — connection_mode=%s", client_connection_mode
+                        )
                     else:
                         await self._send_async(Message.auth_fail("Invalid credentials"))
                         self.inbox.put(("auth_result", (False, "Invalid credentials"), self.session_seq))
@@ -397,16 +403,22 @@ class _RelaySession:
                     nonce_hash = compute_response(nonce, self.password) if nonce else ""
                     await self._send_async(Message.auth_response(
                         nonce_hash, device_id=self.device_id,
+                        connection_mode=self.connection_mode,
                     ))
                     self.inbox.put(("auth_requested", None, self.session_seq))
 
                 elif t == MessageType.AUTH_OK:
                     self.inbox.put(("auth_result", (True, "Authenticated"), self.session_seq))
-                    # Richiedi subito un keyframe per avviare lo streaming
-                    logger.info("Auth OK — requesting first keyframe from host")
-                    await self._send_async(
-                        Message(MessageType.VIDEO_REQUEST_KEYFRAME, {}),
-                    )
+                    if self.connection_mode == "remote_desktop":
+                        # Richiedi subito un keyframe per avviare lo streaming
+                        logger.info("Auth OK — requesting first keyframe from host")
+                        await self._send_async(
+                            Message(MessageType.VIDEO_REQUEST_KEYFRAME, {}),
+                        )
+                    else:
+                        logger.info(
+                            "Auth OK — file transfer mode, skipping keyframe request"
+                        )
 
                 elif t == MessageType.AUTH_FAIL:
                     reason = msg.payload.get("reason", "Authentication failed")
@@ -694,11 +706,18 @@ class RelayClient(QObject):
     # ── client connection ──
 
     def join_session(self, host: str, port: int, session_id: str, password: str,
-                     device_id: str = "") -> None:
+                     device_id: str = "",
+                     connection_mode: str = "remote_desktop") -> None:
         """Connect to relay and join a session as client.
 
         Does NOT stop the host session — the host session continues
         running in the background, accepting incoming connections.
+
+        Parameters
+        ----------
+        connection_mode : str
+            "remote_desktop" (default) for full remote desktop,
+            "file_transfer" for file-transfer-only mode.
         """
         # Only stop a previous CLIENT session, NOT the host session
         self._stop_client_session()
@@ -709,6 +728,7 @@ class RelayClient(QObject):
             host, port, session_id, password, RelayRole.CLIENT, self._inbox,
             device_id=device_id,
             session_seq=self._current_seq,
+            connection_mode=connection_mode,
         )
         self._start_client_thread()
 
@@ -782,6 +802,18 @@ class RelayClient(QObject):
     def host_role(self) -> RelayRole | None:
         """Return HOST if the host session is active, else None."""
         return self._host_role if self.is_hosting() else None
+
+    @property
+    def client_connection_mode(self) -> str:
+        """Return the connection mode of the most recently connected client.
+
+        ``"remote_desktop"`` (default) or ``"file_transfer"``.
+        Only meaningful on the host side after a client has authenticated.
+        Returns ``"remote_desktop"`` if no host session is active.
+        """
+        if self._host_session is not None:
+            return getattr(self._host_session, "connection_mode", "remote_desktop")
+        return "remote_desktop"
 
     # ── host internals ──────────────────────────────────────────
 

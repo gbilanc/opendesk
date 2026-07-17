@@ -192,6 +192,7 @@ class ConnectionPanel(QWidget):
     """
 
     connection_requested = Signal(str, str)  # session_id, password
+    file_transfer_requested = Signal(str, str)  # device_id, password
 
     def __init__(
         self,
@@ -251,6 +252,28 @@ class ConnectionPanel(QWidget):
         self._connect_btn.setEnabled(False)
         self._connect_btn.clicked.connect(self._on_connect)
         btn_row.addWidget(self._connect_btn)
+
+        self._transfer_btn = QPushButton("Transfer Files")
+        self._transfer_btn.setEnabled(False)
+        self._transfer_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #059669;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 6px 18px;
+                font-weight: 600;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: #047857;
+            }
+            QPushButton:disabled {
+                background-color: #94a3b8;
+            }
+        """)
+        self._transfer_btn.clicked.connect(self._on_file_transfer)
+        btn_row.addWidget(self._transfer_btn)
 
         btn_row.addStretch()
         layout.addLayout(btn_row)
@@ -370,18 +393,21 @@ class ConnectionPanel(QWidget):
         self._list_view.setVisible(has_devices)
         self._empty_widget.setVisible(not has_devices)
         self._connect_btn.setEnabled(False)
+        self._transfer_btn.setEnabled(False)
 
     def _on_selection_changed(self) -> None:
-        """Enable/disable connect button based on selection."""
+        """Enable/disable connect and transfer buttons based on selection."""
         indexes = self._list_view.selectionModel().selectedIndexes()
         if not indexes:
             self._connect_btn.setEnabled(False)
+            self._transfer_btn.setEnabled(False)
             return
         idx = indexes[0]
         session_id = idx.data(Qt.ItemDataRole.UserRole + 1) or ""
         trusted = idx.data(Qt.ItemDataRole.UserRole + 2) or False
         can_connect = bool(session_id)
         self._connect_btn.setEnabled(can_connect)
+        self._transfer_btn.setEnabled(can_connect)
 
         if trusted and can_connect:
             self._on_connect()
@@ -438,6 +464,30 @@ class ConnectionPanel(QWidget):
         if password is not None:
             # Use device_id (not session_id) for lookup
             self.connection_requested.emit(device_id, password)
+
+    @Slot()
+    def _on_file_transfer(self) -> None:
+        """Initiate a file-transfer-only connection to the selected device."""
+        indexes = self._list_view.selectionModel().selectedIndexes()
+        if not indexes:
+            return
+        idx = indexes[0]
+
+        device_id = idx.data(Qt.ItemDataRole.UserRole) or ""
+        session_id = idx.data(Qt.ItemDataRole.UserRole + 1) or ""
+        trusted = idx.data(Qt.ItemDataRole.UserRole + 2) or False
+
+        if not session_id:
+            QMessageBox.warning(
+                self, "Device offline",
+                "This device is not currently connected to the relay.\n"
+                "Please try again later.",
+            )
+            return
+
+        password = "" if trusted else self._prompt_password(device_id)
+        if password is not None:
+            self.file_transfer_requested.emit(device_id, password)
 
     def _prompt_password(self, device_id: str) -> str | None:
         pwd, ok = QInputDialog.getText(

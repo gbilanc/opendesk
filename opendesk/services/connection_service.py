@@ -177,6 +177,15 @@ class ConnectionService(QObject):
         """Check if the HOST session is active and connected."""
         return self._relay.is_hosting()
 
+    @property
+    def client_connection_mode(self) -> str:
+        """Connection mode of the client connected to our host session.
+
+        ``"remote_desktop"`` (default) or ``"file_transfer"``.
+        Only meaningful on the host side after a client authenticates.
+        """
+        return self._relay.client_connection_mode
+
     # ── session lifecycle ───────────────────────────────────────────
 
     def create_session(self, password: str) -> str:
@@ -210,17 +219,28 @@ class ConnectionService(QObject):
         self._host_retries = 0
         self._relay.stop_hosting()
 
-    def join_session(self, peer_id: str, password: str) -> None:
+    def join_session(self, peer_id: str, password: str,
+                     connection_mode: str = "remote_desktop") -> None:
         """Connetti come client a una sessione remota.
 
         NON ferma la sessione host — l'hosting continua in background.
+
+        Parameters
+        ----------
+        connection_mode : str
+            "remote_desktop" (default) per desktop remoto completo,
+            "file_transfer" per solo file transfer (senza streaming).
         """
         clean_id = peer_id.replace(" ", "")
         host, port = self._get_relay_config()
-        logger.info("Joining session %s on relay %s:%s", clean_id, host, port)
+        logger.info(
+            "Joining session %s on relay %s:%s (mode=%s)",
+            clean_id, host, port, connection_mode,
+        )
         self._relay.join_session(
             host, port, clean_id, password,
             device_id=self._device_id,
+            connection_mode=connection_mode,
         )
 
     def disconnect(self) -> None:
