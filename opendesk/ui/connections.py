@@ -441,14 +441,11 @@ class ConnectionPanel(QWidget):
         self._transfer_btn.setEnabled(can_connect)
         # Chat button is controlled by connection state, not selection
 
-        if trusted and can_connect:
-            self._on_connect()
+        # Connection is only initiated via the Connect button, not on selection
 
     def _on_double_clicked(self, index: QModelIndex) -> None:
-        """Double-click to connect."""
-        session_id = index.data(Qt.ItemDataRole.UserRole + 1) or ""
-        if session_id:
-            self._on_connect()
+        """Double-click is disabled; connection only starts via the Connect button."""
+        pass
 
     def _toggle_manual(self) -> None:
         visible = not self._manual_form.isVisible()
