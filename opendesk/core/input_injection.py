@@ -22,6 +22,14 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Max ABS range for uinput absolute positioning (compositor maps to screen)
+_ABS_MAX = 32767
+
+
+# ---------------------------------------------------------------------------
 # Data types
 # ---------------------------------------------------------------------------
 
@@ -231,6 +239,12 @@ class WaylandInputBackend(InputBackend):
     ``ydotool`` (``sudo apt install ydotool``) — the backend
     detects it automatically.
 
+    When ``ydotool`` is unavailable, this backend tries to create
+    a second uinput device with ``EV_ABS`` capability.  Compositors
+    based on wlroots (Sway, Hyprland) and KDE respect absolute
+    positioning via ``EV_ABS``.  GNOME ignores it, falling back
+    to relative delta tracking with a warning.
+
     Requires:
         - ``python-evdev`` (``pip install evdev``)
         - ``uinput`` kernel module loaded
@@ -240,6 +254,7 @@ class WaylandInputBackend(InputBackend):
 
     def __init__(self) -> None:
         self._ui: Any = None  # noqa: ANN401
+        self._abs_ui: Any = None  # noqa: ANN401
         self._setup()
 
     def _setup(self) -> None:
@@ -261,6 +276,9 @@ class WaylandInputBackend(InputBackend):
         self._ydotool = _find_ydotool()
         if self._ydotool:
             logger.info("Wayland: ydotool detected — absolute mouse supported")
+
+        # Flag: true if we have a working ABS uinput device
+        self._has_abs: bool = False
 
         # Check that /dev/uinput exists and we can write to it
         import os
@@ -329,7 +347,12 @@ class WaylandInputBackend(InputBackend):
                 e.EV_REL: (e.REL_X, e.REL_Y, e.REL_WHEEL, e.REL_HWHEEL),
             }
             self._ui = UInput(capabilities, name="OpenDesk Virtual Input", version=0x1)
-            logger.info("Wayland uinput device created")
+            logger.info("Wayland uinput REL device created")
+
+            # ── Try to create a second uinput device with EV_ABS for absolute positioning ──
+            if not self._ydotool:
+                self._try_create_abs_device()
+
         except PermissionError:
             raise
         except OSError as e:
@@ -380,16 +403,52 @@ class WaylandInputBackend(InputBackend):
         logger.warning("Unknown key '%s'", key)
         return 0
 
+    def _try_create_abs_device(self) -> None:
+        """Tenta di creare un secondo device uinput con EV_ABS.
+
+        Alcuni compositori Wayland (wlroots, KDE) supportano il
+        posizionamento assoluto via EV_ABS da uinput.  GNOME lo
+        ignora.  Se la creazione fallisce, si usa il fallback REL.
+        """
+        from evdev import UInput, AbsInfo
+        try:
+            abs_caps = {
+                self._e.EV_KEY: (
+                    self._e.BTN_LEFT, self._e.BTN_MIDDLE, self._e.BTN_RIGHT,
+                ),
+                self._e.EV_ABS: [
+                    (self._e.ABS_X, AbsInfo(0, 0, _ABS_MAX, 0, 0, 0)),
+                    (self._e.ABS_Y, AbsInfo(0, 0, _ABS_MAX, 0, 0, 0)),
+                ],
+            }
+            self._abs_ui = UInput(
+                abs_caps,
+                name="OpenDesk Virtual Input (Absolute)",
+                version=0x1,
+            )
+            self._has_abs = True
+            logger.info(
+                "Wayland: ABS uinput device created (max=%d) — "
+                "absolute mouse positioning enabled",
+                _ABS_MAX,
+            )
+        except Exception as e:
+            self._abs_ui = None
+            self._has_abs = False
+            logger.warning(
+                "Wayland: could not create ABS uinput device (%s) — "
+                "falling back to relative delta tracking. "
+                "Install ydotool for accurate absolute positioning.",
+                e,
+            )
+
     def move_mouse(self, x: int, y: int, absolute: bool = True) -> None:
         """Move the mouse cursor.
 
-        On Wayland, *absolute* positioning is emulated via relative
-        deltas because compositors do not expose a warp-pointer API.
-
-        If ``ydotool`` is installed, absolute positioning uses it
-        for accurate cursor placement.  Otherwise, the virtual
-        position is tracked and converted to relative deltas — this
-        may drift over time.
+        On Wayland, absolute positioning is done via:
+        1. ``ydotool`` (if installed) — most reliable
+        2. ``EV_ABS`` on a secondary uinput device — works on wlroots/KDE
+        3. Relative delta tracking with virtual cursor — drifts over time
         """
         if absolute and self._ydotool:
             # ydotool supports absolute positioning
@@ -402,12 +461,23 @@ class WaylandInputBackend(InputBackend):
             self._virtual_y = y
             return
 
+        if absolute and self._has_abs:
+            # ABS uinput: invia coordinate assolute direttamente
+            # (wlroots/KDE rispettano EV_ABS; GNOME ignora → REL fallback)
+            self._abs_ui.write(self._e.EV_ABS, self._e.ABS_X, x)
+            self._abs_ui.write(self._e.EV_ABS, self._e.ABS_Y, y)
+            self._abs_ui.syn()
+            self._virtual_x = x
+            self._virtual_y = y
+            return
+
         if absolute:
             if not self._virtual_inited:
-                logger.info(
-                    "Wayland absolute mouse: virtual cursor tracking enabled. "
-                    "Initial position is (0,0).  Convert absolute to relative. "
-                    "Install ydotool for accurate absolute positioning."
+                logger.warning(
+                    "Wayland: absolute mouse via relative deltas — "
+                    "initial position assumed (0,0).  The first event "
+                    "will be inaccurate.  Install ydotool (or use "
+                    "wlroots/KDE compositor) for reliable positioning."
                 )
                 self._virtual_inited = True
             dx = x - self._virtual_x
@@ -432,14 +502,18 @@ class WaylandInputBackend(InputBackend):
         btn = btn_map.get(button)
         if btn is None:
             return
+        # Invia il click sul device ABS se disponibile (posizione già
+        # impostata da move_mouse sullo stesso device), altrimenti sul
+        # device REL.  Il cursore è condiviso tra tutti i device pointer.
+        target = self._abs_ui if self._has_abs else self._ui
         if state == KeyState.PRESSED:
-            self._ui.write(self._e.EV_KEY, btn, 1)
+            target.write(self._e.EV_KEY, btn, 1)
         elif state == KeyState.RELEASED:
-            self._ui.write(self._e.EV_KEY, btn, 0)
+            target.write(self._e.EV_KEY, btn, 0)
         elif state == KeyState.TYPED:
-            self._ui.write(self._e.EV_KEY, btn, 1)
-            self._ui.write(self._e.EV_KEY, btn, 0)
-        self._ui.syn()
+            target.write(self._e.EV_KEY, btn, 1)
+            target.write(self._e.EV_KEY, btn, 0)
+        target.syn()
 
     def scroll_mouse(self, dx: int, dy: int) -> None:
         if dy != 0:
@@ -473,6 +547,12 @@ class WaylandInputBackend(InputBackend):
             self._ui.syn()
 
     def release(self) -> None:
+        if self._abs_ui is not None:
+            try:
+                self._abs_ui.close()
+            except Exception:
+                pass
+            self._abs_ui = None
         if self._ui is not None:
             self._ui.close()
             self._ui = None

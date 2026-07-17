@@ -148,6 +148,15 @@ class RemoteViewer(QGraphicsView):
         self._frame_timeout_timer.setSingleShot(True)
         self._frame_timeout_timer.timeout.connect(self._on_frame_timeout)
 
+        # ── Mouse event coalescing ──
+        # Accumula eventi di movimento a ~30 fps invece di inviare
+        # ogni singolo mouseMoveEvent (evita accodamento sulla rete).
+        self._mouse_coalesce_timer = QTimer(self)
+        self._mouse_coalesce_timer.setSingleShot(True)
+        self._mouse_coalesce_timer.timeout.connect(self._send_pending_mouse)
+        self._pending_mouse: tuple[int, int, int, bool, bool] | None = None
+        self._MOUSE_COALESCE_MS = 33  # ~30 fps
+
         # Placeholder while disconnected
         self._show_placeholder()
 
@@ -316,10 +325,24 @@ class RemoteViewer(QGraphicsView):
         else:
             super().wheelEvent(event)
 
+    def _send_pending_mouse(self) -> None:
+        """Invia l'ultima posizione mouse accumulata (coalescing)."""
+        if self._pending_mouse is not None:
+            self.remote_mouse_event.emit(*self._pending_mouse)
+            self._pending_mouse = None
+
+    def _flush_pending_mouse(self) -> None:
+        """Forza l'invio immediato della posizione accumulata."""
+        if self._mouse_coalesce_timer.isActive():
+            self._mouse_coalesce_timer.stop()
+        self._send_pending_mouse()
+
     def mousePressEvent(self, event) -> None:  # noqa: N802
         """Forward mouse press (all buttons)."""
         btn = self._qt_button_to_remote(event.button())
         if btn is not None:
+            # Flush pending movement first, then send click at correct pos
+            self._flush_pending_mouse()
             scene_pos = self.mapToScene(event.pos())
             self.remote_mouse_event.emit(
                 int(scene_pos.x()), int(scene_pos.y()),
@@ -331,6 +354,7 @@ class RemoteViewer(QGraphicsView):
         """Forward mouse release (all buttons)."""
         btn = self._qt_button_to_remote(event.button())
         if btn is not None:
+            self._flush_pending_mouse()
             scene_pos = self.mapToScene(event.pos())
             self.remote_mouse_event.emit(
                 int(scene_pos.x()), int(scene_pos.y()),
@@ -339,13 +363,15 @@ class RemoteViewer(QGraphicsView):
         super().mouseReleaseEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
-        """Forward mouse movement."""
+        """Forward mouse movement with coalescing (~30 fps)."""
         if self._connection_active:
             scene_pos = self.mapToScene(event.pos())
-            self.remote_mouse_event.emit(
+            self._pending_mouse = (
                 int(scene_pos.x()), int(scene_pos.y()),
                 0, False, True,
             )
+            if not self._mouse_coalesce_timer.isActive():
+                self._mouse_coalesce_timer.start(self._MOUSE_COALESCE_MS)
         super().mouseMoveEvent(event)
 
     def resizeEvent(self, event) -> None:  # noqa: N802
