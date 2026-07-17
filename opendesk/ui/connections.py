@@ -367,11 +367,11 @@ class ConnectionPanel(QWidget):
 
     def update_device_list(self, devices: list[DeviceEntry]) -> None:
         """Update the displayed device list (called from MainWindow)."""
+        self._model.set_devices(devices)
 
     def set_connected(self, connected: bool) -> None:
         """Enable/disable the Chat button based on connection state."""
         self._chat_btn.setEnabled(connected)
-        self._model.set_devices(devices)
 
     # ── context menu ───────────────────────────────────────────────
 
