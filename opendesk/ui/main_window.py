@@ -307,8 +307,8 @@ class MainWindow(QMainWindow):
         self._chat_panel = ChatPanel(self)
         self._chat_panel.message_sent.connect(self._on_chat_message_sent)
 
-        # ── File transfers window ──
-        self._transfer_dock = FileBrowserDock(self)
+        # ── File transfers window (created lazily on first use) ──
+        self._transfer_dock: FileBrowserDock | None = None
 
     def _setup_central_widget(self) -> None:
         """Build the central area with session info + remote viewer."""
@@ -417,8 +417,9 @@ class MainWindow(QMainWindow):
         self._clipboard_sync.stop()
         self.act_send_file.setEnabled(False)
         self._file_transfer_send_fn = None
-        self._transfer_dock.set_connected(False)
-        self._transfer_dock.set_status("Disconnected — remote browsing unavailable")
+        if self._transfer_dock is not None:
+            self._transfer_dock.set_connected(False)
+            self._transfer_dock.set_status("Disconnected — remote browsing unavailable")
         self._stop_streaming()
         self._set_connected(False)
         self._peer_id = ""
@@ -460,7 +461,8 @@ class MainWindow(QMainWindow):
             # Enable file transfer
             self.act_send_file.setEnabled(True)
             self._file_transfer_send_fn = self._send_file_message
-            self._transfer_dock.set_connected(True)
+            if self._transfer_dock is not None:
+                self._transfer_dock.set_connected(True)
 
             # Start clipboard sync if enabled in settings
             if self._settings.value("general/clipboard_sync", False, type=bool):
@@ -485,7 +487,8 @@ class MainWindow(QMainWindow):
             # Enable file transfer
             self.act_send_file.setEnabled(True)
             self._file_transfer_send_fn = self._send_file_message
-            self._transfer_dock.set_connected(True)
+            if self._transfer_dock is not None:
+                self._transfer_dock.set_connected(True)
 
             # Start clipboard sync if enabled in settings
             if self._settings.value("general/clipboard_sync", False, type=bool):
@@ -559,7 +562,7 @@ class MainWindow(QMainWindow):
             job_id = msg.payload.get("job_id", "")
             if job_id:
                 job = self._file_transfer.get_job(job_id)
-                if job:
+                if job and self._transfer_dock is not None:
                     self._transfer_dock.add_transfer(job)
         elif msg.type == MessageType.FILE_ACCEPT:
             job_id = msg.payload.get("job_id", "")
@@ -573,7 +576,8 @@ class MainWindow(QMainWindow):
             if job:
                 job.state = TransferState.CANCELLED
                 job.error = reason
-                self._transfer_dock.add_transfer(job)
+                if self._transfer_dock is not None:
+                    self._transfer_dock.add_transfer(job)
         elif msg.type in (MessageType.FILE_COMPLETE, MessageType.FILE_ERROR):
             job_id = msg.payload.get("job_id", "")
             job = self._file_transfer.get_job(job_id)
@@ -583,7 +587,8 @@ class MainWindow(QMainWindow):
                 else:
                     job.state = TransferState.FAILED
                     job.error = msg.payload.get("error", "Unknown error")
-                self._transfer_dock.add_transfer(job)
+                if self._transfer_dock is not None:
+                    self._transfer_dock.add_transfer(job)
         elif msg.type == MessageType.FILE_LIST_REQUEST:
             # Remote peer wants a directory listing — respond
             response = self._file_transfer.handle_list_request(msg)
@@ -845,14 +850,34 @@ class MainWindow(QMainWindow):
             self._chat_panel.hide()
 
     @Slot()
+    def _ensure_transfer_dock(self) -> FileBrowserDock:
+        """Create and return the file transfer dock (lazy init).
+
+        The dock is created on first use to avoid potential segfaults
+        from ``QFileSystemModel`` setup during ``MainWindow.__init__``.
+        """
+        if self._transfer_dock is None:
+            self._transfer_dock = FileBrowserDock(self)
+            self._transfer_dock.file_upload_requested.connect(
+                self._on_browser_upload
+            )
+            self._transfer_dock.file_download_requested.connect(
+                self._on_browser_download
+            )
+            self._transfer_dock.remote_listing_requested.connect(
+                self._on_browser_remote_listing
+            )
+        return self._transfer_dock
+
     def _on_toggle_transfers(self) -> None:
         """Show/hide the file transfers window."""
+        dock = self._ensure_transfer_dock()
         if self.act_show_transfers.isChecked():
-            self._transfer_dock.show()
-            self._transfer_dock.raise_()
-            self._transfer_dock.activateWindow()
+            dock.show()
+            dock.raise_()
+            dock.activateWindow()
         else:
-            self._transfer_dock.hide()
+            dock.hide()
 
     def _send_file_message(self, msg: Message) -> None:
         """Send a message via the relay (used as send_fn by FileTransferManager).
@@ -909,18 +934,20 @@ class MainWindow(QMainWindow):
                 if kind == "transfer":
                     job_id = event[1]
                     job = self._file_transfer.get_job(job_id)
-                    if job:
+                    if job and self._transfer_dock is not None:
                         self._transfer_dock.add_transfer(job)
 
                 elif kind == "listing":
                     path = event[1]
                     entries = event[2]
                     error = event[3]
-                    self._transfer_dock.set_remote_listing(path, entries, error)
+                    if self._transfer_dock is not None:
+                        self._transfer_dock.set_remote_listing(path, entries, error)
 
                 elif kind == "status":
                     message = event[1]
-                    self._transfer_dock.set_status(message)
+                    if self._transfer_dock is not None:
+                        self._transfer_dock.set_status(message)
 
         except queue.Empty:
             pass
