@@ -12,6 +12,10 @@ Architecture:
   daemon thread.  All async operations (chunk transfers, hashing) are
   scheduled on that loop via ``run_coroutine_threadsafe``.  This avoids
   depending on a running event loop in the Qt main thread.
+
+  UI updates are delivered via a thread-safe queue (``updates``).
+  The Qt main thread should poll this queue periodically (e.g. with
+  a QTimer) and process the events.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import queue
 import threading
 import time
 from collections.abc import Callable
@@ -163,6 +168,16 @@ class FileTransferManager:
     asyncio event loop.
 
     All public methods are thread-safe and can be called from any thread.
+
+    UI update events are pushed into the ``updates`` queue (thread-safe).
+    The format is:
+
+    - ``("transfer", job_id)`` — a transfer job changed state.
+      Read the updated job via ``get_job(job_id)``.
+    - ``("listing", path, entries, error)`` — remote directory listing arrived.
+    - ``("status", message)`` — a status message for the UI.
+
+    The Qt main thread should poll ``updates`` with a QTimer (~200 ms).
     """
 
     def __init__(self, max_concurrent: int = _MAX_CONCURRENT) -> None:
@@ -174,9 +189,8 @@ class FileTransferManager:
         self._bg_loop = _BgEventLoop()
         self._bg_loop.start()
 
-        # Callbacks for async events (called from the background thread)
-        self.on_remote_listing: Callable | None = None  # fn(path, entries, error)
-        self.on_transfer_update: Callable | None = None  # fn(job)
+        # Thread-safe queue for UI updates (polled by Qt main thread)
+        self.updates: queue.Queue = queue.Queue()
 
     # ── lifecycle ───────────────────────────────────────────────────
 
@@ -257,6 +271,7 @@ class FileTransferManager:
                 job.file_info.size,
                 job.file_info.sha256,
             ))
+            self._push_update("transfer", job.id)
 
     def send_chunks(
         self,
@@ -287,6 +302,7 @@ class FileTransferManager:
 
         job.state = TransferState.IN_PROGRESS
         job.started_at = time.time()
+        self._push_update("transfer", job.id)
 
         with open(path, "rb") as f:
             seq = 0
@@ -305,14 +321,17 @@ class FileTransferManager:
                 job.progress = job.bytes_transferred / job.file_info.size
                 seq += 1
 
+                # Throttle progress updates to avoid flooding the queue
+                if seq % 10 == 0:
+                    self._push_update("transfer", job.id)
+
                 # Yield control between chunks
                 await asyncio.sleep(0)
 
         job.state = TransferState.COMPLETED
         job.completed_at = time.time()
+        self._push_update("transfer", job.id)
         logger.info("File sent: %s (%d chunks)", job.file_info.name, seq)
-        if self.on_transfer_update:
-            self.on_transfer_update(job)
 
     # ── receiving ───────────────────────────────────────────────────
 
@@ -336,8 +355,7 @@ class FileTransferManager:
         job.state = TransferState.ACCEPTED
         job.started_at = time.time()
         logger.info("Incoming file: %s (%d bytes)", name, size)
-        if self.on_transfer_update:
-            self.on_transfer_update(job)
+        self._push_update("transfer", job_id)
         return job_id
 
     def handle_chunk(self, msg: Message) -> None:
@@ -357,7 +375,6 @@ class FileTransferManager:
         job.progress = job.bytes_transferred / job.file_info.size
 
         if is_last:
-            # If the job has a custom destination path, use its parent dir
             if job.file_info.path:
                 custom_path = Path(job.file_info.path)
                 if custom_path.is_dir():
@@ -376,9 +393,8 @@ class FileTransferManager:
         if job is None:
             return False
         job.state = TransferState.CANCELLED
+        self._push_update("transfer", job_id)
         logger.info("Job cancelled: %s", job_id)
-        if self.on_transfer_update:
-            self.on_transfer_update(job)
         return True
 
     def pause_job(self, job_id: str) -> bool:
@@ -387,18 +403,20 @@ class FileTransferManager:
         if job is None or job.state != TransferState.IN_PROGRESS:
             return False
         job.state = TransferState.PAUSED
-        if self.on_transfer_update:
-            self.on_transfer_update(job)
+        self._push_update("transfer", job_id)
         return True
 
     # ── internal ────────────────────────────────────────────────────
 
+    def _push_update(self, kind: str, *args) -> None:
+        """Push an update event into the thread-safe queue."""
+        self.updates.put((kind, *args))
+
     def _fail_job(self, job: TransferJob, error: str) -> None:
         job.state = TransferState.FAILED
         job.error = error
+        self._push_update("transfer", job.id)
         logger.error("Transfer failed: %s — %s", job.file_info.name, error)
-        if self.on_transfer_update:
-            self.on_transfer_update(job)
 
     def _finalize_receive(self, job: TransferJob, dest_dir: str | Path | None = None) -> None:
         """Write received data to disk.
@@ -422,8 +440,7 @@ class FileTransferManager:
             job.state = TransferState.COMPLETED
             job.completed_at = time.time()
             logger.info("File received: %s (%d bytes)", dest, job.bytes_transferred)
-            if self.on_transfer_update:
-                self.on_transfer_update(job)
+            self._push_update("transfer", job.id)
         except OSError as e:
             self._fail_job(job, str(e))
 
@@ -487,18 +504,21 @@ class FileTransferManager:
     ) -> None:
         """Request a directory listing from the remote peer.
 
-        The result will be delivered via ``on_remote_listing`` callback.
-        This is synchronous — just sends one message.
+        The result will be delivered via the ``updates`` queue as a
+        ``("listing", path, entries, error)`` event.
         """
         send_fn(Message.file_list_request(path))
 
     def handle_list_response(self, msg: Message) -> None:
-        """Process an incoming FILE_LIST_RESPONSE."""
+        """Process an incoming FILE_LIST_RESPONSE.
+
+        Pushes a ``("listing", path, entries, error)`` event onto
+        the ``updates`` queue.
+        """
         path = msg.payload.get("path", "")
         entries = msg.payload.get("entries", [])
         error = msg.payload.get("error", "")
-        if self.on_remote_listing:
-            self.on_remote_listing(path, entries, error)
+        self._push_update("listing", path, entries, error)
 
     # ── download requests ─────────────────────────────────────────────
 
@@ -532,8 +552,8 @@ class FileTransferManager:
         if local_dest:
             job.file_info.path = str(local_dest)
         self._jobs[job_id] = job
+        self._push_update("transfer", job_id)
 
-        # Send the download request synchronously
         send_fn(Message(
             MessageType.FILE_DOWNLOAD_REQUEST,
             {"remote_path": remote_path, "job_id": job_id},
@@ -560,13 +580,13 @@ class FileTransferManager:
             state=TransferState.ACCEPTED,
         )
         self._jobs[job_id] = job
+        self._push_update("transfer", job_id)
 
         # Start chunk transfer on background loop
         self._bg_loop.run(self._send_download_chunks_async(job, send_fn))
 
     async def _send_download_chunks_async(self, job: TransferJob, send_fn: Callable) -> None:
         """Send file chunks for a download request (background)."""
-        # Send accept first
         send_fn(Message.file_download_accept(job.id))
 
         path = Path(job.file_info.path)
@@ -577,8 +597,7 @@ class FileTransferManager:
 
         job.state = TransferState.IN_PROGRESS
         job.started_at = time.time()
-        if self.on_transfer_update:
-            self.on_transfer_update(job)
+        self._push_update("transfer", job.id)
 
         with open(path, "rb") as f:
             seq = 0
@@ -596,13 +615,16 @@ class FileTransferManager:
                 job.bytes_transferred += len(chunk)
                 job.progress = job.bytes_transferred / job.file_info.size
                 seq += 1
+
+                if seq % 10 == 0:
+                    self._push_update("transfer", job.id)
+
                 await asyncio.sleep(0)
 
         job.state = TransferState.COMPLETED
         job.completed_at = time.time()
+        self._push_update("transfer", job.id)
         logger.info("Download sent: %s (%d chunks)", job.file_info.name, seq)
-        if self.on_transfer_update:
-            self.on_transfer_update(job)
 
     def handle_download_accept(self, msg: Message) -> None:
         """Handle FILE_DOWNLOAD_ACCEPT — remote peer will start sending chunks."""
@@ -611,8 +633,7 @@ class FileTransferManager:
         if job:
             job.state = TransferState.IN_PROGRESS
             job.started_at = time.time()
-            if self.on_transfer_update:
-                self.on_transfer_update(job)
+            self._push_update("transfer", job_id)
 
     def handle_download_reject(self, msg: Message) -> None:
         """Handle FILE_DOWNLOAD_REJECT."""
@@ -622,8 +643,7 @@ class FileTransferManager:
         if job:
             job.state = TransferState.CANCELLED
             job.error = reason
-            if self.on_transfer_update:
-                self.on_transfer_update(job)
+            self._push_update("transfer", job_id)
 
     @staticmethod
     async def _compute_sha256(path: Path) -> str:

@@ -9,6 +9,7 @@ real P2P relay networking.
 from __future__ import annotations
 
 import logging
+import queue
 import time
 import uuid
 
@@ -113,6 +114,11 @@ class MainWindow(QMainWindow):
         # File transfer manager
         self._file_transfer = FileTransferManager()
         self._file_transfer_send_fn = None  # set after connection
+
+        # Poll the file-transfer updates queue from the background thread
+        self._ft_update_timer = QTimer(self)
+        self._ft_update_timer.timeout.connect(self._poll_file_transfer_updates)
+        self._ft_update_timer.start(200)
 
         # Clipboard sync (instantiated but only started when enabled in settings)
         self._clipboard_sync = ClipboardSync(self)
@@ -892,22 +898,32 @@ class MainWindow(QMainWindow):
         if self._file_transfer_send_fn:
             self._file_transfer.request_remote_listing(path, self._file_transfer_send_fn)
 
-    def _on_transfer_update(self, job: TransferJob) -> None:
-        """Callback from FileTransferManager when a transfer job updates.
+    def _poll_file_transfer_updates(self) -> None:
+        """Poll the FileTransferManager updates queue (runs on main thread via QTimer)."""
+        from opendesk.core.file_transfer import TransferJob
+        try:
+            while True:
+                event = self._file_transfer.updates.get_nowait()
+                kind = event[0]
 
-        Called from the background thread — bounce to the main thread
-        before updating Qt widgets.
-        """
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(0, lambda: self._transfer_dock.add_transfer(job))
+                if kind == "transfer":
+                    job_id = event[1]
+                    job = self._file_transfer.get_job(job_id)
+                    if job:
+                        self._transfer_dock.add_transfer(job)
 
-    def _on_remote_listing(self, path: str, entries: list[dict], error: str) -> None:
-        """Callback from FileTransferManager when remote listing arrives.
+                elif kind == "listing":
+                    path = event[1]
+                    entries = event[2]
+                    error = event[3]
+                    self._transfer_dock.set_remote_listing(path, entries, error)
 
-        Called from the background thread — bounce to the main thread.
-        """
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(0, lambda: self._transfer_dock.set_remote_listing(path, entries, error))
+                elif kind == "status":
+                    message = event[1]
+                    self._transfer_dock.set_status(message)
+
+        except queue.Empty:
+            pass
 
     # ── Slots: help ─────────────────────────────────────────────────
 
