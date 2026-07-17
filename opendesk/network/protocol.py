@@ -76,6 +76,11 @@ class MessageType(IntEnum):
     FILE_COMPLETE = 0x44  # File transfer complete
     FILE_ERROR = 0x45  # File transfer error
     FILE_PROGRESS = 0x46  # Transfer progress update
+    FILE_LIST_REQUEST = 0x47  # Request remote directory listing
+    FILE_LIST_RESPONSE = 0x48  # Remote directory listing response
+    FILE_DOWNLOAD_REQUEST = 0x49  # Request to download a remote file
+    FILE_DOWNLOAD_ACCEPT = 0x4A  # Accept download request
+    FILE_DOWNLOAD_REJECT = 0x4B  # Reject download request
 
     # ── Audio ──
     AUDIO_FRAME = 0x50  # Opus-encoded audio packet
@@ -316,6 +321,55 @@ class Message:
     def file_error(cls, job_id: str, error: str) -> Message:
         """Signal that a file transfer failed."""
         return cls(MessageType.FILE_ERROR, {"job_id": job_id, "error": error})
+
+    @classmethod
+    def file_list_request(cls, path: str = "/") -> Message:
+        """Request a directory listing from the remote peer."""
+        return cls(MessageType.FILE_LIST_REQUEST, {"path": path})
+
+    @classmethod
+    def file_list_response(
+        cls, path: str, entries: list[dict], error: str = "",
+    ) -> Message:
+        """Respond with a directory listing.
+
+        Parameters
+        ----------
+        path : str
+            The directory path that was listed.
+        entries : list[dict]
+            List of entries, each with keys:
+            - name (str)
+            - is_dir (bool)
+            - size (int, for files)
+            - mtime (float, modification time)
+        error : str
+            Error message if listing failed.
+        """
+        return cls(MessageType.FILE_LIST_RESPONSE, {
+            "path": path,
+            "entries": entries,
+            "error": error,
+        })
+
+    @classmethod
+    def file_download_request(cls, remote_path: str) -> Message:
+        """Request to download a file from the remote peer."""
+        return cls(MessageType.FILE_DOWNLOAD_REQUEST, {
+            "remote_path": remote_path,
+        })
+
+    @classmethod
+    def file_download_accept(cls, job_id: str) -> Message:
+        """Accept an incoming download request."""
+        return cls(MessageType.FILE_DOWNLOAD_ACCEPT, {"job_id": job_id})
+
+    @classmethod
+    def file_download_reject(cls, job_id: str, reason: str = "") -> Message:
+        """Reject an incoming download request."""
+        return cls(MessageType.FILE_DOWNLOAD_REJECT, {
+            "job_id": job_id, "reason": reason,
+        })
 
     @classmethod
     def chat_message(cls, text: str) -> Message:

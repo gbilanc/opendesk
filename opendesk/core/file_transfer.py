@@ -108,6 +108,10 @@ class FileTransferManager:
         self._active_count: int = 0
         self._current_chunk_transfer: asyncio.Task | None = None
 
+        # Callbacks for async events
+        self.on_remote_listing: Callable | None = None  # fn(path, entries, error)
+        self.on_transfer_update: Callable | None = None  # fn(job)
+
     # ── properties ──────────────────────────────────────────────────
 
     @property
@@ -267,7 +271,16 @@ class FileTransferManager:
         job.progress = job.bytes_transferred / job.file_info.size
 
         if is_last:
-            self._finalize_receive(job)
+            # If the job has a custom destination path, use its parent dir
+            if job.file_info.path:
+                custom_path = Path(job.file_info.path)
+                if custom_path.is_dir():
+                    dest_dir = custom_path
+                else:
+                    dest_dir = custom_path.parent
+                self._finalize_receive(job, dest_dir=dest_dir)
+            else:
+                self._finalize_receive(job)
 
         logger.debug("Chunk %d for %s (%d/%d bytes)", seq, job_id, job.bytes_transferred, job.file_info.size)
 
@@ -295,20 +308,244 @@ class FileTransferManager:
         job.error = error
         logger.error("Transfer failed: %s — %s", job.file_info.name, error)
 
-    def _finalize_receive(self, job: TransferJob) -> None:
-        """Write received data to disk."""
-        download_dir = Path.home() / "Downloads" / "OpenDesk"
-        download_dir.mkdir(parents=True, exist_ok=True)
+    def _finalize_receive(self, job: TransferJob, dest_dir: str | Path | None = None) -> None:
+        """Write received data to disk.
 
-        dest = download_dir / job.file_info.name
+        Parameters
+        ----------
+        job : TransferJob
+            The completed receive job.
+        dest_dir : str or Path, optional
+            Custom destination directory. Defaults to ~/Downloads/OpenDesk.
+        """
+        if dest_dir is None:
+            dest_dir = Path.home() / "Downloads" / "OpenDesk"
+        dest_dir = Path(dest_dir)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        dest = dest_dir / job.file_info.name
 
         try:
             dest.write_bytes(bytes(job.chunk_buffer))
             job.state = TransferState.COMPLETED
             job.completed_at = time.time()
             logger.info("File received: %s (%d bytes)", dest, job.bytes_transferred)
+            if self.on_transfer_update:
+                self.on_transfer_update(job)
         except OSError as e:
             self._fail_job(job, str(e))
+            if self.on_transfer_update:
+                self.on_transfer_update(job)
+
+    # ── directory listing ─────────────────────────────────────────────
+
+    @staticmethod
+    def list_directory(path: str | Path) -> tuple[list[dict], str]:
+        """List the contents of a local directory.
+
+        Parameters
+        ----------
+        path : str or Path
+            Directory path to list.
+
+        Returns
+        -------
+        (entries, error) tuple where:
+        - entries is a list of dicts with keys: name, is_dir, size, mtime
+        - error is an empty string on success, or an error message
+        """
+        path = Path(path)
+        if not path.exists():
+            return [], f"Path does not exist: {path}"
+        if not path.is_dir():
+            return [], f"Path is not a directory: {path}"
+
+        entries: list[dict] = []
+        try:
+            for child in sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+                try:
+                    stat = child.stat()
+                    entries.append({
+                        "name": child.name,
+                        "is_dir": child.is_dir(),
+                        "size": stat.st_size if child.is_file() else 0,
+                        "mtime": stat.st_mtime,
+                    })
+                except OSError:
+                    # Skip files we can't stat (permission issues)
+                    entries.append({
+                        "name": child.name,
+                        "is_dir": child.is_dir(),
+                        "size": 0,
+                        "mtime": 0.0,
+                    })
+        except PermissionError as e:
+            return [], str(e)
+
+        return entries, ""
+
+    def handle_list_request(self, msg: Message) -> Message:
+        """Handle an incoming FILE_LIST_REQUEST.
+
+        Returns a FILE_LIST_RESPONSE message with the directory listing.
+        """
+        path = msg.payload.get("path", "/")
+        entries, error = self.list_directory(path)
+        return Message.file_list_response(path, entries, error=error)
+
+    def request_remote_listing(
+        self, path: str, send_fn: Callable,
+    ) -> None:
+        """Request a directory listing from the remote peer.
+
+        The result will be delivered via ``on_remote_listing`` callback.
+        """
+        asyncio.ensure_future(send_fn(Message.file_list_request(path)))
+
+    def handle_list_response(self, msg: Message) -> None:
+        """Process an incoming FILE_LIST_RESPONSE."""
+        path = msg.payload.get("path", "")
+        entries = msg.payload.get("entries", [])
+        error = msg.payload.get("error", "")
+        if self.on_remote_listing:
+            self.on_remote_listing(path, entries, error)
+
+    # ── download requests ─────────────────────────────────────────────
+
+    async def request_download(
+        self,
+        remote_path: str,
+        send_fn: Callable,
+        local_dest: str | Path | None = None,
+    ) -> TransferJob | None:
+        """Request to download a file from the remote peer.
+
+        Parameters
+        ----------
+        remote_path : str
+            Path of the file on the remote system.
+        send_fn : async callable
+            Function to send a ``Message``.
+        local_dest : str or Path, optional
+            Local destination path. If None, uses filename in Downloads.
+
+        Returns
+        -------
+        TransferJob or None
+        """
+        name = Path(remote_path).name
+        job_id = f"dl-{int(time.time())}-{name}"
+
+        file_info = FileInfo(path=remote_path, name=name)
+        job = TransferJob(
+            id=job_id,
+            file_info=file_info,
+            direction=TransferDirection.RECEIVE,
+            state=TransferState.PENDING,
+        )
+        if local_dest:
+            job.file_info.path = str(local_dest)
+        self._jobs[job_id] = job
+
+        await send_fn(Message(
+            MessageType.FILE_DOWNLOAD_REQUEST,
+            {"remote_path": remote_path, "job_id": job_id},
+        ))
+        return job
+
+    def handle_download_request(self, msg: Message, send_fn: Callable) -> None:
+        """Handle an incoming FILE_DOWNLOAD_REQUEST from remote.
+
+        Starts sending the requested file in chunks.
+        """
+        remote_path = msg.payload.get("remote_path", "")
+        job_id = msg.payload.get("job_id", "")
+
+        path = Path(remote_path)
+        if not path.exists() or not path.is_file():
+            asyncio.ensure_future(send_fn(
+                Message.file_download_reject(job_id, "File not found"),
+            ))
+            return
+
+        file_info = FileInfo.from_path(path)
+        job = TransferJob(
+            id=job_id,
+            file_info=file_info,
+            direction=TransferDirection.SEND,
+            state=TransferState.ACCEPTED,
+        )
+        self._jobs[job_id] = job
+
+        # Send accept, then start chunk transfer
+        asyncio.ensure_future(self._send_download_chunks(job, send_fn))
+
+    async def _send_download_chunks(self, job: TransferJob, send_fn: Callable) -> None:
+        """Send file chunks for a download request."""
+        # Send accept first
+        await send_fn(Message.file_download_accept(job.id))
+
+        path = Path(job.file_info.path)
+        if not path.exists():
+            self._fail_job(job, "File missing")
+            await send_fn(Message.file_error(job.id, "File missing"))
+            if self.on_transfer_update:
+                self.on_transfer_update(job)
+            return
+
+        job.state = TransferState.IN_PROGRESS
+        job.started_at = time.time()
+        if self.on_transfer_update:
+            self.on_transfer_update(job)
+
+        with open(path, "rb") as f:
+            seq = 0
+            while True:
+                chunk = f.read(_CHUNK_SIZE)
+                if not chunk:
+                    break
+
+                msg = Message.file_chunk(
+                    job.id, seq, chunk,
+                    is_last=len(chunk) < _CHUNK_SIZE,
+                )
+                await send_fn(msg)
+
+                job.bytes_transferred += len(chunk)
+                job.progress = job.bytes_transferred / job.file_info.size
+                seq += 1
+                await asyncio.sleep(0)
+
+        job.state = TransferState.COMPLETED
+        job.completed_at = time.time()
+        logger.info("Download sent: %s (%d chunks)", job.file_info.name, seq)
+        if self.on_transfer_update:
+            self.on_transfer_update(job)
+
+    def handle_download_accept(self, msg: Message) -> None:
+        """Handle FILE_DOWNLOAD_ACCEPT — remote peer will start sending chunks.
+
+        The actual chunk handling goes through the existing handle_chunk flow,
+        but we mark the job as IN_PROGRESS here.
+        """
+        job_id = msg.payload.get("job_id", "")
+        job = self._jobs.get(job_id)
+        if job:
+            job.state = TransferState.IN_PROGRESS
+            job.started_at = time.time()
+            if self.on_transfer_update:
+                self.on_transfer_update(job)
+
+    def handle_download_reject(self, msg: Message) -> None:
+        """Handle FILE_DOWNLOAD_REJECT."""
+        job_id = msg.payload.get("job_id", "")
+        reason = msg.payload.get("reason", "Rejected")
+        job = self._jobs.get(job_id)
+        if job:
+            job.state = TransferState.CANCELLED
+            job.error = reason
+            if self.on_transfer_update:
+                self.on_transfer_update(job)
 
     @staticmethod
     async def _compute_sha256(path: Path) -> str:

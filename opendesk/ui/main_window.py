@@ -37,7 +37,7 @@ from opendesk.services.connection_service import ConnectionService
 from opendesk.services.stream_service import StreamService
 from opendesk.ui.chat_panel import ChatPanel
 from opendesk.ui.connections import ConnectionPanel, SessionStatusWidget
-from opendesk.ui.file_transfer_ui import FileTransferDock
+from opendesk.ui.file_transfer_ui import FileBrowserDock
 from opendesk.ui.session_info import SessionInfoWidget
 from opendesk.ui.settings_dialog import SettingsDialog
 from opendesk.ui.viewer import ViewerWindow
@@ -302,7 +302,7 @@ class MainWindow(QMainWindow):
         self._chat_panel.message_sent.connect(self._on_chat_message_sent)
 
         # ── File transfers window ──
-        self._transfer_dock = FileTransferDock(self)
+        self._transfer_dock = FileBrowserDock(self)
 
     def _setup_central_widget(self) -> None:
         """Build the central area with session info + remote viewer."""
@@ -411,6 +411,7 @@ class MainWindow(QMainWindow):
         self._clipboard_sync.stop()
         self.act_send_file.setEnabled(False)
         self._file_transfer_send_fn = None
+        self._transfer_dock.set_connected(False)
         self._stop_streaming()
         self._set_connected(False)
         self._peer_id = ""
@@ -452,10 +453,15 @@ class MainWindow(QMainWindow):
             # Enable file transfer
             self.act_send_file.setEnabled(True)
             self._file_transfer_send_fn = self._send_file_message_async
+            self._transfer_dock.set_connected(True)
 
             # Start clipboard sync if enabled in settings
             if self._settings.value("general/clipboard_sync", False, type=bool):
                 self._clipboard_sync.start(self._send_clipboard_message)
+
+            # Request initial remote file listing
+            if self._file_transfer_send_fn:
+                self._file_transfer.request_remote_listing("/", self._file_transfer_send_fn)
         else:
             logger.warning("Client authentication failed: %s", message)
             self._status_text.setText("Client authentication failed")
@@ -472,10 +478,15 @@ class MainWindow(QMainWindow):
             # Enable file transfer
             self.act_send_file.setEnabled(True)
             self._file_transfer_send_fn = self._send_file_message_async
+            self._transfer_dock.set_connected(True)
 
             # Start clipboard sync if enabled in settings
             if self._settings.value("general/clipboard_sync", False, type=bool):
                 self._clipboard_sync.start(self._send_clipboard_message)
+
+            # Request initial remote file listing
+            if self._file_transfer_send_fn:
+                self._file_transfer.request_remote_listing("/", self._file_transfer_send_fn)
         else:
             logger.warning("Authentication failed: %s", message)
             QMessageBox.warning(
@@ -573,6 +584,25 @@ class MainWindow(QMainWindow):
                     job.state = TransferState.FAILED
                     job.error = msg.payload.get("error", "Unknown error")
                 self._transfer_dock.add_transfer(job)
+        elif msg.type == MessageType.FILE_LIST_REQUEST:
+            # Remote peer wants a directory listing — respond
+            import asyncio
+            response = self._file_transfer.handle_list_request(msg)
+            if self._file_transfer_send_fn:
+                asyncio.ensure_future(self._file_transfer_send_fn(response))
+        elif msg.type == MessageType.FILE_LIST_RESPONSE:
+            # Remote directory listing received
+            self._file_transfer.handle_list_response(msg)
+        elif msg.type == MessageType.FILE_DOWNLOAD_REQUEST:
+            # Remote peer wants to download a file from us
+            if self._file_transfer_send_fn:
+                self._file_transfer.handle_download_request(msg, self._file_transfer_send_fn)
+        elif msg.type == MessageType.FILE_DOWNLOAD_ACCEPT:
+            # Remote peer accepted our download request
+            self._file_transfer.handle_download_accept(msg)
+        elif msg.type == MessageType.FILE_DOWNLOAD_REJECT:
+            # Remote peer rejected our download request
+            self._file_transfer.handle_download_reject(msg)
         elif msg.type == MessageType.DISCONNECT:
             self._on_disconnect()
 
@@ -842,6 +872,45 @@ class MainWindow(QMainWindow):
         logger.debug("Chat message sent: %s", text)
         if self._relay.is_connected:
             self._relay.send_message(Message.chat_message(text))
+
+    # ── File transfer browser handlers ──────────────────────────────
+
+    @Slot(list)
+    def _on_browser_upload(self, paths: list[str]) -> None:
+        """Upload selected local files to the remote peer."""
+        if not paths or not self._file_transfer_send_fn:
+            return
+        import asyncio
+        asyncio.ensure_future(
+            self._file_transfer.send_files(paths, self._file_transfer_send_fn)
+        )
+        logger.info("Upload requested: %d files", len(paths))
+
+    @Slot(list)
+    def _on_browser_download(self, remote_paths: list[str]) -> None:
+        """Download selected remote files to local."""
+        if not remote_paths or not self._file_transfer_send_fn:
+            return
+        import asyncio
+        for rpath in remote_paths:
+            asyncio.ensure_future(
+                self._file_transfer.request_download(rpath, self._file_transfer_send_fn)
+            )
+        logger.info("Download requested: %d files", len(remote_paths))
+
+    @Slot(str)
+    def _on_browser_remote_listing(self, path: str) -> None:
+        """Request a remote directory listing."""
+        if self._file_transfer_send_fn:
+            self._file_transfer.request_remote_listing(path, self._file_transfer_send_fn)
+
+    def _on_transfer_update(self, job: TransferJob) -> None:
+        """Callback from FileTransferManager when a transfer job updates."""
+        self._transfer_dock.add_transfer(job)
+
+    def _on_remote_listing(self, path: str, entries: list[dict], error: str) -> None:
+        """Callback from FileTransferManager when remote listing arrives."""
+        self._transfer_dock.set_remote_listing(path, entries, error)
 
     # ── Slots: help ─────────────────────────────────────────────────
 
