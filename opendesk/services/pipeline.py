@@ -205,6 +205,12 @@ class EncoderWorker(threading.Thread):
         self._frame_count: int = 0
         self._force_full_keyframe: bool = False
 
+        # Adaptive quality when screen is idle
+        self._last_change_ratio: float = 1.0  # 0.0 = idle, 1.0 = full change
+        self._idle_frames: int = 0
+        self._normal_crf: int | None = None
+        self._is_boosted: bool = False
+
     def run(self) -> None:
         logger.info("EncoderWorker started")
         last_frame_time = time.monotonic()
@@ -258,17 +264,32 @@ class EncoderWorker(threading.Thread):
                         logger.info("EncoderWorker: using %s CRF=%s",
                                     self._encoder.codec_name, crf or "(bitrate)")
 
-                # Decidi se inviare full keyframe o tile
-                send_full = (
+                # ── Adaptive quality: idle counter ──
+                if self._last_change_ratio < 0.05:
+                    self._idle_frames += 1
+                else:
+                    self._idle_frames = 0
+                    if self._is_boosted:
+                        self._restore_normal_quality()
+
+                # ── Decidi se inviare full keyframe o tile ──
+                needs_keyframe = (
                     self._prev_frame is None
                     or self._force_full_keyframe
-                    or self._frame_count >= 60  # KEYFRAME_INTERVAL
+                    or (self._frame_count >= 60 and self._last_change_ratio > 0.0)
                 )
 
-                if send_full:
+                if self._frame_count >= 60:
+                    # Resetta il contatore anche se saltiamo il keyframe
+                    self._frame_count = 0
+
+                if needs_keyframe:
+                    # Se in idle da tempo, alza la qualità per questo keyframe
+                    if self._idle_frames >= 10:
+                        self._apply_quality_boost()
+
                     self._do_full_keyframe(data, w, h, pts)
                     self._prev_frame = data.copy()
-                    self._frame_count = 0
                     self._force_full_keyframe = False
                 else:
                     self._do_tiles(data, w, h, pts)
@@ -349,6 +370,12 @@ class EncoderWorker(threading.Thread):
 
         self._prev_frame = current.copy()
 
+        # Aggiorna change ratio per adaptive quality
+        if total_tiles > 0:
+            self._last_change_ratio = changed / total_tiles
+        else:
+            self._last_change_ratio = 0.0
+
         # Se troppi tile cambiati, meglio un full keyframe
         if total_tiles > 0 and changed / total_tiles > 0.30:
             self._do_full_keyframe(current, w, h, pts)
@@ -359,6 +386,54 @@ class EncoderWorker(threading.Thread):
             self._pkt_queue.put(("tile", tile_data, tx, ty, tw, th, pts))
             if self._on_send_tile:
                 self._on_send_tile(tile_data, tx, ty, tw, th, pts)
+
+    # ── adaptive quality ────────────────────────────────────────────
+
+    def _apply_quality_boost(self) -> None:
+        """Aumenta la qualità (CRF più basso) quando lo schermo è fermo.
+
+        Rilascia e ricrea l'encoder con un CRF ridotto per il prossimo
+        keyframe.  La banda risparmiata durante l'inattività viene
+        reinvestita in qualità.
+        """
+        if self._encoder is None or self._is_boosted:
+            return
+
+        crf = self._config.crf
+        if crf is None:
+            crf = _QUALITY_CRF.get(self._config.quality)
+        if crf is None:
+            return
+
+        # Salva il CRF originale e imposta un CRF più basso (qualità più alta)
+        self._normal_crf = crf
+        boosted = max(10, crf - 4)  # CRF -4 = qualità molto più alta
+
+        logger.info(
+            "Adaptive quality: idle=%d frames, boosting CRF %d→%d",
+            self._idle_frames, crf, boosted,
+        )
+        self._config.crf = boosted
+        self._encoder.release()
+        self._encoder = None  # sarà ricreato al prossimo frame
+        self._is_boosted = True
+
+    def _restore_normal_quality(self) -> None:
+        """Ripristina il CRF originale quando il movimento riprende."""
+        if not self._is_boosted or self._normal_crf is None:
+            self._is_boosted = False
+            return
+
+        logger.info(
+            "Adaptive quality: motion resumed, restoring CRF %d",
+            self._normal_crf,
+        )
+        self._config.crf = self._normal_crf
+        self._normal_crf = None
+        if self._encoder is not None:
+            self._encoder.release()
+            self._encoder = None  # sarà ricreato al prossimo frame
+        self._is_boosted = False
 
 
 # ═══════════════════════════════════════════════════════════════════
