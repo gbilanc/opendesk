@@ -610,8 +610,8 @@ class FileBrowserDock(QDialog):
     """
 
     # Signals
-    file_upload_requested = Signal(list)  # list of local file paths
-    file_download_requested = Signal(list)  # list of remote paths
+    file_upload_requested = Signal(list, str)  # (local_paths, remote_dest_dir)
+    file_download_requested = Signal(list, str)  # (remote_paths, local_dest_dir)
     remote_listing_requested = Signal(str)  # remote path to list
     navigate_local = Signal(str)  # local path to navigate to
 
@@ -1049,7 +1049,7 @@ class FileBrowserDock(QDialog):
 
     @Slot()
     def _on_upload_clicked(self) -> None:
-        """Upload selected local files to remote."""
+        """Upload selected local files to the current remote folder."""
         indexes = self._local_tree.selectionModel().selectedIndexes()
         paths = set()
         for idx in indexes:
@@ -1059,12 +1059,15 @@ class FileBrowserDock(QDialog):
                     paths.add(path)
 
         if paths:
-            self.file_upload_requested.emit(list(paths))
-            self._status_label.setText(f"Uploading {len(paths)} file(s)...")
+            remote_dest = self._remote_path or "/"
+            self.file_upload_requested.emit(list(paths), remote_dest)
+            self._status_label.setText(
+                f"Uploading {len(paths)} file(s) to {remote_dest}..."
+            )
 
     @Slot()
     def _on_download_clicked(self) -> None:
-        """Download selected remote files to local."""
+        """Download selected remote files to the current local folder."""
         indexes = self._remote_tree.selectionModel().selectedIndexes()
         paths = set()
         for idx in indexes:
@@ -1074,8 +1077,11 @@ class FileBrowserDock(QDialog):
                     paths.add(node.get("path", ""))
 
         if paths:
-            self.file_download_requested.emit(list(paths))
-            self._status_label.setText(f"Downloading {len(paths)} file(s)...")
+            local_dest = self._local_root or str(Path.home())
+            self.file_download_requested.emit(list(paths), local_dest)
+            self._status_label.setText(
+                f"Downloading {len(paths)} file(s) to {local_dest}..."
+            )
 
     def _on_refresh_clicked(self) -> None:
         """Refresh the current remote directory."""

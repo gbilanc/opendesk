@@ -294,7 +294,7 @@ class Message:
 
     @classmethod
     def file_request(cls, name: str, size: int, sha256: str = "",
-                     job_id: str = "") -> Message:
+                     job_id: str = "", dest_path: str = "") -> Message:
         """Request permission to send a file.
 
         Parameters
@@ -302,10 +302,12 @@ class Message:
         job_id : str
             The sender's local job ID, so the receiver can echo it back
             in FILE_ACCEPT and both sides agree on the same identifier.
+        dest_path : str
+            Remote directory path where the file should be saved.
         """
         return cls(MessageType.FILE_REQUEST, {
             "name": name, "size": size, "sha256": sha256,
-            "job_id": job_id,
+            "job_id": job_id, "dest_path": dest_path,
         })
 
     @classmethod

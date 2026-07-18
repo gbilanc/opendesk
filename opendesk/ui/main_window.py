@@ -17,8 +17,6 @@ import numpy as np
 
 from PySide6.QtCore import QObject, QSettings, QSize, Qt, QTimer, Slot
 from PySide6.QtGui import QAction, QCloseEvent, QKeySequence, QShortcut
-from pathlib import Path
-
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -569,43 +567,14 @@ class MainWindow(QMainWindow):
             if self._clipboard_sync.enabled:
                 self._clipboard_sync.receive_from_remote(msg)
         elif msg.type == MessageType.FILE_REQUEST:
-            # Ask the user where to save the incoming file
+            # Auto-accept incoming file transfer.
+            # The sender may have included a "dest_path" in the
+            # FILE_REQUEST payload, which handle_file_request will
+            # store as job.file_info.path so _finalize_receive saves
+            # to the chosen remote directory.
             job_id = self._file_transfer.handle_file_request(msg)
-            if not job_id:
-                return
-            job = self._file_transfer.get_job(job_id)
-            if job is None:
-                return
-
-            # Show Save-As dialog with the original filename as default
-            default_name = job.file_info.name
-            last_dir = self._settings.value("file_transfer/last_save_dir", "")
-            if not last_dir:
-                last_dir = str(Path.home() / "Downloads")
-
-            save_path, _ = QFileDialog.getSaveFileName(
-                self,
-                f"Save incoming file — {default_name}",
-                str(Path(last_dir) / default_name),
-                "All files (*)",
-            )
-
-            if save_path:
-                # User chose a location — store it in the job and accept
-                save_path_obj = Path(save_path)
-                job.file_info.path = str(save_path_obj)
-                self._settings.setValue(
-                    "file_transfer/last_save_dir",
-                    str(save_path_obj.parent),
-                )
+            if job_id:
                 self._relay.send_message(Message.file_accept(job_id))
-                self._status_text.setText(f"Receiving: {default_name}")
-            else:
-                # User cancelled — reject the transfer
-                self._relay.send_message(
-                    Message.file_reject(job_id, "User cancelled")
-                )
-                self._file_transfer.cancel_job(job_id)
         elif msg.type == MessageType.FILE_CHUNK:
             self._file_transfer.handle_chunk(msg)
             job_id = msg.payload.get("job_id", "")
@@ -952,22 +921,40 @@ class MainWindow(QMainWindow):
 
     # ── File transfer browser handlers ──────────────────────────────
 
-    @Slot(list)
-    def _on_browser_upload(self, paths: list[str]) -> None:
-        """Upload selected local files to the remote peer."""
+    @Slot(list, str)
+    def _on_browser_upload(self, paths: list[str], remote_dest: str = "/") -> None:
+        """Upload selected local files to the remote peer.
+
+        Parameters
+        ----------
+        remote_dest : str
+            Remote directory where the file should be saved.
+        """
         if not paths or not self._file_transfer_send_fn:
             return
-        self._file_transfer.send_files(paths, self._file_transfer_send_fn)
-        logger.info("Upload requested: %d files", len(paths))
+        self._file_transfer.send_files(
+            paths, self._file_transfer_send_fn,
+            remote_dest_path=remote_dest,
+        )
+        logger.info("Upload requested: %d files to %s", len(paths), remote_dest)
 
-    @Slot(list)
-    def _on_browser_download(self, remote_paths: list[str]) -> None:
-        """Download selected remote files to local."""
+    @Slot(list, str)
+    def _on_browser_download(self, remote_paths: list[str], local_dest: str = "") -> None:
+        """Download selected remote files to the local folder.
+
+        Parameters
+        ----------
+        local_dest : str
+            Local directory where the downloaded file should be saved.
+        """
         if not remote_paths or not self._file_transfer_send_fn:
             return
         for rpath in remote_paths:
-            self._file_transfer.request_download(rpath, self._file_transfer_send_fn)
-        logger.info("Download requested: %d files", len(remote_paths))
+            self._file_transfer.request_download(
+                rpath, self._file_transfer_send_fn,
+                local_dest=local_dest,
+            )
+        logger.info("Download requested: %d files to %s", len(remote_paths), local_dest)
 
     @Slot(str)
     def _on_browser_remote_listing(self, path: str) -> None:

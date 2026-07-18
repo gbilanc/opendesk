@@ -224,6 +224,7 @@ class FileTransferManager:
         self,
         paths: list[str | Path],
         send_fn: Callable,
+        remote_dest_path: str = "",
     ) -> None:
         """Initiate file transfers for the given paths.
 
@@ -234,13 +235,17 @@ class FileTransferManager:
         send_fn : callable
             Function to send a ``Message`` to the remote peer
             (e.g. ``lambda msg: relay.send_message(msg)``).
+        remote_dest_path : str
+            Remote directory where the files should be saved.
+            Passed to the receiver via FILE_REQUEST payload.
         """
-        self._bg_loop.run(self._send_files_async(paths, send_fn))
+        self._bg_loop.run(self._send_files_async(paths, send_fn, remote_dest_path))
 
     async def _send_files_async(
         self,
         paths: list[str | Path],
         send_fn: Callable,
+        remote_dest_path: str = "",
     ) -> None:
         """Async implementation of send_files."""
         jobs: list[TransferJob] = []
@@ -266,13 +271,15 @@ class FileTransferManager:
 
         # Send file request messages with the sender's job_id so the
         # receiver echoes it back in FILE_ACCEPT and both sides use
-        # the same identifier for the transfer.
+        # the same identifier for the transfer.  Include the remote
+        # destination path so the receiver knows where to save.
         for job in jobs:
             send_fn(Message.file_request(
                 job.file_info.name,
                 job.file_info.size,
                 job.file_info.sha256,
                 job_id=job.id,
+                dest_path=remote_dest_path,
             ))
             self._push_update("transfer", job.id)
 
@@ -342,8 +349,11 @@ class FileTransferManager:
         """Handle an incoming file request.
 
         Uses the sender's ``job_id`` so both sides agree on the same
-        identifier for the transfer.  Returns the job ID if accepted,
-        or ``None`` to reject.
+        identifier for the transfer.  If the sender included a
+        ``dest_path``, it is used as the save location, otherwise the
+        default ``~/Downloads/OpenDesk`` is used.
+
+        Returns the job ID if accepted, or ``None`` to reject.
         """
         name = msg.payload.get("name", "unknown")
         size = msg.payload.get("size", 0)
@@ -358,10 +368,24 @@ class FileTransferManager:
             file_info=file_info,
             direction=TransferDirection.RECEIVE,
         )
+
+        # If the sender told us where to save, honour it.
+        dest_path = msg.payload.get("dest_path", "")
+        if dest_path:
+            job.file_info.path = dest_path
+            logger.info(
+                "Incoming file: %s (%d bytes) → %s [job=%s]",
+                name, size, dest_path, job_id,
+            )
+        else:
+            logger.info(
+                "Incoming file: %s (%d bytes) → default location [job=%s]",
+                name, size, job_id,
+            )
+
         self._jobs[job_id] = job
         job.state = TransferState.ACCEPTED
         job.started_at = time.time()
-        logger.info("Incoming file: %s (%d bytes) [job=%s]", name, size, job_id)
         self._push_update("transfer", job_id)
         return job_id
 
