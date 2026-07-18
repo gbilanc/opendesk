@@ -88,6 +88,7 @@ class MessageType(IntEnum):
     # ── Chat ──
     CHAT_MESSAGE = 0x60  # Text chat message
     CHAT_TYPING = 0x61  # Typing indicator
+    CHAT_OPEN = 0x62  # Chat window open/close notification
 
     # ── Control ──
     PING = 0x70  # Keep-alive / latency measurement
@@ -379,6 +380,11 @@ class Message:
     @classmethod
     def chat_message(cls, text: str) -> Message:
         return cls(MessageType.CHAT_MESSAGE, {"text": text})
+
+    @classmethod
+    def chat_open(cls, open: bool) -> Message:
+        """Notify peer that the chat window was opened or closed."""
+        return cls(MessageType.CHAT_OPEN, {"open": open})
 
     @classmethod
     def ping(cls, seq: int = 0) -> Message:

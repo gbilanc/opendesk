@@ -552,6 +552,16 @@ class MainWindow(QMainWindow):
         elif msg.type == MessageType.CHAT_MESSAGE:
             text = msg.payload.get("text", "")
             self._chat_panel.add_message("Remote", text, is_remote=True)
+        elif msg.type == MessageType.CHAT_OPEN:
+            is_open = msg.payload.get("open", False)
+            if is_open:
+                if not self._chat_panel.isVisible():
+                    self._chat_panel.show()
+                    self._chat_panel.raise_()
+                    self._chat_panel.activateWindow()
+            else:
+                if self._chat_panel.isVisible():
+                    self._chat_panel.hide()
         elif msg.type in (MessageType.CLIPBOARD_TEXT, MessageType.CLIPBOARD_IMAGE):
             if self._clipboard_sync.enabled:
                 self._clipboard_sync.receive_from_remote(msg)
@@ -851,13 +861,20 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_chat_toggled(self) -> None:
-        """Show/hide the chat window."""
+        """Show/hide the chat window and notify the remote peer."""
         if self._chat_panel.isVisible():
             self._chat_panel.hide()
+            self._send_chat_open_notification(False)
         else:
             self._chat_panel.show()
             self._chat_panel.raise_()
             self._chat_panel.activateWindow()
+            self._send_chat_open_notification(True)
+
+    def _send_chat_open_notification(self, is_open: bool) -> None:
+        """Send CHAT_OPEN notification to the remote peer."""
+        if self._relay.is_connected:
+            self._relay.send_message(Message.chat_open(is_open))
 
     @Slot()
     def _ensure_transfer_dock(self) -> FileBrowserDock:
