@@ -454,8 +454,14 @@ class TransferListModel(QAbstractListModel):
                 return True
         return False
 
-    def clear_completed(self) -> None:
-        """Remove all completed/failed/cancelled jobs."""
+    def clear_completed(self) -> bool:
+        """Remove all completed/failed/cancelled jobs.
+
+        Returns
+        -------
+        bool
+            ``True`` if at least one job was removed, ``False`` otherwise.
+        """
         completed_states = {TransferState.COMPLETED, TransferState.FAILED, TransferState.CANCELLED}
         to_remove = [i for i, j in enumerate(self._jobs) if j.state in completed_states]
         for i in reversed(to_remove):
@@ -464,6 +470,7 @@ class TransferListModel(QAbstractListModel):
             self.endRemoveRows()
         if to_remove:
             self.countChanged.emit(len(self._jobs))
+        return len(to_remove) > 0
 
     def job_at(self, row: int) -> TransferJob | None:
         if 0 <= row < len(self._jobs):
@@ -1042,15 +1049,20 @@ class FileBrowserDock(QDialog):
             self.file_download_requested.emit(list(paths))
             self._status_label.setText(f"Downloading {len(paths)} file(s)...")
 
-    @Slot()
     def _on_refresh_clicked(self) -> None:
         """Refresh the current remote directory."""
+        self._status_label.setText("Refreshing remote directory...")
         self._navigate_remote_to(self._remote_path)
 
-    @Slot()
     def _clear_completed(self) -> None:
         """Clear completed transfers."""
-        self._transfer_model.clear_completed()
+        cleared = self._transfer_model.clear_completed()
+        if cleared:
+            self._status_label.setText("Cleared completed transfers")
+        else:
+            self._status_label.setText("No completed transfers to clear")
+        # Re-evaluate button states after clearing
+        self._update_action_buttons()
 
     # ── public API ──────────────────────────────────────────────────
 
