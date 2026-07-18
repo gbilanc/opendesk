@@ -21,7 +21,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QColor, QFont, QPainter, QPen, QBrush,
-    QTextOption, QFontMetrics, QIcon,
+    QTextOption, QFontMetrics, QIcon, QKeySequence, QShortcut,
 )
 from PySide6.QtWidgets import (
     QDialog, QFrame, QHBoxLayout, QLabel, QListView,
@@ -638,6 +638,11 @@ class FileBrowserDock(QDialog):
         self._build_ui()
         self._connect_signals()
 
+        # Shortcut: Escape to clear selection
+        self._esc_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        self._esc_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._esc_shortcut.activated.connect(self._clear_selection)
+
     # ── UI construction ─────────────────────────────────────────────
 
     def _build_ui(self) -> None:
@@ -691,8 +696,26 @@ class FileBrowserDock(QDialog):
         """)
         self._status_label = QLabel("Ready")
         self._status_bar.addWidget(self._status_label, 1)
-        self._selection_label = QLabel("")
-        self._status_bar.addPermanentWidget(self._selection_label)
+
+        # Selection info with inline clear button
+        self._selection_info = QLabel("")
+        self._selection_info.setStyleSheet("color: #2563eb; font-weight: 600;")
+        self._status_bar.addPermanentWidget(self._selection_info)
+
+        self._clear_sel_btn = QPushButton("✕")
+        self._clear_sel_btn.setFixedSize(20, 20)
+        self._clear_sel_btn.setVisible(False)
+        self._clear_sel_btn.setStyleSheet("""
+            QPushButton {
+                border: none; border-radius: 10px;
+                font-size: 11px; font-weight: 700;
+                color: #64748b; background: #f1f5f9;
+            }
+            QPushButton:hover {
+                background: #e2e8f0; color: #0f172a;
+            }
+        """)
+        self._status_bar.addPermanentWidget(self._clear_sel_btn)
         layout.addWidget(self._status_bar)
 
     def _build_toolbar(self) -> QWidget:
@@ -833,6 +856,7 @@ class FileBrowserDock(QDialog):
         tree.setIndentation(20)
         tree.setAlternatingRowColors(True)
         tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        tree.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         tree.setStyleSheet("""
             QTreeView {
                 border: none; border-radius: 0px;
@@ -844,6 +868,9 @@ class FileBrowserDock(QDialog):
             }
             QTreeView::item:selected {
                 background-color: #dbeafe; color: #0f172a;
+            }
+            QTreeView::item:selected:active {
+                background-color: #bfdbfe;
             }
             QTreeView::item:hover {
                 background-color: #f8fafc;
@@ -945,6 +972,7 @@ class FileBrowserDock(QDialog):
         self._download_btn.clicked.connect(self._on_download_clicked)
         self._refresh_btn.clicked.connect(self._on_refresh_clicked)
         self._clear_btn.clicked.connect(self._clear_completed)
+        self._clear_sel_btn.clicked.connect(self._clear_selection)
 
     # ── local filesystem handlers ───────────────────────────────────
 
@@ -1064,6 +1092,17 @@ class FileBrowserDock(QDialog):
         # Re-evaluate button states after clearing
         self._update_action_buttons()
 
+    def _clear_selection(self) -> None:
+        """Clear all selections in both panes."""
+        local_sel = self._local_tree.selectionModel()
+        remote_sel = self._remote_tree.selectionModel()
+        if local_sel is not None:
+            local_sel.clearSelection()
+        if remote_sel is not None:
+            remote_sel.clearSelection()
+        self._selection_info.setText("")
+        self._clear_sel_btn.setVisible(False)
+
     # ── public API ──────────────────────────────────────────────────
 
     @property
@@ -1115,32 +1154,49 @@ class FileBrowserDock(QDialog):
         local_sel = self._local_tree.selectionModel()
         remote_sel = self._remote_tree.selectionModel()
 
-        # Upload: needs local files selected
+        # Collect selected file names from local tree
+        local_names: list[str] = []
         local_indexes = local_sel.selectedIndexes() if local_sel else []
-        has_local_files = any(
-            not self._local_model.isDir(idx) and idx.column() == 0
-            for idx in local_indexes
-        )
+        has_local_files = False
+        seen_local = set()
+        for idx in local_indexes:
+            if idx.column() == 0 and not self._local_model.isDir(idx):
+                path = self._local_model.filePath(idx)
+                if path not in seen_local:
+                    seen_local.add(path)
+                    local_names.append(self._local_model.fileName(idx))
+                    has_local_files = True
         self._upload_btn.setEnabled(has_local_files)
 
-        # Download: needs remote files selected
+        # Collect selected file names from remote tree
+        remote_names: list[str] = []
         remote_indexes = remote_sel.selectedIndexes() if remote_sel else []
         has_remote_files = False
+        seen_remote = set()
         for idx in remote_indexes:
             if idx.column() == 0:
                 node = self._remote_model.node_at(idx)
                 if node and not node.get("is_dir"):
-                    has_remote_files = True
-                    break
+                    name = node.get("name", "")
+                    if name not in seen_remote:
+                        seen_remote.add(name)
+                        remote_names.append(name)
+                        has_remote_files = True
         self._download_btn.setEnabled(has_remote_files and self._refresh_btn.isEnabled())
 
-        # Update selection info
-        local_count = sum(1 for idx in local_indexes if idx.column() == 0 and not self._local_model.isDir(idx))
-        remote_count = sum(1 for idx in remote_indexes if idx.column() == 0)
-
+        # ── Update selection info with file names ──
         parts = []
-        if local_count:
-            parts.append(f"Local: {local_count} file(s)")
-        if remote_count:
-            parts.append(f"Remote: {remote_count} item(s)")
-        self._selection_label.setText(" | ".join(parts) if parts else "")
+        if local_names:
+            label = f"↑ {len(local_names)}: {', '.join(local_names[:3])}"
+            if len(local_names) > 3:
+                label += f" …(+{len(local_names) - 3})"
+            parts.append(label)
+        if remote_names:
+            label = f"↓ {len(remote_names)}: {', '.join(remote_names[:3])}"
+            if len(remote_names) > 3:
+                label += f" …(+{len(remote_names) - 3})"
+            parts.append(label)
+
+        has_any_selection = bool(local_names or remote_names)
+        self._selection_info.setText(" | ".join(parts) if parts else "")
+        self._clear_sel_btn.setVisible(has_any_selection)
