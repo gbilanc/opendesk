@@ -279,7 +279,9 @@ class AudioManager:
         if _platform.system() == "Windows":
             import os as _os
             _system32 = r"C:\Windows\System32"
-            if _os.path.isdir(_system32) and _system32 not in _os.environ["PATH"]:
+            # Must check exact PATH entry, not substring — otherwise
+            # C:\Windows\System32\Wbem etc. cause a false positive.
+            if _os.path.isdir(_system32) and _system32 not in _os.environ["PATH"].split(_os.pathsep):
                 _os.environ["PATH"] += _os.pathsep + _system32
 
         try:
