@@ -645,8 +645,6 @@ dependencies = [
     { name = "argon2-cffi" },
     { name = "av" },
     { name = "cryptography" },
-    { name = "dbus-next" },
-    { name = "evdev" },
     { name = "msgpack" },
     { name = "mss" },
     { name = "numpy" },
@@ -654,7 +652,6 @@ dependencies = [
     { name = "pillow" },
     { name = "pynacl" },
     { name = "pyside6" },
-    { name = "python-xlib" },
     { name = "pyzmq" },
     { name = "websockets" },
 ]
@@ -677,6 +674,9 @@ wayland = [
     { name = "dbus-next" },
     { name = "evdev" },
 ]
+x11 = [
+    { name = "python-xlib" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -685,9 +685,7 @@ requires-dist = [
     { name = "av", specifier = ">=12.0.0" },
     { name = "black", marker = "extra == 'dev'", specifier = ">=24.0" },
     { name = "cryptography", specifier = ">=41.0.7" },
-    { name = "dbus-next", specifier = ">=0.2.3" },
     { name = "dbus-next", marker = "extra == 'wayland'", specifier = ">=0.2.3" },
-    { name = "evdev", specifier = ">=1.9.3" },
     { name = "evdev", marker = "extra == 'wayland'", specifier = ">=1.6.0" },
     { name = "msgpack", specifier = ">=1.0.0" },
     { name = "mss", specifier = ">=9.0.0" },
@@ -700,13 +698,13 @@ requires-dist = [
     { name = "pyside6", specifier = ">=6.10.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
-    { name = "python-xlib", specifier = ">=0.33" },
+    { name = "python-xlib", marker = "extra == 'x11'", specifier = ">=0.33" },
     { name = "pyzmq", specifier = ">=26.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.3.0" },
     { name = "soundcard", marker = "extra == 'audio'", specifier = ">=0.4.0" },
     { name = "websockets", specifier = ">=10.4" },
 ]
-provides-extras = ["dev", "wayland", "win", "macos", "audio"]
+provides-extras = ["dev", "x11", "wayland", "win", "macos", "audio"]
 
 [[package]]
 name = "packaging"
