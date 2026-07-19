@@ -817,9 +817,10 @@ class MainWindow(QMainWindow):
                     Message(MessageType.CAMERA_START, {"enabled": False})
                 )
         self._camera_indicator.setVisible(True)
-        # Sync viewer toolbar button state
+        # Sync viewer toolbar button state and overlay visibility
         if self._viewer_window:
             self._viewer_window.set_camera_checked(checked)
+            self._viewer_window.viewer.set_camera_active(checked)
         self.act_toggle_camera.setChecked(checked)
         logger.info("Camera toggled: %s", "ON" if checked else "OFF")
 
