@@ -19,7 +19,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon, QPalette, QColor
 from PySide6.QtWidgets import QApplication
 
-from opendesk.utils.logger import setup_logging
+from opendesk.utils.logger import parse_log_level, setup_logging
 from opendesk.ui.main_window import MainWindow
 
 logger = logging.getLogger(__name__)
@@ -110,9 +110,35 @@ def get_current_theme() -> str:
     return _current_theme
 
 
-def main() -> None:
-    """Start the OpenDesk application."""
-    setup_logging()
+def main_release() -> None:
+    """Start OpenDesk in release mode (WARNING+ messages only)."""
+    main(log_level=logging.WARNING)
+
+
+def main(log_level: int | None = None) -> None:
+    """Start the OpenDesk application.
+
+    Parameters
+    ----------
+    log_level : int | None
+        Optional logging level override (e.g. ``logging.WARNING``).
+        If not provided, falls back to ``OPENDESK_LOG_LEVEL`` env var,
+        then to ``logging.DEBUG``.
+    """
+    # Parse --log-level from CLI before Qt processes argv
+    cli_level: int | None = None
+    for i, arg in enumerate(sys.argv[1:], start=1):
+        if arg.startswith("--log-level="):
+            cli_level = parse_log_level(arg.split("=", 1)[1])
+            del sys.argv[i]
+            break
+        if arg == "--log-level" and i + 1 < len(sys.argv):
+            cli_level = parse_log_level(sys.argv[i + 1])
+            del sys.argv[i : i + 2]
+            break
+
+    effective_level = log_level if log_level is not None else cli_level
+    setup_logging(level=effective_level)
     version = __import__("opendesk").__version__
     logger.info("Starting OpenDesk v%s", version)
 
