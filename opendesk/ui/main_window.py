@@ -796,26 +796,25 @@ class MainWindow(QMainWindow):
     def _on_toggle_camera(self, checked: bool) -> None:
         """Toggle webcam streaming on/off."""
         self._stream.camera_enabled = checked
+        # Update indicator
         if checked:
             self._stream._start_camera_capture()
             self._camera_indicator.setText("Cam On")
-            self._camera_indicator.setStyleSheet("font-size: 12px; font-weight: 700; color: #22c55e; padding: 0 6px;")
-            # Notify remote peer that camera stream started
-            if self._connection.relay.is_connected:
-                from opendesk.network.protocol import Message, MessageType
-                self._connection.relay.send_message(
-                    Message(MessageType.CAMERA_START, {"enabled": True})
-                )
+            self._camera_indicator.setStyleSheet(
+                "font-size: 12px; font-weight: 700; color: #22c55e; padding: 0 6px;"
+            )
         else:
             self._stream._stop_camera_capture()
             self._camera_indicator.setText("Cam Off")
-            self._camera_indicator.setStyleSheet("font-size: 12px; font-weight: 600; color: #94a3b8; padding: 0 6px;")
-            # Notify remote peer that camera stream stopped
-            if self._connection.relay.is_connected:
-                from opendesk.network.protocol import Message, MessageType
-                self._connection.relay.send_message(
-                    Message(MessageType.CAMERA_START, {"enabled": False})
-                )
+            self._camera_indicator.setStyleSheet(
+                "font-size: 12px; font-weight: 600; color: #94a3b8; padding: 0 6px;"
+            )
+
+        # Notify remote peer
+        if self._connection.relay.is_connected:
+            self._connection.relay.send_message(
+                Message(MessageType.CAMERA_START, {"enabled": checked})
+            )
         self._camera_indicator.setVisible(True)
         # Sync viewer toolbar button state and overlay visibility
         if self._viewer_window:

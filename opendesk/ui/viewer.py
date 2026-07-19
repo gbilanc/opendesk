@@ -27,6 +27,7 @@ from PySide6.QtCore import (
     QPointF,
 )
 from PySide6.QtGui import (
+    QAction,
     QBrush,
     QColor,
     QFont,
@@ -36,6 +37,7 @@ from PySide6.QtGui import (
     QPen,
     QPixmap,
     QWheelEvent,
+    Qt as QtKey,
 )
 from PySide6.QtWidgets import (
     QFrame,
@@ -79,8 +81,8 @@ _CAMERA_OVERLAY_MARGIN = 12
 class CameraOverlay(QWidget):
     """Picture-in-picture overlay for the remote webcam feed.
 
-    Drawn entirely via paintEvent (no child QLabel) so that mouse events
-    work reliably for both dragging and the close button.
+    Drawn entirely via paintEvent (no child widgets) so mouse events
+    work reliably for dragging.
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -520,7 +522,6 @@ class RemoteViewer(QGraphicsView):
         pixmap.fill(QColor("#1e293b"))
 
         # Draw centered text on the placeholder
-        from PySide6.QtGui import QPainter
         painter = QPainter(pixmap)
         painter.setPen(QColor("#64748b"))
         font = QFont("Segoe UI", 18)
@@ -589,8 +590,6 @@ class RemoteViewer(QGraphicsView):
 
     def _key_to_name(self, qt_key: int) -> str | None:
         """Convert a Qt key code to a remote key name."""
-        from PySide6.QtGui import Qt as QtKey
-
         # Common keys
         key_map = {
             QtKey.Key_Return: "return",
@@ -752,8 +751,6 @@ class ViewerToolbar(QToolBar):
         self._setup_buttons()
 
     def _setup_buttons(self) -> None:
-        from PySide6.QtGui import QAction
-
         # Fit to window
         fit_act = QAction("⊞ Fit", self)
         fit_act.setToolTip("Fit remote screen to window")
@@ -969,9 +966,10 @@ class ViewerWindow(QMainWindow):
         """Send Ctrl+Alt+Del to the remote peer."""
         # Send Ctrl down, Alt down, Delete down, Delete up, Alt up, Ctrl up
         if hasattr(self._viewer, 'remote_key_event'):
-            import itertools
-            for key, pressed in [("ctrl", True), ("alt", True), ("delete", True),
-                                  ("delete", False), ("alt", False), ("ctrl", False)]:
+            for key, pressed in [
+                ("ctrl", True), ("alt", True), ("delete", True),
+                ("delete", False), ("alt", False), ("ctrl", False),
+            ]:
                 self._viewer.remote_key_event.emit(key, pressed)
 
     def _on_disconnect_clicked(self) -> None:
