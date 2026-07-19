@@ -176,9 +176,22 @@ This approach saves bandwidth and encoding CPU for typical desktop usage.
 ## Commands
 
 ```bash
-uv run opendesk  # Start the remote desktop client
-uv run pytest    # Run all tests
+uv run opendesk           # Start the remote desktop client (DEBUG log level)
+uv run opendesk-release   # Start in release mode (WARNING+ messages only)
+uv run opendesk --log-level=WARNING  # Custom log level
+uv run pytest             # Run all tests
 ```
+
+### Log level
+
+Log verbosity is controlled by (highest precedence first):
+
+1. **`--log-level`** CLI argument — `uv run opendesk --log-level=WARNING`
+2. **`OPENDESK_LOG_LEVEL`** environment variable — `OPENDESK_LOG_LEVEL=ERROR uv run opendesk`
+3. **Entry point default** — `opendesk` defaults to `DEBUG` (development),
+   `opendesk-release` defaults to `WARNING` (distribution)
+
+Valid values: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`.
 
 ## Relay server
 
