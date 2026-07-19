@@ -18,6 +18,7 @@ from PIL import Image
 
 from PySide6.QtCore import (
     Qt,
+    QRect,
     QRectF,
     QSize,
     QTimer,
@@ -78,102 +79,154 @@ _CAMERA_OVERLAY_MARGIN = 12
 class CameraOverlay(QWidget):
     """Picture-in-picture overlay for the remote webcam feed.
 
-    Can be dragged by the user and has a close button.
+    Drawn entirely via paintEvent (no child QLabel) so that mouse events
+    work reliably for both dragging and the close button.
     """
 
     closed = Signal()  # emitted when user clicks the close button
 
+    # Close button metrics
+    _BTN_SIZE = 16
+    _BTN_MARGIN = 2
+    _BTN_X = _CAMERA_OVERLAY_WIDTH - _BTN_SIZE - _BTN_MARGIN
+    _BTN_Y = _BTN_MARGIN
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setFixedSize(_CAMERA_OVERLAY_WIDTH, _CAMERA_OVERLAY_HEIGHT)
-        self.setStyleSheet(
-            "background-color: #0f172a;"
-            "border: 2px solid #1e293b;"
-            "border-radius: 8px;"
-        )
+        self.setMouseTracking(True)
 
-        # Video label — transparent to mouse events so drag works everywhere
-        self._video_label = QLabel(self)
-        self._video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._video_label.setText("\U0001f4f7")
-        self._video_label.setStyleSheet("background: transparent; font-size: 28px;")
-        self._video_label.setGeometry(2, 2, _CAMERA_OVERLAY_WIDTH - 4, _CAMERA_OVERLAY_HEIGHT - 28)
-        self._video_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-
-        # Close button (small) — bring to front so it is clickable above the video label
-        self._close_btn = QPushButton(self)
-        self._close_btn.setFixedSize(16, 16)
-        self._close_btn.move(_CAMERA_OVERLAY_WIDTH - 20, 2)
-        self._close_btn.setStyleSheet(
-            "QPushButton {"
-            "  background: #ef4444; color: white; border-radius: 8px;"
-            "  font-size: 9px; font-weight: bold;"
-            "  border: none;"
-            "  padding: 0px;"
-            "}"
-            "QPushButton:hover { background: #dc2626; }"
-        )
-        self._close_btn.setText("\u2716")
-        self._close_btn.raise_()
-        self._close_btn.clicked.connect(self._on_close)
+        self._pixmap: QPixmap | None = None  # current camera frame
+        self._hover_close: bool = False       # cursor over close button
 
         # Drag state
         self._dragging = False
         self._drag_offset = QPoint()
+        self._user_moved = False
 
-    # ── public API ──
+    # ── public API ──────────────────────────────────────────────────
 
     def set_pixmap(self, pixmap: QPixmap) -> None:
-        """Set the camera frame pixmap, scaled to fit."""
-        scaled = pixmap.scaled(
-            _CAMERA_OVERLAY_WIDTH - 8,
-            _CAMERA_OVERLAY_HEIGHT - 32,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        self._video_label.setPixmap(scaled)
+        """Set the camera frame (will be scaled to fit on paint)."""
+        self._pixmap = pixmap
+        self.update()  # trigger repaint
 
     def clear_frame(self) -> None:
         """Reset to placeholder icon."""
-        self._video_label.clear()
-        self._video_label.setText("📷")
+        self._pixmap = None
+        self.update()
 
-    # ── close ───────────────────────────────────────────────────────
+    # ── paint ───────────────────────────────────────────────────────
 
-    def _on_close(self) -> None:
-        """Hide the overlay and emit closed signal."""
-        self.hide()
-        self.closed.emit()
+    def paintEvent(self, event) -> None:  # noqa: N802
 
-    # ── drag support ───────────────────────────────────────────────
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        r = self.rect()
+
+        # Background with rounded corners
+        path = QPainterPath()
+        path.addRoundedRect(r, 8, 8)
+        painter.setClipPath(path)
+        painter.fillPath(path, QColor("#0f172a"))
+
+        # Border
+        painter.setPen(QPen(QColor("#1e293b"), 2))
+        painter.drawRoundedRect(r.adjusted(1, 1, -1, -1), 8, 8)
+
+        # Video frame or placeholder
+        if self._pixmap is not None and not self._pixmap.isNull():
+            scaled = self._pixmap.scaled(
+                _CAMERA_OVERLAY_WIDTH - 4,
+                _CAMERA_OVERLAY_HEIGHT - 24,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            x = (_CAMERA_OVERLAY_WIDTH - scaled.width()) // 2
+            y = 2
+            painter.drawPixmap(x, y, scaled)
+        else:
+            painter.setPen(QColor("#64748b"))
+            font = QFont("Segoe UI Emoji", 24)
+            painter.setFont(font)
+            painter.drawText(
+                r.adjusted(0, 0, 0, -20),
+                Qt.AlignmentFlag.AlignCenter,
+                "\U0001f4f7",
+            )
+
+        # Close button (red circle with X)
+        btn_r = self._close_btn_rect()
+        if self._hover_close:
+            painter.setBrush(QBrush(QColor("#dc2626")))
+        else:
+            painter.setBrush(QBrush(QColor("#ef4444")))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(btn_r)
+
+        painter.setPen(QPen(QColor("white"), 1.5))
+        cx = btn_r.center().x()
+        cy = btn_r.center().y()
+        s = 4  # half-size of the X
+        painter.drawLine(cx - s, cy - s, cx + s, cy + s)
+        painter.drawLine(cx + s, cy - s, cx - s, cy + s)
+
+        painter.end()
+
+    def _close_btn_rect(self):
+        """Return the close button rectangle."""
+        return QRect(
+            self._BTN_X, self._BTN_Y,
+            self._BTN_SIZE, self._BTN_SIZE,
+        )
+
+    # ── mouse events ───────────────────────────────────────────────
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
-            self._dragging = True
-            self._drag_offset = event.globalPosition().toPoint() - self.parent().mapToGlobal(self.pos())
-        super().mousePressEvent(event)
+            if self._close_btn_rect().contains(event.position().toPoint()):
+                # Close button clicked
+                self.hide()
+                self.closed.emit()
+            else:
+                # Start drag
+                self._dragging = True
+                self._drag_offset = event.globalPosition().toPoint() - self.parent().mapToGlobal(self.pos())
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        pos = event.position().toPoint()
+        # Update close button hover state
+        hover = self._close_btn_rect().contains(pos)
+        if hover != self._hover_close:
+            self._hover_close = hover
+            self.update()
+
         if self._dragging:
             parent = self.parent()
             if parent:
                 global_pos = event.globalPosition().toPoint() - self._drag_offset
                 new_pos = parent.mapFromGlobal(global_pos)
-                # Clamp within parent bounds
                 pw, ph = parent.width(), parent.height()
                 new_pos.setX(max(0, min(new_pos.x(), pw - _CAMERA_OVERLAY_WIDTH)))
                 new_pos.setY(max(0, min(new_pos.y(), ph - _CAMERA_OVERLAY_HEIGHT)))
                 self.move(new_pos)
-                # Remember user moved it — don't snap back on resize
                 self._user_moved = True
-        super().mouseMoveEvent(event)
+        # Update cursor for close button hover
+        if self._hover_close:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
             self._dragging = False
-        super().mouseReleaseEvent(event)
 
-
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        if self._hover_close:
+            self._hover_close = False
+            self.update()
+        super().leaveEvent(event)
 # ---------------------------------------------------------------------------
 # RemoteViewer — main display widget
 # ---------------------------------------------------------------------------
