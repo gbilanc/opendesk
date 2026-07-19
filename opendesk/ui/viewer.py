@@ -84,21 +84,12 @@ class CameraOverlay(QWidget):
     work reliably for both dragging and the close button.
     """
 
-    closed = Signal()  # emitted when user clicks the close button
-
-    # Close button metrics
-    _BTN_SIZE = 16
-    _BTN_MARGIN = 2
-    _BTN_X = _CAMERA_OVERLAY_WIDTH - _BTN_SIZE - _BTN_MARGIN
-    _BTN_Y = _BTN_MARGIN
-
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setFixedSize(_CAMERA_OVERLAY_WIDTH, _CAMERA_OVERLAY_HEIGHT)
         self.setMouseTracking(True)
 
         self._pixmap: QPixmap | None = None  # current camera frame
-        self._hover_close: bool = False       # cursor over close button
 
         # Drag state
         self._dragging = False
@@ -157,52 +148,16 @@ class CameraOverlay(QWidget):
                 "\U0001f4f7",
             )
 
-        # Close button (red circle with X)
-        btn_r = self._close_btn_rect()
-        if self._hover_close:
-            painter.setBrush(QBrush(QColor("#dc2626")))
-        else:
-            painter.setBrush(QBrush(QColor("#ef4444")))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawEllipse(btn_r)
-
-        painter.setPen(QPen(QColor("white"), 1.5))
-        cx = btn_r.center().x()
-        cy = btn_r.center().y()
-        s = 4  # half-size of the X
-        painter.drawLine(cx - s, cy - s, cx + s, cy + s)
-        painter.drawLine(cx + s, cy - s, cx - s, cy + s)
-
         painter.end()
-
-    def _close_btn_rect(self):
-        """Return the close button rectangle."""
-        return QRect(
-            self._BTN_X, self._BTN_Y,
-            self._BTN_SIZE, self._BTN_SIZE,
-        )
 
     # ── mouse events ───────────────────────────────────────────────
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
-            if self._close_btn_rect().contains(event.position().toPoint()):
-                # Close button clicked
-                self.hide()
-                self.closed.emit()
-            else:
-                # Start drag
-                self._dragging = True
-                self._drag_offset = event.globalPosition().toPoint() - self.parent().mapToGlobal(self.pos())
+            self._dragging = True
+            self._drag_offset = event.globalPosition().toPoint() - self.parent().mapToGlobal(self.pos())
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
-        pos = event.position().toPoint()
-        # Update close button hover state
-        hover = self._close_btn_rect().contains(pos)
-        if hover != self._hover_close:
-            self._hover_close = hover
-            self.update()
-
         if self._dragging:
             parent = self.parent()
             if parent:
@@ -213,21 +168,10 @@ class CameraOverlay(QWidget):
                 new_pos.setY(max(0, min(new_pos.y(), ph - _CAMERA_OVERLAY_HEIGHT)))
                 self.move(new_pos)
                 self._user_moved = True
-        # Update cursor for close button hover
-        if self._hover_close:
-            self.setCursor(Qt.CursorShape.PointingHandCursor)
-        else:
-            self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
             self._dragging = False
-
-    def leaveEvent(self, event) -> None:  # noqa: N802
-        if self._hover_close:
-            self._hover_close = False
-            self.update()
-        super().leaveEvent(event)
 # ---------------------------------------------------------------------------
 # RemoteViewer — main display widget
 # ---------------------------------------------------------------------------
@@ -324,7 +268,7 @@ class RemoteViewer(QGraphicsView):
         self._camera_active: bool = False
         self._camera_overlay = CameraOverlay(self.viewport())
         self._camera_overlay.setVisible(False)
-        self._camera_overlay.closed.connect(self._on_camera_overlay_closed)
+
 
         # Placeholder while disconnected
         self._show_placeholder()
@@ -719,9 +663,7 @@ class RemoteViewer(QGraphicsView):
         except Exception as e:
             logger.warning("Camera overlay update error: %s", e)
 
-    def _on_camera_overlay_closed(self) -> None:
-        """User closed the camera PiP overlay — deactivate."""
-        self._camera_active = False
+
 
     def _reposition_camera_overlay(self) -> None:
         """Position the camera PiP at the top-right of the viewport.
