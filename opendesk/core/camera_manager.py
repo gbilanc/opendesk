@@ -14,6 +14,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
+import contextlib
+import os
+
 import cv2
 import numpy as np
 
@@ -61,28 +64,71 @@ def list_cameras(max_devices: int = 10) -> list[dict]:
 
     Returns a list of dicts with ``index`` and ``name`` keys.
     Name may be empty if the backend doesn't provide it.
+
+    Suppresses OpenCV's stderr noise during enumeration and stops
+    early after 3 consecutive failed indices.
     """
     cameras = []
-    for i in range(max_devices):
-        try:
-            cap = cv2.VideoCapture(i, cv2.CAP_ANY)
-            if cap is None or not cap.isOpened():
+
+    # Suppress OpenCV spam on stderr
+    with _suppress_opencv_stderr():
+        consecutive_failures = 0
+        for i in range(max_devices):
+            try:
+                cap = cv2.VideoCapture(i, cv2.CAP_ANY)
+                if cap is None or not cap.isOpened():
+                    cap.release()
+                    consecutive_failures += 1
+                    if consecutive_failures >= 3:
+                        break
+                    continue
+
+                # Try to read one frame to confirm the device works
+                ret, _ = cap.read()
+                if not ret:
+                    cap.release()
+                    consecutive_failures += 1
+                    if consecutive_failures >= 3:
+                        break
+                    continue
+
+                # Success — reset consecutive failures
+                consecutive_failures = 0
+
+                # Get the camera name (may be empty)
+                try:
+                    name = cap.getBackendName()
+                except Exception:
+                    name = ""
+                if not name:
+                    name = f"Camera {i}"
+                cameras.append({"index": i, "name": name})
                 cap.release()
+            except Exception:
+                consecutive_failures += 1
+                if consecutive_failures >= 3:
+                    break
                 continue
-            # Try to read one frame to confirm the device works
-            ret, _ = cap.read()
-            if not ret:
-                cap.release()
-                continue
-            # Get the camera name (may be empty)
-            name = cap.getBackendName()
-            if not name:
-                name = cap.get(cv2.CAP_PROP_BRAND)
-            cameras.append({"index": i, "name": name or f"Camera {i}"})
-            cap.release()
-        except Exception:
-            continue
     return cameras
+
+
+@contextlib.contextmanager
+def _suppress_opencv_stderr():
+    """Temporarily redirect stderr to /dev/null to suppress OpenCV spam.
+
+    OpenCV's FFMPEG backend prints error messages directly to stderr
+    even when Python exceptions are caught.  This context manager
+    silences that noise during camera enumeration.
+    """
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        old_stderr = os.dup(2)
+        os.dup2(devnull, 2)
+        os.close(devnull)
+        yield
+    finally:
+        os.dup2(old_stderr, 2)
+        os.close(old_stderr)
 
 
 # ---------------------------------------------------------------------------
