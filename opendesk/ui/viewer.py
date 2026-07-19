@@ -99,15 +99,16 @@ class CameraOverlay(QWidget):
         self._video_label.setStyleSheet("background: transparent; font-size: 28px;")
         self._video_label.setGeometry(2, 2, _CAMERA_OVERLAY_WIDTH - 4, _CAMERA_OVERLAY_HEIGHT - 28)
 
-        # Close button — bring to front so it is clickable above the video label
+        # Close button (small) — bring to front so it is clickable above the video label
         self._close_btn = QPushButton(self)
-        self._close_btn.setFixedSize(22, 22)
-        self._close_btn.move(_CAMERA_OVERLAY_WIDTH - 26, 4)
+        self._close_btn.setFixedSize(16, 16)
+        self._close_btn.move(_CAMERA_OVERLAY_WIDTH - 20, 2)
         self._close_btn.setStyleSheet(
             "QPushButton {"
-            "  background: #ef4444; color: white; border-radius: 11px;"
-            "  font-size: 11px; font-weight: bold;"
+            "  background: #ef4444; color: white; border-radius: 8px;"
+            "  font-size: 9px; font-weight: bold;"
             "  border: none;"
+            "  padding: 0px;"
             "}"
             "QPushButton:hover { background: #dc2626; }"
         )
@@ -162,6 +163,8 @@ class CameraOverlay(QWidget):
                 new_pos.setX(max(0, min(new_pos.x(), pw - _CAMERA_OVERLAY_WIDTH)))
                 new_pos.setY(max(0, min(new_pos.y(), ph - _CAMERA_OVERLAY_HEIGHT)))
                 self.move(new_pos)
+                # Remember user moved it — don't snap back on resize
+                self._user_moved = True
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
@@ -637,10 +640,15 @@ class RemoteViewer(QGraphicsView):
     # ── Camera PiP overlay ────────────────────────────────────────────
 
     def set_camera_active(self, active: bool) -> None:
-        """Show or hide the camera picture-in-picture overlay."""
+        """Show or hide the camera picture-in-picture overlay.
+
+        When showing, resets position to top-right (clears any user drag offset).
+        """
         self._camera_active = active
         self._camera_overlay.setVisible(active)
         if active:
+            # Reset position to top-right on fresh activation
+            self._camera_overlay._user_moved = False
             self._reposition_camera_overlay()
         else:
             self._camera_overlay.clear_frame()
@@ -661,13 +669,17 @@ class RemoteViewer(QGraphicsView):
         self._camera_active = False
 
     def _reposition_camera_overlay(self) -> None:
-        """Position the camera PiP at the top-right of the viewport."""
+        """Position the camera PiP at the top-right of the viewport.
+
+        Does NOT reposition if the user has manually dragged the overlay.
+        """
         if self._camera_overlay and self._camera_overlay.isVisible():
-            # Only reposition if user hasn't manually moved it
-            if not hasattr(self, '_camera_overlay_moved'):
-                x = self.viewport().width() - _CAMERA_OVERLAY_WIDTH - _CAMERA_OVERLAY_MARGIN
-                y = _CAMERA_OVERLAY_MARGIN
-                self._camera_overlay.move(x, y)
+            # Respect user drag — don't snap back
+            if getattr(self._camera_overlay, '_user_moved', False):
+                return
+            x = self.viewport().width() - _CAMERA_OVERLAY_WIDTH - _CAMERA_OVERLAY_MARGIN
+            y = _CAMERA_OVERLAY_MARGIN
+            self._camera_overlay.move(x, y)
 
     def drawForeground(self, painter: QPainter, rect: QRectF) -> None:  # noqa: N802
         """Paint HUD overlay on top of the remote view."""
