@@ -260,13 +260,21 @@ class StreamService(QObject):
             self._pipeline.on_tile_sent = lambda data, x, y, tw, th, pts: _on_send(data)
             self._pipeline.start()
 
-            # Avvia cattura audio se abilitata
+            # Avvia cattura audio se abilitata (non blocca la pipeline in caso di errore)
             if self._audio_enabled:
-                self._start_audio_capture()
+                try:
+                    self._start_audio_capture()
+                except Exception as e:
+                    logger.warning("Failed to start audio capture: %s", e)
+                    self._audio_enabled = False
 
-            # Avvia cattura webcam se abilitata
+            # Avvia cattura webcam se abilitata (non blocca la pipeline in caso di errore)
             if self._camera_enabled:
-                self._start_camera_capture()
+                try:
+                    self._start_camera_capture()
+                except Exception as e:
+                    logger.warning("Failed to start camera capture: %s", e)
+                    self._camera_enabled = False
 
             # Timer per bandwidth adaptation (1s)
             self._bw_timer.start(1000)
@@ -298,26 +306,42 @@ class StreamService(QObject):
 
     def _start_audio_capture(self) -> None:
         """Avvia la cattura del microfono in un thread separato."""
+        if self._audio_manager.is_capturing:
+            logger.debug("Audio capture already running")
+            return
         self._audio_manager.direction = AudioDirection.MIC_ONLY
+        # start_capture può lanciare eccezioni (es. codec Opus non disponibile)
         self._audio_manager.start_capture(self._relay.send_message)
 
     def _stop_audio_capture(self) -> None:
         """Ferma la cattura del microfono."""
-        self._audio_manager.stop_capture()
+        try:
+            self._audio_manager.stop_capture()
+        except Exception as e:
+            logger.debug("Audio stop error (ignored): %s", e)
 
     def play_audio_frame(self, data: bytes) -> None:
         """Decodifica e riproduce un pacchetto audio ricevuto (lato client)."""
-        self._audio_manager.play_audio_frame(data)
+        try:
+            self._audio_manager.play_audio_frame(data)
+        except Exception as e:
+            logger.debug("Audio playback error (ignored): %s", e)
 
     # ── camera capture (host side) ─────────────────────────────────────
 
     def _start_camera_capture(self) -> None:
         """Avvia la cattura della webcam in un thread separato."""
+        if self._camera_manager.is_capturing:
+            logger.debug("Camera capture already running")
+            return
         self._camera_manager.start_capture(self._relay.send_message)
 
     def _stop_camera_capture(self) -> None:
         """Ferma la cattura della webcam."""
-        self._camera_manager.stop_capture()
+        try:
+            self._camera_manager.stop_capture()
+        except Exception as e:
+            logger.debug("Camera stop error (ignored): %s", e)
 
     @Slot()
     def _force_keyframe(self) -> None:
