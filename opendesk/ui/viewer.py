@@ -86,28 +86,23 @@ class CameraOverlay(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setFixedSize(_CAMERA_OVERLAY_WIDTH, _CAMERA_OVERLAY_HEIGHT)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
-
-        # Container widget for the rounded background
-        self._container = QWidget(self)
-        self._container.setGeometry(0, 0, _CAMERA_OVERLAY_WIDTH, _CAMERA_OVERLAY_HEIGHT)
-        self._container.setStyleSheet(
+        self.setStyleSheet(
             "background-color: #0f172a;"
             "border: 2px solid #1e293b;"
             "border-radius: 8px;"
         )
 
         # Video label
-        self._video_label = QLabel(self._container)
+        self._video_label = QLabel(self)
         self._video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._video_label.setText("📷")
+        self._video_label.setText("\U0001f4f7")
         self._video_label.setStyleSheet("background: transparent; font-size: 28px;")
         self._video_label.setGeometry(2, 2, _CAMERA_OVERLAY_WIDTH - 4, _CAMERA_OVERLAY_HEIGHT - 28)
 
-        # Close button
-        self._close_btn = QPushButton("✖", self._container)
+        # Close button — bring to front so it is clickable above the video label
+        self._close_btn = QPushButton(self)
         self._close_btn.setFixedSize(22, 22)
+        self._close_btn.move(_CAMERA_OVERLAY_WIDTH - 26, 4)
         self._close_btn.setStyleSheet(
             "QPushButton {"
             "  background: #ef4444; color: white; border-radius: 11px;"
@@ -116,14 +111,15 @@ class CameraOverlay(QWidget):
             "}"
             "QPushButton:hover { background: #dc2626; }"
         )
-        self._close_btn.move(_CAMERA_OVERLAY_WIDTH - 26, 4)
+        self._close_btn.setText("\u2716")
+        self._close_btn.raise_()
         self._close_btn.clicked.connect(self._on_close)
 
         # Drag state
         self._dragging = False
         self._drag_offset = QPoint()
 
-    # ── public API ──────────────────────────────────────────────────
+    # ── public API ──
 
     def set_pixmap(self, pixmap: QPixmap) -> None:
         """Set the camera frame pixmap, scaled to fit."""
@@ -268,7 +264,7 @@ class RemoteViewer(QGraphicsView):
 
         # ── Camera PiP overlay (top-right, draggable) ──
         self._camera_active: bool = False
-        self._camera_overlay = CameraOverlay(self)
+        self._camera_overlay = CameraOverlay(self.viewport())
         self._camera_overlay.setVisible(False)
         self._camera_overlay.closed.connect(self._on_camera_overlay_closed)
 
@@ -644,7 +640,9 @@ class RemoteViewer(QGraphicsView):
         """Show or hide the camera picture-in-picture overlay."""
         self._camera_active = active
         self._camera_overlay.setVisible(active)
-        if not active:
+        if active:
+            self._reposition_camera_overlay()
+        else:
             self._camera_overlay.clear_frame()
 
     def update_camera_frame(self, jpeg_data: bytes) -> None:
