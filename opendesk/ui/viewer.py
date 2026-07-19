@@ -92,12 +92,13 @@ class CameraOverlay(QWidget):
             "border-radius: 8px;"
         )
 
-        # Video label
+        # Video label — transparent to mouse events so drag works everywhere
         self._video_label = QLabel(self)
         self._video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._video_label.setText("\U0001f4f7")
         self._video_label.setStyleSheet("background: transparent; font-size: 28px;")
         self._video_label.setGeometry(2, 2, _CAMERA_OVERLAY_WIDTH - 4, _CAMERA_OVERLAY_HEIGHT - 28)
+        self._video_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
         # Close button (small) — bring to front so it is clickable above the video label
         self._close_btn = QPushButton(self)
