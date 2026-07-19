@@ -33,6 +33,7 @@ from PySide6.QtGui import (
     QFont,
     QImage,
     QPainter,
+    QPainterPath,
     QPen,
     QPixmap,
     QWheelEvent,
