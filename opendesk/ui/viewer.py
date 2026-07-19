@@ -18,7 +18,6 @@ from PIL import Image
 
 from PySide6.QtCore import (
     Qt,
-    QRect,
     QRectF,
     QSize,
     QTimer,
@@ -641,13 +640,11 @@ class RemoteViewer(QGraphicsView):
     def set_camera_active(self, active: bool) -> None:
         """Show or hide the camera picture-in-picture overlay.
 
-        When showing, resets position to top-right (clears any user drag offset).
+        Keeps the last user-dragged position across toggles.
         """
         self._camera_active = active
         self._camera_overlay.setVisible(active)
         if active:
-            # Reset position to top-right on fresh activation
-            self._camera_overlay._user_moved = False
             self._reposition_camera_overlay()
         else:
             self._camera_overlay.clear_frame()
@@ -666,13 +663,15 @@ class RemoteViewer(QGraphicsView):
 
 
     def _reposition_camera_overlay(self) -> None:
-        """Position the camera PiP at the top-right of the viewport.
-
-        Does NOT reposition if the user has manually dragged the overlay.
-        """
+        """Ensure the overlay is visible. First time places it at top-right."""
         if self._camera_overlay and self._camera_overlay.isVisible():
-            # Respect user drag — don't snap back
             if getattr(self._camera_overlay, '_user_moved', False):
+                # Clamp user-placed position so it stays on-screen after a resize
+                vp = self.viewport()
+                ox, oy = self._camera_overlay.pos().x(), self._camera_overlay.pos().y()
+                ox = max(0, min(ox, vp.width() - _CAMERA_OVERLAY_WIDTH))
+                oy = max(0, min(oy, vp.height() - _CAMERA_OVERLAY_HEIGHT))
+                self._camera_overlay.move(ox, oy)
                 return
             x = self.viewport().width() - _CAMERA_OVERLAY_WIDTH - _CAMERA_OVERLAY_MARGIN
             y = _CAMERA_OVERLAY_MARGIN
