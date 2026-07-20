@@ -27,6 +27,34 @@ pip install -e .
 opendesk
 ```
 
+## OpenDesk Host (solo incoming)
+
+Versione ridotta di OpenDesk che funge solo da **host** (nessuna connessione
+in uscita).  Si connette al relay, mostra **Your ID** e **Password** in una
+finestra compatta, e accetta connessioni in ingresso con streaming, input
+remoto, chat e file transfer.
+
+```bash
+uv run opendesk-host           # Avvia la versione host-only
+uv run opendesk-host --log-level=WARNING
+```
+
+### Cosa fa
+
+- All'avvio si connette al relay e mostra ID + password
+- Accetta solo connessioni **in ingresso** — nessun pannello dispositivi
+- Quando un client remoto si connette: **streaming schermo**, **input remoto**
+- **Chat** e **File transfer** si attivano automaticamente su richiesta del remoto
+- **Settings** per pre-autorizzazione dispositivi (bypass password), video, rete
+
+### Cosa NON fa (rispetto a OpenDesk completo)
+
+- ❌ Connessioni in uscita verso altri computer
+- ❌ Viewer remoto (schermo di un altro PC)
+- ❌ Ricerca dispositivi nella rete
+- ❌ Pulsanti manuali per chat / file transfer (solo da remoto)
+- ❌ Clipboard sync, webcam remota
+
 ## Development
 
 ```bash
@@ -91,6 +119,7 @@ opendesk/
 │   ├── crypto/        # E2E encryption (NaCl Box), Argon2 auth
 │   ├── services/      # Streaming pipeline, connection service
 │   ├── ui/            # PySide6 widgets + QSS themes (light/dark)
+│   ├── host_app.py    # OpenDesk Host: entry point incoming-only
 │   └── utils/         # Logging, platform detection
 ├── tests/             # 123+ tests — unit, integration, edge cases
 └── uv.lock            # Locked dependencies
@@ -278,6 +307,7 @@ top-right corner of the viewer window:
 ```bash
 uv run opendesk           # Start the remote desktop client (DEBUG log level)
 uv run opendesk-release   # Start in release mode (WARNING+ messages only)
+uv run opendesk-host      # Start the host-only version (incoming only)
 uv run opendesk --log-level=WARNING  # Custom log level
 uv run pytest             # Run all tests
 ```
