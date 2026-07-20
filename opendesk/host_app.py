@@ -597,22 +597,10 @@ class HostWindow(QMainWindow):
         layout.addWidget(self._status_label)
 
         # ── Action buttons ──
+        # Solo Settings: Chat e File Transfer si attivano automaticamente
+        # quando il computer remoto li richiede.
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(8)
-
-        self._chat_btn = QPushButton("💬 Chat")
-        self._chat_btn.setFixedHeight(34)
-        self._chat_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._chat_btn.setEnabled(False)
-        self._chat_btn.clicked.connect(self._on_toggle_chat)
-        btn_layout.addWidget(self._chat_btn)
-
-        self._file_btn = QPushButton("📁 File Transfer")
-        self._file_btn.setFixedHeight(34)
-        self._file_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._file_btn.setEnabled(False)
-        self._file_btn.clicked.connect(self._on_toggle_file_transfer)
-        btn_layout.addWidget(self._file_btn)
 
         self._settings_btn = QPushButton("⚙ Settings")
         self._settings_btn.setFixedHeight(34)
@@ -675,14 +663,10 @@ class HostWindow(QMainWindow):
     @Slot(str)
     def _on_peer_connected(self, peer_name: str) -> None:
         self.setWindowTitle("OpenDesk Host — Connected")
-        self._chat_btn.setEnabled(True)
-        self._file_btn.setEnabled(True)
 
     @Slot()
     def _on_peer_disconnected(self) -> None:
         self.setWindowTitle(self.WINDOW_TITLE)
-        self._chat_btn.setEnabled(False)
-        self._file_btn.setEnabled(False)
 
     # ── Slots: azioni ───────────────────────────────────────────────────
 
@@ -690,34 +674,8 @@ class HostWindow(QMainWindow):
     def _on_refresh_session(self) -> None:
         self._service.regenerate_session()
 
-    @Slot()
-    def _on_toggle_chat(self) -> None:
-        if self._chat_panel is None:
-            self._chat_panel = ChatPanel(self)
-            self._chat_panel.message_sent.connect(self._on_chat_message_sent)
-        if self._chat_panel.isVisible():
-            self._chat_panel.hide()
-            self._service.relay.send_message(Message.chat_open(False))
-        else:
-            self._chat_panel.show()
-            self._chat_panel.raise_()
-            self._chat_panel.activateWindow()
-            self._service.relay.send_message(Message.chat_open(True))
-
-    @Slot()
-    def _on_toggle_file_transfer(self) -> None:
-        dock = self._ensure_transfer_dock()
-        if dock.isVisible():
-            dock.hide()
-        else:
-            dock.show()
-            dock.raise_()
-            dock.activateWindow()
-            dock.set_connected(True)
-            dock.set_status("Connected — browsing remote files...")
-            self._service.file_transfer.request_remote_listing(
-                "/", self._service.relay.send_message,
-            )
+    # Chat e File Transfer si aprono SOLO su richiesta del computer remoto.
+    # L'host non ha pulsanti per avviarli manualmente.
 
     @Slot()
     def _on_settings(self) -> None:
@@ -761,11 +719,17 @@ class HostWindow(QMainWindow):
 
     @Slot()
     def _on_file_transfer_event(self) -> None:
-        """Mostra il dock file transfer quando arriva un file."""
+        """Mostra il dock file transfer quando il remoto invia un file."""
         dock = self._ensure_transfer_dock()
         if not dock.isVisible():
             dock.show()
             dock.raise_()
+            dock.activateWindow()
+            dock.set_connected(True)
+            dock.set_status("Connected — file transfer ready")
+            self._service.file_transfer.request_remote_listing(
+                "/", self._service.relay.send_message,
+            )
 
     def _ensure_transfer_dock(self) -> QWidget:
         """Crea il dock file transfer al primo uso (lazy)."""
