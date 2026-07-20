@@ -82,4 +82,5 @@ ignore_missing_imports = true
 [project.scripts]
 opendesk = "opendesk.app:main"
 opendesk-release = "opendesk.app:main_release"
+opendesk-host = "opendesk.host_app:main_host"
 
