@@ -587,12 +587,17 @@ class HostWindow(QMainWindow):
         self._id_display = QLabel("—")
         self._id_display.setObjectName("HostIdDisplay")
         self._id_display.setToolTip(f"Device UUID: {self._service.device_id}\nUsa questo UUID per pre-autorizzare il dispositivo")
+        self._id_display.setFixedHeight(44)
         self._id_display.setStyleSheet(f"""
             QLabel#HostIdDisplay {{
-                font-size: 24px; font-weight: 800;
+                font-size: 26px; font-weight: 800;
                 font-family: {self._FONT_MONO};
                 letter-spacing: 4px;
                 color: {self._C_TEXT};
+                padding: 6px 12px;
+                background: #f8fafc;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
             }}
         """)
         id_row.addWidget(self._id_display)
@@ -623,12 +628,17 @@ class HostWindow(QMainWindow):
 
         self._pwd_display = QLabel("—")
         self._pwd_display.setObjectName("HostPwdDisplay")
+        self._pwd_display.setFixedHeight(44)
         self._pwd_display.setStyleSheet(f"""
             QLabel#HostPwdDisplay {{
-                font-size: 18px; font-weight: 700;
+                font-size: 20px; font-weight: 700;
                 font-family: {self._FONT_MONO};
                 letter-spacing: 3px;
                 color: {self._C_TEXT};
+                padding: 6px 12px;
+                background: #f8fafc;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
             }}
         """)
         pwd_row.addWidget(self._pwd_display)
