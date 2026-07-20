@@ -20,6 +20,16 @@ import os
 import cv2
 import numpy as np
 
+# ── Silence OpenCV's noisy backend errors (V4L2, FFMPEG) ──
+# These fire during camera enumeration on machines without a webcam.
+# Must be set before any cv2.VideoCapture call.
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
+os.environ.setdefault("OPENCV_VIDEOIO_LOG_LEVEL", "ERROR")
+try:
+    cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+except Exception:
+    pass
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
