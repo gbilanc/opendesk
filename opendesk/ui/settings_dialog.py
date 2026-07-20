@@ -53,7 +53,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setMinimumWidth(640)
-        self.setMinimumHeight(560)
+        self.setMinimumHeight(680)
 
         self._settings = QSettings(_ORG, _APP)
         self._registry = device_registry
