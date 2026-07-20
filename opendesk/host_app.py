@@ -474,8 +474,8 @@ class HostWindow(QMainWindow):
     """
 
     WINDOW_TITLE = "OpenDesk Host"
-    MIN_WIDTH = 420
-    MIN_HEIGHT = 360
+    MIN_WIDTH = 440
+    MIN_HEIGHT = 420
 
     # ── Design tokens ───────────────────────────────────────────────────
     _C_PRIMARY = "#2563eb"
