@@ -10,6 +10,7 @@ Abstracts mouse and keyboard input across:
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import struct
 from abc import ABC, abstractmethod
