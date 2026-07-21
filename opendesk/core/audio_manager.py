@@ -332,8 +332,6 @@ class AudioManager:
                         except Exception as e:
                             logger.warning("Audio send error: %s", e)
 
-                    time.sleep(_FRAME_DURATION_MS / 1000)
-
         except Exception as e:
             logger.error("Audio capture error: %s", e)
         finally:
