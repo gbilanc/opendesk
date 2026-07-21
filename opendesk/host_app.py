@@ -9,11 +9,16 @@ input remoto, chat e file transfer.  Non permette connessioni in uscita.
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import secrets
 import string
 import uuid
 from pathlib import Path
+
+# Fix for Python 3.14+: ctypes.util.find_library() no longer searches
+# C:\Windows\System32 automatically, breaking cffi-based libs like SoundCard.
+os.add_dll_directory(r"C:\Windows\System32")
 
 from PySide6.QtCore import QObject, QSettings, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QCloseEvent

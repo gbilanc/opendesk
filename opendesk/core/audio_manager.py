@@ -286,10 +286,11 @@ class AudioManager:
 
         try:
             import soundcard as sc  # optional dependency
-        except ImportError:
+        except (ImportError, OSError) as exc:
             logger.warning(
-                "soundcard not installed — audio capture disabled. "
-                "Install with: pip install soundcard"
+                "soundcard not available — audio capture disabled (%s). "
+                "Install with: pip install soundcard",
+                exc,
             )
             return
 

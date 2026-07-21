@@ -5,6 +5,8 @@ on:
     branches: [main, master, develop]
   pull_request:
     branches: [main, master]
+  release:
+    types: [published]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -76,14 +78,10 @@ jobs:
       - name: Run tests
         run: uv run pytest tests/ -v --tb=short
 
-  # ── Build (Linux + Windows) ───────────────────────────────────────
+  # ── Build wheel + sdist ────────────────────────────────────────────
   build:
     needs: [lint, test]
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -95,41 +93,58 @@ jobs:
       - name: Set up Python
         run: uv python pin 3.12
 
-      - name: Install Linux deps
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+      - name: Install build deps
+        run: uv sync --extra dev
 
-      - name: Install Python deps
-        run: uv sync
+      - name: Build wheel and sdist
+        run: uv run python -m build
 
-      - name: Install PyInstaller
-        run: uv pip install pyinstaller
-
-      - name: Build with PyInstaller
-        run: uv run pyinstaller opendesk.spec --clean
-
-      - name: Upload artifact
+      - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: opendesk-${{ runner.os }}
-          path: dist/opendesk/
+          name: opendesk-dist
+          path: dist/*.whl
           retention-days: 7
 
-  # ── Release (manual trigger) ──────────────────────────────────────
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opendesk-dist
+          path: dist/*.tar.gz
+          retention-days: 7
+
+  # ── Publish to PyPI (on tag v*) ────────────────────────────────────
+  publish-pypi:
+    needs: [build]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+
+    environment:
+      name: pypi
+      url: https://pypi.org/p/opendesk
+    permissions:
+      id-token: write  # required for Trusted Publishing
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: opendesk-dist/
+
+  # ── GitHub Release (on tag v*) ─────────────────────────────────────
   release:
     needs: [build]
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
 
+    permissions:
+      contents: write
+
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -138,6 +153,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            opendesk-Linux/**/*
-            opendesk-Windows/**/*
+            opendesk-dist/*.whl
+            opendesk-dist/*.tar.gz
           generate_release_notes: true
+
+

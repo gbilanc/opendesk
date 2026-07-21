@@ -590,7 +590,7 @@ class PlatformConfig:
         # Audio: check soundcard availability
         try:
             import soundcard  # noqa: F401
-        except ImportError:
+        except (ImportError, OSError):
             if self.supports_audio:
                 issues.append(HealthIssue(
                     HealthSeverity.INFO, "audio",

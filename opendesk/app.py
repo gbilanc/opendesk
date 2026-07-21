@@ -9,11 +9,16 @@ from __future__ import annotations
 
 import faulthandler
 import logging
+import os
 import sys
 from pathlib import Path
 
 # Enable crash diagnostics — on segfault, prints a traceback to stderr
 faulthandler.enable()
+
+# Fix for Python 3.14+: ctypes.util.find_library() no longer searches
+# C:\Windows\System32 automatically, breaking cffi-based libs like SoundCard.
+os.add_dll_directory(r"C:\Windows\System32")
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon, QPalette, QColor
@@ -115,6 +120,130 @@ def main_release() -> None:
     main(log_level=logging.WARNING)
 
 
+def install_system_deps() -> None:
+    """Print platform-specific system dependency installation guide.
+
+    Exits after printing instructions — does not start the GUI.
+    """
+    import platform as _platform
+
+    system = _platform.system()
+    print("=" * 60)
+    print("  OpenDesk — System Dependencies")
+    print("=" * 60)
+    print()
+
+    if system == "Linux":
+        print("Required system packages for Linux:")
+        print()
+        print("  Debian / Ubuntu / Mint:")
+        print("    sudo apt-get install -y ffmpeg libx11-6 libxext6")
+        print("    sudo apt-get install -y libxrender1 libxtst6")
+        print()
+        print("  For Wayland (optional, better screen capture):")
+        print("    sudo apt-get install -y pipewire gstreamer1.0-pipewire")
+        print("    sudo apt-get install -y python3-gi xdg-desktop-portal")
+        print()
+        print("  Fedora / RHEL:")
+        print("    sudo dnf install -y ffmpeg libX11 libXext libXrender libXtst")
+        print()
+        print("  Arch Linux:")
+        print("    sudo pacman -S --noconfirm ffmpeg libx11 libxext")
+        print("    sudo pacman -S --noconfirm libxrender libxtst")
+    elif system == "Darwin":
+        print("Required system packages for macOS:")
+        print()
+        print("  ffmpeg (via Homebrew):")
+        print("    brew install ffmpeg")
+        print()
+        print("  Everything else is bundled with the pip package.")
+    elif system == "Windows":
+        print("Required system packages for Windows:")
+        print()
+        print("  ffmpeg:")
+        print("    Download from https://ffmpeg.org/download.html")
+        print("    or install via winget: winget install ffmpeg")
+        print()
+        print("  Everything else is bundled with the pip package.")
+        print("  Visual C++ Redistributable may be required:")
+        print("    https://aka.ms/vcredist")
+
+    print()
+    print("After installing system packages, run:")
+    print("  pip install --upgrade opendesk")
+    print()
+    sys.exit(0)
+
+
+def _ensure_desktop_entry() -> None:
+    """Create desktop / start-menu entry if missing (silent)."""
+    import platform as _platform
+    system = _platform.system()
+
+    if system == "Linux":
+        data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+        apps_dir = data_home / "applications"
+        icons_dir = data_home / "icons" / "hicolor" / "256x256" / "apps"
+        desktop_file = apps_dir / "opendesk.desktop"
+
+        if desktop_file.exists():
+            return  # already installed
+
+        apps_dir.mkdir(parents=True, exist_ok=True)
+        icons_dir.mkdir(parents=True, exist_ok=True)
+
+        # Find the icon from the installed package
+        icon_src = (
+            Path(__file__).parent / "ui" / "resources" / "opendesk.svg"
+        )
+        if icon_src.exists():
+            import shutil
+            shutil.copy2(icon_src, icons_dir / "opendesk.svg")
+
+        # Find the executable path (pip-installed script)
+        import shutil as _shutil
+        exe_path = _shutil.which("opendesk") or _shutil.which("opendesk-host") or sys.executable
+
+        desktop_content = f"""[Desktop Entry]
+Type=Application
+Name=OpenDesk
+Comment=Remote Desktop Application
+Icon=opendesk
+Exec={exe_path}
+Terminal=false
+Categories=Network;RemoteAccess;
+StartupWMClass=opendesk
+"""
+        desktop_file.write_text(desktop_content)
+        desktop_file.chmod(0o755)
+        logger.debug("Created desktop entry: %s", desktop_file)
+
+
+def _parse_cli_args() -> list[str]:
+    """Parse CLI arguments consumed by the launcher.
+
+    Returns the remaining argv after removing consumed flags.
+    """
+    remaining: list[str] = []
+    i = 0
+    while i < len(sys.argv):
+        arg = sys.argv[i]
+        if arg == "--install-system-deps":
+            install_system_deps()
+        elif arg == "--log-level" and i + 1 < len(sys.argv):
+            # handled below in main()
+            remaining.append(arg)
+            remaining.append(sys.argv[i + 1])
+            i += 2
+            continue
+        elif arg.startswith("--log-level="):
+            remaining.append(arg)
+        else:
+            remaining.append(arg)
+        i += 1
+    return remaining
+
+
 def main(log_level: int | None = None) -> None:
     """Start the OpenDesk application.
 
@@ -125,7 +254,9 @@ def main(log_level: int | None = None) -> None:
         If not provided, falls back to ``OPENDESK_LOG_LEVEL`` env var,
         then to ``logging.DEBUG``.
     """
-    # Parse --log-level from CLI before Qt processes argv
+    # Parse launcher-level CLI args before Qt processes argv
+    sys.argv[:] = _parse_cli_args()
+
     cli_level: int | None = None
     for i, arg in enumerate(sys.argv[1:], start=1):
         if arg.startswith("--log-level="):
@@ -145,6 +276,9 @@ def main(log_level: int | None = None) -> None:
     # Log platform configuration at startup
     from opendesk.core.platform_config import get_platform_config
     get_platform_config()
+
+    # Ensure desktop entry on first run (silent if already present)
+    _ensure_desktop_entry()
 
     app = QApplication(sys.argv)
     app.setApplicationName("OpenDesk")

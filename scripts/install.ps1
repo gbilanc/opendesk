@@ -1,43 +1,25 @@
-# OpenDesk — Windows Installer
+# ---------------------------------------------------------------------------
+# OpenDesk — Legacy Windows installer (redirects to bootstrap.ps1)
 #
-# Usage (PowerShell as Administrator):
-#   iwr -useb https://your-server.com/install.ps1 | iex
-#
-# The script downloads the NSIS installer and runs it silently.
+# Kept for backward compatibility.  New installations should use:
+#   iwr -useb https://opendesk.io/bootstrap.ps1 | iex
+# ---------------------------------------------------------------------------
 
-param(
-    [string]$DownloadBase = $env:OPENDESK_DOWNLOAD_BASE,
-    [string]$Version = $env:OPENDESK_VERSION
-)
-
-if (-not $DownloadBase) { $DownloadBase = "http://gibisoft.net/dl" }
-if (-not $Version)     { $Version = "latest" }
-
-$ErrorActionPreference = "Stop"
-
-# ═══════════════════════════════════════════════════════════════════
-# OS Detection
-# ═══════════════════════════════════════════════════════════════════
-
-$arch = if ([Environment]::Is64BitOperatingSystem) { "x86_64" } else { "x86" }
-Write-Host "→ Detected: Windows / $arch" -ForegroundColor Green
-
-# ═══════════════════════════════════════════════════════════════════
-# Download & Install
-# ═══════════════════════════════════════════════════════════════════
-
-$filename = "opendesk-${Version}-windows-${arch}.exe"
-$url = "${DownloadBase}/${filename}"
-$tmp = "$env:TEMP\opendesk-installer.exe"
-
-Write-Host "→ Downloading OpenDesk installer..." -ForegroundColor Green
-Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing
-
-Write-Host "→ Running installer (silent)..." -ForegroundColor Green
-Start-Process -FilePath $tmp -ArgumentList "/S", "/D=$env:LOCALAPPDATA\OpenDesk" -Wait
-
-Remove-Item $tmp -Force
-
+Write-Host "⚠ This install script is deprecated." -ForegroundColor Yellow
 Write-Host ""
-Write-Host "✓ OpenDesk installed successfully!" -ForegroundColor Green
-Write-Host "  Find it in the Start Menu or run: $env:LOCALAPPDATA\OpenDesk\opendesk.exe" -ForegroundColor White
+Write-Host "  Use the new bootstrap installer instead:"
+Write-Host ""
+Write-Host "  iwr -useb https://opendesk.io/bootstrap.ps1 | iex"
+Write-Host ""
+
+# Delegate to bootstrap.ps1 in the same directory
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$bootstrapPath = Join-Path $scriptDir "bootstrap.ps1"
+
+if (Test-Path $bootstrapPath) {
+    & $bootstrapPath @args
+} else {
+    Write-Host ""
+    Write-Host "  Downloading bootstrap.ps1 ..."
+    iex (iwr -useb "https://raw.githubusercontent.com/opendesk/opendesk-client/main/scripts/bootstrap.ps1")
+}

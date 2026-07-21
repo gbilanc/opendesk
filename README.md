@@ -1,6 +1,15 @@
 # OpenDesk
 
+<p align="center">
+  <img src="opendesk/ui/resources/opendesk.svg" width="100" alt="OpenDesk">
+</p>
+
 Multi-platform remote desktop application (TeamViewer / AnyDesk-like).
+
+[![PyPI version](https://img.shields.io/pypi/v/opendesk?color=blue)](https://pypi.org/project/opendesk/)
+[![Python versions](https://img.shields.io/pypi/pyversions/opendesk)](https://pypi.org/project/opendesk/)
+[![License](https://img.shields.io/pypi/l/opendesk?color=green)](https://github.com/opendesk/opendesk-client/blob/main/LICENSE)
+[![CI](https://github.com/opendesk/opendesk-client/actions/workflows/ci.yml/badge.svg)](https://github.com/opendesk/opendesk-client/actions/workflows/ci.yml)
 
 - **Platforms:** Windows, macOS, Linux
 - **Tech:** Python 3.12+, PySide6 (Qt6), PyAV (FFmpeg), E2E encryption
@@ -8,23 +17,61 @@ Multi-platform remote desktop application (TeamViewer / AnyDesk-like).
 - **Features:** Screen sharing, remote control, file transfer, clipboard sync,
   microphone streaming, webcam streaming with PiP overlay, audio, chat, multi-monitor
 
-## Quick start (uv — recommended)
+---
+
+## Install
+
+### Quick install (bootstrap)
 
 ```bash
-# Install uv (https://docs.astral.sh/uv/)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Clone and run
-cd opendesk
-uv sync          # creates venv + installs deps
-uv run opendesk  # start the app
+# Linux / macOS
+curl -fsSL https://opendesk.io/bootstrap.sh | bash
 ```
 
-## Alternative (pip)
+```powershell
+# Windows (PowerShell as Administrator)
+iwr -useb https://opendesk.io/bootstrap.ps1 | iex
+```
+
+The bootstrap script handles:
+1. ✅ Python 3.12+ installation (if missing)
+2. ✅ System dependencies (ffmpeg, libxtst, pipewire, etc.)
+3. ✅ `pip install opendesk` (or `pipx install opendesk`)
+4. ✅ Desktop entry / Start Menu shortcut
+
+### Via pip
 
 ```bash
-pip install -e .
-opendesk
+pip install opendesk
+```
+
+> **Tip:** Use [pipx](https://pipx.pypa.io/) for isolated app installation:
+> `pipx install opendesk`
+
+### Via uv (development)
+
+```bash
+git clone https://github.com/opendesk/opendesk-client
+cd opendesk-client
+uv sync
+uv run opendesk
+```
+
+### Post-install: system dependencies
+
+After installing, run this to make sure all system packages are present:
+
+```bash
+opendesk --install-system-deps
+```
+
+## Usage
+
+```bash
+opendesk                   # Start the remote desktop client
+opendesk --log-level=WARNING  # Quieter logging
+opendesk-host              # Start host-only version (incoming only)
+opendesk --help            # Show all options
 ```
 
 ## OpenDesk Host (solo incoming)
@@ -58,9 +105,19 @@ uv run opendesk-host --log-level=WARNING
 ## Development
 
 ```bash
+# Clone and install from source
+git clone https://github.com/opendesk/opendesk-client
+cd opendesk-client
 uv sync --dev          # install with dev dependencies
-uv run pytest          # run tests (123 tests)
+
+# Or with pip
+pip install -e ".[dev]"
+
+# Run tests
+uv run pytest          # run tests
 uv run pytest -v       # verbose
+
+# Code quality
 uv run black .         # format code
 uv run ruff check .    # lint
 uv run mypy opendesk/  # type check
@@ -69,25 +126,17 @@ uv run mypy opendesk/  # type check
 ### Optional features
 
 ```bash
-# Wayland support (Linux)
-uv sync --extra wayland
-
-# Audio streaming (microphone)
-uv sync --extra audio
-
-# macOS input backend
-uv sync --extra macos
+# Audio streaming (microphone) — requires soundcard
+pip install opendesk[audio]
 ```
 
 ### Wayland setup (Linux)
 
-Wayland requires both **Python packages** and **system packages**:
+Wayland support is **built-in** (dbus-next, evdev are auto-installed on Linux).
+You still need **system packages**:
 
 ```bash
-# 1. Python dependencies
-uv sync --extra wayland      # installs dbus-next, evdev
-
-# 2. System packages (Ubuntu/Debian)
+# Ubuntu/Debian
 sudo apt install gstreamer1.0-pipewire python3-gi       \
                  xdg-desktop-portal pipewire
 
@@ -305,19 +354,23 @@ top-right corner of the viewer window:
 ## Commands
 
 ```bash
-uv run opendesk           # Start the remote desktop client (DEBUG log level)
-uv run opendesk-release   # Start in release mode (WARNING+ messages only)
-uv run opendesk-host      # Start the host-only version (incoming only)
-uv run opendesk --log-level=WARNING  # Custom log level
-uv run pytest             # Run all tests
+opendesk                     # Start the remote desktop client
+opendesk-release             # Start in release mode (WARNING+ messages only)
+opendesk-host                # Start the host-only version (incoming only)
+opendesk --log-level=WARNING # Custom log level
+opendesk --install-system-deps  # Show system dependency installation guide
+
+# Development (from source)
+uv run opendesk              # Start from source via uv
+uv run pytest                # Run all tests
 ```
 
 ### Log level
 
 Log verbosity is controlled by (highest precedence first):
 
-1. **`--log-level`** CLI argument — `uv run opendesk --log-level=WARNING`
-2. **`OPENDESK_LOG_LEVEL`** environment variable — `OPENDESK_LOG_LEVEL=ERROR uv run opendesk`
+1. **`--log-level`** CLI argument — `opendesk --log-level=WARNING`
+2. **`OPENDESK_LOG_LEVEL`** environment variable — `OPENDESK_LOG_LEVEL=ERROR opendesk`
 3. **Entry point default** — `opendesk` defaults to `DEBUG` (development),
    `opendesk-release` defaults to `WARNING` (distribution)
 

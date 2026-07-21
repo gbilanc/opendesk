@@ -12,6 +12,25 @@ authors = [
     {name = "OpenDesk Contributors"},
 ]
 requires-python = ">=3.12"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: File Sharing",
+    "Topic :: Internet",
+    "Topic :: System :: Networking",
+]
+
+# ── Core dependencies ──────────────────────────────────────────────
+# Platform-specific deps use environment markers so pip auto-selects
+# the correct ones for the target OS.
 dependencies = [
     "PySide6>=6.10.1",
     "Pillow>=10.2.0",
@@ -26,35 +45,31 @@ dependencies = [
     "pyzmq>=26.0",
     "argon2-cffi>=23.1.0",
     "msgpack>=1.0.0",
-    "python-xlib>=0.33",
-    "soundcard>=0.4.6",
-    "evdev>=1.9.3",
+    # Linux (X11 + Wayland input / keyboard state)
+    "python-xlib>=0.33 ; sys_platform == 'linux'",
+    "dbus-next>=0.2.3   ; sys_platform == 'linux'",
+    "evdev>=1.9.3       ; sys_platform == 'linux'",
+    # macOS (screen capture / input via CoreGraphics)
+    "pyobjc-framework-Quartz>=9.0 ; sys_platform == 'darwin'",
 ]
 
+[project.urls]
+Homepage = "https://github.com/opendesk/opendesk-client"
+Repository = "https://github.com/opendesk/opendesk-client"
+Issues = "https://github.com/opendesk/opendesk-client/issues"
+
 [project.optional-dependencies]
+audio = [
+    "soundcard>=0.4.6",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "black>=24.0",
     "ruff>=0.3.0",
     "mypy>=1.9.0",
-]
-x11 = [
-    "python-xlib>=0.33",
-]
-wayland = [
-    "dbus-next>=0.2.3",
-    "evdev>=1.6.0",
-]
-# Wayland also needs SYSTEM packages (apt / dnf):
-#   gstreamer1.0-pipewire  python3-gi  xdg-desktop-portal  pipewire
-#   ydotool (optional — for absolute mouse positioning)
-win = []
-macos = [
-    "pyobjc-framework-Quartz>=9.0",
-]
-audio = [
-    "soundcard>=0.4.0",
+    "build>=1.2.0",
+    "twine>=6.0.0",
 ]
 
 [tool.setuptools.packages.find]
