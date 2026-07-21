@@ -183,6 +183,38 @@ class _RelaySession:
         MessageType.RELAY_DEVICE_UPDATE,
     })
 
+    # Peer-to-peer message types that are forwarded to the UI thread
+    # via the generic "message" inbox event.  They need no special
+    # handling in the network thread — we just suppress the
+    # "unhandled message type" debug log to avoid flooding the log
+    # with high-frequency types like AUDIO_FRAME and CAMERA_FRAME.
+    _PEER_PASSTHROUGH = frozenset({
+        MessageType.MOUSE_EVENT,
+        MessageType.KEYBOARD_EVENT,
+        MessageType.TEXT_INPUT,
+        MessageType.CLIPBOARD_TEXT,
+        MessageType.CLIPBOARD_IMAGE,
+        MessageType.CLIPBOARD_SYNC,
+        MessageType.FILE_REQUEST,
+        MessageType.FILE_ACCEPT,
+        MessageType.FILE_REJECT,
+        MessageType.FILE_CHUNK,
+        MessageType.FILE_COMPLETE,
+        MessageType.FILE_ERROR,
+        MessageType.FILE_PROGRESS,
+        MessageType.FILE_LIST_REQUEST,
+        MessageType.FILE_LIST_RESPONSE,
+        MessageType.FILE_DOWNLOAD_REQUEST,
+        MessageType.FILE_DOWNLOAD_ACCEPT,
+        MessageType.FILE_DOWNLOAD_REJECT,
+        MessageType.AUDIO_FRAME,
+        MessageType.CAMERA_FRAME,
+        MessageType.CAMERA_START,
+        MessageType.CHAT_MESSAGE,
+        MessageType.CHAT_TYPING,
+        MessageType.CHAT_OPEN,
+    })
+
     def send_message(self, msg: Message) -> None:
         """Send a message over the relay connection (thread-safe).
 
@@ -327,6 +359,8 @@ class _RelaySession:
                     logger.debug("Host received DISCONNECT — breaking loop")
                     break
 
+                elif t in self._PEER_PASSTHROUGH:
+                    pass  # forwarded to UI via generic "message" inbox event
                 else:
                     logger.debug("Host received unhandled message type %s", t)
         finally:
@@ -551,6 +585,8 @@ class _RelaySession:
                     logger.debug("Client received DISCONNECT — breaking loop")
                     break
 
+                elif t in self._PEER_PASSTHROUGH:
+                    pass  # forwarded to UI via generic "message" inbox event
                 else:
                     logger.debug("Client received unhandled message type %s", t)
         finally:
