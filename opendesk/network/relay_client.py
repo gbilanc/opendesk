@@ -384,7 +384,8 @@ class _RelaySession:
                     self.inbox.put(("device_update", (device, online), self.session_seq))
 
                 elif t == MessageType.KEY_EXCHANGE_ACK:
-                    self._accept_remote_key(msg.payload)
+                    if not self._accept_remote_key(msg.payload):
+                        logger.warning("E2E key exchange ACK failed, continuing without encryption")
 
                 elif t == MessageType.AUTH_RESPONSE:
                     client_hash = msg.payload.get("nonce_hash", "")
@@ -543,8 +544,7 @@ class _RelaySession:
                             self._key_exchange_message(MessageType.KEY_EXCHANGE_ACK)
                         )
                     else:
-                        self.inbox.put(("error", "E2E key exchange failed", self.session_seq))
-                        break
+                        logger.warning("E2E key exchange failed, continuing without encryption")
 
                 elif t == MessageType.AUTH_REQUEST:
                     nonce = msg.payload.get("nonce", "")
