@@ -26,6 +26,8 @@ dependencies = [
     "pyzmq>=26.0",
     "argon2-cffi>=23.1.0",
     "msgpack>=1.0.0",
+    "python-xlib>=0.33",
+    "soundcard>=0.4.6",
 ]
 
 [project.optional-dependencies]
