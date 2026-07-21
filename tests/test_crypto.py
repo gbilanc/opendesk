@@ -6,9 +6,12 @@ Covers E2E encryption roundtrip, key exchange, and password hashing.
 
 from __future__ import annotations
 
-from opendesk.crypto.e2ee import E2EEncryption, CryptoKeyPair, EncryptedMessage
-from opendesk.crypto.auth import hash_password, verify_password, generate_session_id
+import queue
 
+from opendesk.crypto.auth import generate_session_id, hash_password, verify_password
+from opendesk.crypto.e2ee import CryptoKeyPair, E2EEncryption, EncryptedMessage
+from opendesk.network.protocol import Message, MessageType
+from opendesk.network.relay_client import RelayRole, _RelaySession
 
 # ── E2E encryption ────────────────────────────────────────────────────────
 
@@ -73,11 +76,42 @@ class TestE2EEncryption:
         eve.set_remote_key(alice.local_key_pair.public_key)
 
         import nacl.exceptions
+
         try:
             eve.decrypt(encrypted)
             assert False, "Should have raised CryptoError"
         except nacl.exceptions.CryptoError:
             pass  # expected
+
+    def test_relay_envelope_requires_authenticated_key_exchange(self) -> None:
+        """Peer payloads are unreadable until both password proofs validate."""
+        alice = _RelaySession(
+            "relay", 1, "session", "shared-secret", RelayRole.HOST, queue.Queue()
+        )
+        bob = _RelaySession(
+            "relay", 1, "session", "shared-secret", RelayRole.CLIENT, queue.Queue()
+        )
+
+        assert bob._accept_remote_key(
+            alice._key_exchange_message(MessageType.KEY_EXCHANGE).payload
+        )
+        assert alice._accept_remote_key(
+            bob._key_exchange_message(MessageType.KEY_EXCHANGE_ACK).payload
+        )
+
+        encrypted = alice._encrypt_peer_message(Message.chat_message("private"))
+        assert encrypted.encrypted is True
+        assert encrypted.payload["_e2ee"] != b"private"
+        assert bob._decrypt_peer_message(encrypted).payload == {"text": "private"}
+
+    def test_relay_envelope_rejects_invalid_key_proof(self) -> None:
+        """A relay cannot substitute a public key without the session password."""
+        session = _RelaySession(
+            "relay", 1, "session", "shared-secret", RelayRole.CLIENT, queue.Queue()
+        )
+        msg = Message.key_exchange(E2EEncryption().get_public_key_string())
+        msg.payload["proof"] = "forged"
+        assert not session._accept_remote_key(msg.payload)
 
     def test_key_rotation(self) -> None:
         """After key rotation, old ciphertexts should not decrypt."""
@@ -94,6 +128,7 @@ class TestE2EEncryption:
 
         # Old ciphertext should fail
         import nacl.exceptions
+
         try:
             bob.decrypt(encrypted)
             assert False, "Old key should not work after rotation"

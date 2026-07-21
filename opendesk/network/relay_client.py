@@ -30,13 +30,14 @@ import time
 from enum import Enum, auto
 from typing import Any
 
+import msgpack
 import numpy as np
+from PySide6.QtCore import QObject, QSettings, QTimer, Signal, Slot
 
-from PySide6.QtCore import QObject, QTimer, Signal, Slot
-
-from opendesk.network.protocol import Message, MessageType
 from opendesk.core.video_codec import VideoDecoder
-from opendesk.crypto.challenge import generate_nonce, compute_response, verify_response
+from opendesk.crypto.challenge import compute_response, generate_nonce, verify_response
+from opendesk.crypto.e2ee import E2EEncryption, EncryptedMessage
+from opendesk.network.protocol import Message, MessageType
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +89,7 @@ class _RelaySession:
         session_seq: int = 0,
         trusted_device_ids: set[str] | None = None,
         connection_mode: str = "remote_desktop",
+        e2ee_enabled: bool = True,
     ) -> None:
         self.host = host
         self.port = port
@@ -99,6 +101,7 @@ class _RelaySession:
         self.device_name = device_name
         self.session_seq = session_seq
         self.connection_mode = connection_mode
+        self._e2ee_enabled = e2ee_enabled
         self._trusted_device_ids: set[str] = trusted_device_ids or set()
 
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -107,6 +110,8 @@ class _RelaySession:
         self._running = threading.Event()
         self._decoder: VideoDecoder | None = None
         self._auth_nonce: str = ""  # challenge nonce for challenge-response auth
+        self._e2ee = E2EEncryption()
+        self._e2ee_ready = False
 
         # Tile grid compositing (client side)
         self._reference_frame: np.ndarray | None = None
@@ -162,58 +167,123 @@ class _RelaySession:
 
     # Message types that are internal to the relay protocol and must be
     # sent directly (not wrapped in RELAY_ROUTE).
-    _RELAY_CONTROL_TYPES = frozenset({
-        MessageType.HELLO,
-        MessageType.HELLO_ACK,
-        MessageType.KEY_EXCHANGE,
-        MessageType.KEY_EXCHANGE_ACK,
-        MessageType.AUTH_REQUEST,
-        MessageType.AUTH_RESPONSE,
-        MessageType.AUTH_OK,
-        MessageType.AUTH_FAIL,
-        MessageType.SESSION_INFO,
-        MessageType.PING,
-        MessageType.PONG,
-        MessageType.DISCONNECT,
-        MessageType.ERROR,
-        MessageType.RELAY_REGISTER,
-        MessageType.RELAY_ROUTE,
-        MessageType.RELAY_PEER_LIST,
-        MessageType.RELAY_DEVICE_LIST,
-        MessageType.RELAY_DEVICE_UPDATE,
-    })
+    _RELAY_CONTROL_TYPES = frozenset(
+        {
+            MessageType.HELLO,
+            MessageType.HELLO_ACK,
+            MessageType.KEY_EXCHANGE,
+            MessageType.KEY_EXCHANGE_ACK,
+            MessageType.AUTH_REQUEST,
+            MessageType.AUTH_RESPONSE,
+            MessageType.AUTH_OK,
+            MessageType.AUTH_FAIL,
+            MessageType.SESSION_INFO,
+            MessageType.PING,
+            MessageType.PONG,
+            MessageType.DISCONNECT,
+            MessageType.ERROR,
+            MessageType.RELAY_REGISTER,
+            MessageType.RELAY_ROUTE,
+            MessageType.RELAY_PEER_LIST,
+            MessageType.RELAY_DEVICE_LIST,
+            MessageType.RELAY_DEVICE_UPDATE,
+        }
+    )
 
     # Peer-to-peer message types that are forwarded to the UI thread
     # via the generic "message" inbox event.  They need no special
     # handling in the network thread — we just suppress the
     # "unhandled message type" debug log to avoid flooding the log
     # with high-frequency types like AUDIO_FRAME and CAMERA_FRAME.
-    _PEER_PASSTHROUGH = frozenset({
-        MessageType.MOUSE_EVENT,
-        MessageType.KEYBOARD_EVENT,
-        MessageType.TEXT_INPUT,
-        MessageType.CLIPBOARD_TEXT,
-        MessageType.CLIPBOARD_IMAGE,
-        MessageType.CLIPBOARD_SYNC,
-        MessageType.FILE_REQUEST,
-        MessageType.FILE_ACCEPT,
-        MessageType.FILE_REJECT,
-        MessageType.FILE_CHUNK,
-        MessageType.FILE_COMPLETE,
-        MessageType.FILE_ERROR,
-        MessageType.FILE_PROGRESS,
-        MessageType.FILE_LIST_REQUEST,
-        MessageType.FILE_LIST_RESPONSE,
-        MessageType.FILE_DOWNLOAD_REQUEST,
-        MessageType.FILE_DOWNLOAD_ACCEPT,
-        MessageType.FILE_DOWNLOAD_REJECT,
-        MessageType.AUDIO_FRAME,
-        MessageType.CAMERA_FRAME,
-        MessageType.CAMERA_START,
-        MessageType.CHAT_MESSAGE,
-        MessageType.CHAT_TYPING,
-        MessageType.CHAT_OPEN,
-    })
+    _PEER_PASSTHROUGH = frozenset(
+        {
+            MessageType.MOUSE_EVENT,
+            MessageType.KEYBOARD_EVENT,
+            MessageType.TEXT_INPUT,
+            MessageType.CLIPBOARD_TEXT,
+            MessageType.CLIPBOARD_IMAGE,
+            MessageType.CLIPBOARD_SYNC,
+            MessageType.FILE_REQUEST,
+            MessageType.FILE_ACCEPT,
+            MessageType.FILE_REJECT,
+            MessageType.FILE_CHUNK,
+            MessageType.FILE_COMPLETE,
+            MessageType.FILE_ERROR,
+            MessageType.FILE_PROGRESS,
+            MessageType.FILE_LIST_REQUEST,
+            MessageType.FILE_LIST_RESPONSE,
+            MessageType.FILE_DOWNLOAD_REQUEST,
+            MessageType.FILE_DOWNLOAD_ACCEPT,
+            MessageType.FILE_DOWNLOAD_REJECT,
+            MessageType.AUDIO_FRAME,
+            MessageType.CAMERA_FRAME,
+            MessageType.CAMERA_START,
+            MessageType.CHAT_MESSAGE,
+            MessageType.CHAT_TYPING,
+            MessageType.CHAT_OPEN,
+        }
+    )
+
+    def _key_exchange_message(self, message_type: MessageType) -> Message:
+        """Build a password-authenticated ephemeral public-key message."""
+        public_key = self._e2ee.get_public_key_string()
+        proof_input = f"e2ee:{self.session_id}:{public_key}"
+        return Message(
+            message_type,
+            {
+                "public_key": public_key,
+                "proof": compute_response(proof_input, self.password),
+            },
+        )
+
+    def _accept_remote_key(self, payload: dict[str, Any]) -> bool:
+        """Verify the peer key against the session secret and activate E2E."""
+        public_key = payload.get("public_key", "")
+        proof = payload.get("proof", "")
+        if not isinstance(public_key, str) or not isinstance(proof, str):
+            return False
+        proof_input = f"e2ee:{self.session_id}:{public_key}"
+        if not verify_response(proof_input, self.password, proof):
+            logger.warning("Rejected E2E key exchange: invalid key proof")
+            return False
+        try:
+            self._e2ee.set_remote_key(public_key)
+        except Exception as e:
+            logger.warning("Rejected E2E key exchange: %s", e)
+            return False
+        self._e2ee_ready = True
+        logger.info("E2E peer channel established")
+        return True
+
+    def _encrypt_peer_message(self, msg: Message) -> Message:
+        """Encrypt a peer payload while preserving its message type."""
+        if not self._e2ee_enabled or not self._e2ee_ready:
+            return msg
+        plaintext = msgpack.packb(msg.payload, use_bin_type=True)
+        encrypted = self._e2ee.encrypt(plaintext)
+        return Message(
+            msg.type,
+            {"_e2ee": encrypted.encode()},
+            encrypted=True,
+        )
+
+    def _decrypt_peer_message(self, msg: Message) -> Message:
+        """Decrypt an E2E envelope received from the relay."""
+        envelope = msg.payload.get("_e2ee")
+        if envelope is None:
+            return msg
+        if not self._e2ee_ready or not isinstance(envelope, bytes):
+            raise ValueError("Encrypted peer payload received before E2E setup")
+        try:
+            payload = msgpack.unpackb(
+                self._e2ee.decrypt(EncryptedMessage.decode(envelope)),
+                raw=False,
+            )
+        except Exception as e:
+            raise ValueError("Unable to decrypt peer payload") from e
+        if not isinstance(payload, dict):
+            raise ValueError("Invalid decrypted peer payload")
+        return Message(msg.type, payload)
 
     def send_message(self, msg: Message) -> None:
         """Send a message over the relay connection (thread-safe).
@@ -224,8 +294,9 @@ class _RelaySession:
         paired peer.  Relay-internal control messages are sent as-is.
         """
         if self._loop and self._running.is_set():
-            # Wrap peer-to-peer messages in RELAY_ROUTE
+            # Encrypt and wrap peer-to-peer messages in RELAY_ROUTE.
             if msg.type not in self._RELAY_CONTROL_TYPES:
+                msg = self._encrypt_peer_message(msg)
                 msg = Message.relay_route(
                     inner_type=msg.type.value,
                     inner_payload=msg.payload,
@@ -255,7 +326,7 @@ class _RelaySession:
                 asyncio.open_connection(self.host, self.port),
                 timeout=_CONNECT_TIMEOUT,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             err = f"Connection to relay {self.host}:{self.port} timed out ({_CONNECT_TIMEOUT}s)"
             logger.error(err)
             self.inbox.put(("error", err, self.session_seq))
@@ -268,15 +339,22 @@ class _RelaySession:
             return
 
         # Register session with device identity
-        await self._send_async(Message.relay_register(
-            session_id=self.session_id,
-            device_id=self.device_id,
-            device_name=self.device_name,
-        ))
+        await self._send_async(
+            Message.relay_register(
+                session_id=self.session_id,
+                device_id=self.device_id,
+                device_name=self.device_name,
+            )
+        )
 
         gen = self._read_loop()
         try:
             async for msg in gen:
+                try:
+                    msg = self._decrypt_peer_message(msg)
+                except ValueError as e:
+                    logger.warning("Dropped encrypted host message: %s", e)
+                    continue
                 self.inbox.put(("message", msg, self.session_seq))
 
                 t = msg.type
@@ -285,7 +363,12 @@ class _RelaySession:
 
                 elif t == MessageType.RELAY_PEER_LIST:
                     self.inbox.put(("peer_joined", None, self.session_seq))
-                    # Challenge-response auth: generate nonce, send to client
+                    # Negotiate E2E first.  Auth is sent immediately as well so
+                    # legacy peers that ignore KEY_EXCHANGE remain compatible.
+                    if self._e2ee_enabled:
+                        await self._send_async(
+                            self._key_exchange_message(MessageType.KEY_EXCHANGE)
+                        )
                     nonce = generate_nonce()
                     self._auth_nonce = nonce
                     await self._send_async(Message.auth_request(self.session_id, nonce=nonce))
@@ -298,6 +381,9 @@ class _RelaySession:
                     device = msg.payload.get("device", {})
                     online = msg.payload.get("online", False)
                     self.inbox.put(("device_update", (device, online), self.session_seq))
+
+                elif t == MessageType.KEY_EXCHANGE_ACK:
+                    self._accept_remote_key(msg.payload)
 
                 elif t == MessageType.AUTH_RESPONSE:
                     client_hash = msg.payload.get("nonce_hash", "")
@@ -312,23 +398,25 @@ class _RelaySession:
                             client_device_id[:8],
                         )
                         await self._send_async(Message.auth_ok())
-                        self.inbox.put((
-                            "auth_result",
-                            (True, "Authenticated (trusted device)"),
-                            self.session_seq,
-                        ))
+                        self.inbox.put(
+                            (
+                                "auth_result",
+                                (True, "Authenticated (trusted device)"),
+                                self.session_seq,
+                            )
+                        )
                         continue
 
                     success = verify_response(self._auth_nonce, self.password, client_hash)
                     if success:
                         await self._send_async(Message.auth_ok())
                         self.inbox.put(("auth_result", (True, "Authenticated"), self.session_seq))
-                        logger.debug(
-                            "Host auth OK — connection_mode=%s", client_connection_mode
-                        )
+                        logger.debug("Host auth OK — connection_mode=%s", client_connection_mode)
                     else:
                         await self._send_async(Message.auth_fail("Invalid credentials"))
-                        self.inbox.put(("auth_result", (False, "Invalid credentials"), self.session_seq))
+                        self.inbox.put(
+                            ("auth_result", (False, "Invalid credentials"), self.session_seq)
+                        )
 
                 elif t == MessageType.VIDEO_REQUEST_KEYFRAME:
                     logger.debug("Peer requested keyframe (host)")
@@ -341,8 +429,14 @@ class _RelaySession:
                         logger.warning(
                             "Host received ERROR from relay without message field "
                             "(payload=%s, code=%s) — possible protocol mismatch",
-                            {k: (str(v)[:120] if isinstance(v, (bytes, str)) and len(str(v)) > 120 else v)
-                             for k, v in msg.payload.items()},
+                            {
+                                k: (
+                                    str(v)[:120]
+                                    if isinstance(v, (bytes, str)) and len(str(v)) > 120
+                                    else v
+                                )
+                                for k, v in msg.payload.items()
+                            },
                             msg.payload.get("code", "N/A"),
                         )
                         err = f"Relay error (code={msg.payload.get('code', 'N/A')})"
@@ -377,7 +471,7 @@ class _RelaySession:
                 asyncio.open_connection(self.host, self.port),
                 timeout=_CONNECT_TIMEOUT,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             err = f"Connection to relay {self.host}:{self.port} timed out ({_CONNECT_TIMEOUT}s)"
             logger.error(err)
             self.inbox.put(("error", err, self.session_seq))
@@ -390,10 +484,12 @@ class _RelaySession:
             return
 
         # Look up device by ID (device_id) → relay pairs us with its session
-        await self._send_async(Message(
-            MessageType.RELAY_REGISTER,
-            {"lookup_device": self.session_id},
-        ))
+        await self._send_async(
+            Message(
+                MessageType.RELAY_REGISTER,
+                {"lookup_device": self.session_id},
+            )
+        )
 
         # Periodic task that requests a keyframe if none received
         async def _keyframe_watchdog():
@@ -407,8 +503,7 @@ class _RelaySession:
                     # session start, not after first keyframe
                     elapsed_since_last = time.time() - self._start_time
                 if elapsed_since_last > 5.0:
-                    logger.info("No keyframe for %.0fs — requesting one",
-                                elapsed_since_last)
+                    logger.info("No keyframe for %.0fs — requesting one", elapsed_since_last)
                     self._last_keyframe_time = time.time()
                     await self._send_async(
                         Message(MessageType.VIDEO_REQUEST_KEYFRAME, {}),
@@ -419,26 +514,49 @@ class _RelaySession:
         gen = self._read_loop()
         try:
             async for msg in gen:
+                try:
+                    msg = self._decrypt_peer_message(msg)
+                except ValueError as e:
+                    logger.warning("Dropped encrypted client message: %s", e)
+                    continue
                 self.inbox.put(("message", msg, self.session_seq))
 
                 t = msg.type
                 if t == MessageType.RELAY_REGISTER:
                     if msg.payload.get("paired"):
-                        self.inbox.put(("connected", ("client", self.session_id), self.session_seq))
+                        self.inbox.put(
+                            ("connected", ("client", self.session_id), self.session_seq)
+                        )
                     elif msg.payload.get("mode") == "host":
                         # Session doesn't exist — we were registered as host instead
                         logger.warning("Session %s not found on relay", self.session_id)
-                        self.inbox.put(("error", f"Session {self.session_id} not found", self.session_seq))
+                        self.inbox.put(
+                            ("error", f"Session {self.session_id} not found", self.session_seq)
+                        )
                         self.inbox.put(("disconnected", None, self.session_seq))
+                        break
+
+                elif t == MessageType.KEY_EXCHANGE:
+                    if not self._e2ee_enabled:
+                        logger.info("Peer offered E2E, but it is disabled locally")
+                    elif self._accept_remote_key(msg.payload):
+                        await self._send_async(
+                            self._key_exchange_message(MessageType.KEY_EXCHANGE_ACK)
+                        )
+                    else:
+                        self.inbox.put(("error", "E2E key exchange failed", self.session_seq))
                         break
 
                 elif t == MessageType.AUTH_REQUEST:
                     nonce = msg.payload.get("nonce", "")
                     nonce_hash = compute_response(nonce, self.password) if nonce else ""
-                    await self._send_async(Message.auth_response(
-                        nonce_hash, device_id=self.device_id,
-                        connection_mode=self.connection_mode,
-                    ))
+                    await self._send_async(
+                        Message.auth_response(
+                            nonce_hash,
+                            device_id=self.device_id,
+                            connection_mode=self.connection_mode,
+                        )
+                    )
                     self.inbox.put(("auth_requested", None, self.session_seq))
 
                 elif t == MessageType.AUTH_OK:
@@ -450,9 +568,7 @@ class _RelaySession:
                             Message(MessageType.VIDEO_REQUEST_KEYFRAME, {}),
                         )
                     else:
-                        logger.info(
-                            "Auth OK — file transfer mode, skipping keyframe request"
-                        )
+                        logger.info("Auth OK — file transfer mode, skipping keyframe request")
 
                 elif t == MessageType.AUTH_FAIL:
                     reason = msg.payload.get("reason", "Authentication failed")
@@ -476,7 +592,10 @@ class _RelaySession:
                     is_keyframe = payload.get("keyframe", False)
                     logger.debug(
                         "VIDEO_FRAME: %dx%d keyframe=%s len=%d",
-                        width, height, is_keyframe, len(data) if data else 0,
+                        width,
+                        height,
+                        is_keyframe,
+                        len(data) if data else 0,
                     )
                     if data and width > 0 and height > 0:
                         if self._decoder is None:
@@ -484,7 +603,10 @@ class _RelaySession:
                             logger.info("VideoDecoder initialised (auto-detect)")
                         try:
                             rgb = self._decoder.decode(
-                                data, width, height, is_keyframe=is_keyframe,
+                                data,
+                                width,
+                                height,
+                                is_keyframe=is_keyframe,
                             )
                             if rgb is not None:
                                 self._reference_frame = rgb.copy()
@@ -496,7 +618,9 @@ class _RelaySession:
                                 )
                                 logger.debug(
                                     "Frame decoded: %dx%d (%s)",
-                                    width, height, self._decoder.codec_name,
+                                    width,
+                                    height,
+                                    self._decoder.codec_name,
                                 )
                             else:
                                 logger.warning(
@@ -526,40 +650,52 @@ class _RelaySession:
                     th = payload.get("height", 0)
                     logger.debug(
                         "🧩 VIDEO_TILE: %dx%d+%d+%d len=%d ref=%s",
-                        tw, th, tx, ty, len(data) if data else 0,
+                        tw,
+                        th,
+                        tx,
+                        ty,
+                        len(data) if data else 0,
                         "yes" if self._reference_frame is not None else "no",
                     )
                     if data and tw > 0 and th > 0 and self._reference_frame is not None:
                         try:
                             import cv2
                             import numpy as np
+
                             arr = np.frombuffer(data, dtype=np.uint8)
                             tile_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                            if tile_bgr is not None and tile_bgr.shape[0] == th and tile_bgr.shape[1] == tw:
+                            if (
+                                tile_bgr is not None
+                                and tile_bgr.shape[0] == th
+                                and tile_bgr.shape[1] == tw
+                            ):
                                 tile_rgb = cv2.cvtColor(tile_bgr, cv2.COLOR_BGR2RGB)
                                 # Composite onto reference frame
                                 ref_h, ref_w = self._reference_frame.shape[:2]
                                 if ty + th <= ref_h and tx + tw <= ref_w:
-                                    self._reference_frame[ty:ty+th, tx:tx+tw] = tile_rgb
+                                    self._reference_frame[ty : ty + th, tx : tx + tw] = tile_rgb
                                     self.inbox.put(
-                                        ("frame", (
-                                            self._reference_frame.copy(),
-                                            self._frame_width,
-                                            self._frame_height,
-                                        ), self.session_seq),
+                                        (
+                                            "frame",
+                                            (
+                                                self._reference_frame.copy(),
+                                                self._frame_width,
+                                                self._frame_height,
+                                            ),
+                                            self.session_seq,
+                                        ),
                                     )
                             else:
                                 logger.warning(
                                     "Tile decode mismatch: expected %dx%d, got %s",
-                                    tw, th,
+                                    tw,
+                                    th,
                                     tile_bgr.shape[:2] if tile_bgr is not None else "None",
                                 )
                         except Exception as e:
                             logger.warning("Tile decode/composite error: %s", e)
                     elif self._reference_frame is None:
-                        logger.debug(
-                            "Tile dropped - no reference frame (waiting for keyframe)"
-                        )
+                        logger.debug("Tile dropped - no reference frame (waiting for keyframe)")
                 elif t == MessageType.VIDEO_REQUEST_KEYFRAME:
                     logger.debug("Keyframe requested by peer")
                     # Forward to host via inbox so the StreamService can
@@ -570,10 +706,15 @@ class _RelaySession:
                     err = msg.payload.get("message", None)
                     if err is None:
                         logger.warning(
-                            "Client received ERROR without message field "
-                            "(payload=%s, code=%s)",
-                            {k: (str(v)[:120] if isinstance(v, (bytes, str)) and len(str(v)) > 120 else v)
-                             for k, v in msg.payload.items()},
+                            "Client received ERROR without message field " "(payload=%s, code=%s)",
+                            {
+                                k: (
+                                    str(v)[:120]
+                                    if isinstance(v, (bytes, str)) and len(str(v)) > 120
+                                    else v
+                                )
+                                for k, v in msg.payload.items()
+                            },
                             msg.payload.get("code", "N/A"),
                         )
                         err = f"Relay error (code={msg.payload.get('code', 'N/A')})"
@@ -615,9 +756,13 @@ class _RelaySession:
                 logger.debug("Read cancelled (shutting down)")
                 break
 
-    def send_frame(self, data: bytes, width: int, height: int, pts: int, keyframe: bool = False) -> None:
+    def send_frame(
+        self, data: bytes, width: int, height: int, pts: int, keyframe: bool = False
+    ) -> None:
         """Send an encoded (H.264) VIDEO_FRAME over the relay."""
-        msg = Message.video_frame(data=data, width=width, height=height, pts=pts, keyframe=keyframe)
+        msg = Message.video_frame(
+            data=data, width=width, height=height, pts=pts, keyframe=keyframe
+        )
         self.send_message(msg)
 
 
@@ -675,6 +820,9 @@ class RelayClient(QObject):
         self._host_inbox: queue.Queue = queue.Queue()
         self._host_seq: int = 0
         self._host_role: RelayRole | None = None
+        self._e2ee_enabled = QSettings("OpenDesk", "OpenDesk").value(
+            "security/e2ee", True, type=bool,
+        )
 
         # ── Client session (on-demand foreground) ──
         self._session: _RelaySession | None = None
@@ -711,9 +859,16 @@ class RelayClient(QObject):
 
     # ── hosting ──
 
-    def start_hosting(self, host: str, port: int, session_id: str, password: str,
-                      device_id: str = "", device_name: str = "",
-                      trusted_device_ids: set[str] | None = None) -> None:
+    def start_hosting(
+        self,
+        host: str,
+        port: int,
+        session_id: str,
+        password: str,
+        device_id: str = "",
+        device_name: str = "",
+        trusted_device_ids: set[str] | None = None,
+    ) -> None:
         """Connect to relay and register as host.
 
         Creates an independent persistent host session.  Does NOT
@@ -724,10 +879,17 @@ class RelayClient(QObject):
         self._host_seq += 1
         self._host_role = RelayRole.HOST
         self._host_session = _RelaySession(
-            host, port, session_id, password, RelayRole.HOST, self._host_inbox,
-            device_id=device_id, device_name=device_name,
+            host,
+            port,
+            session_id,
+            password,
+            RelayRole.HOST,
+            self._host_inbox,
+            device_id=device_id,
+            device_name=device_name,
             session_seq=self._host_seq,
             trusted_device_ids=trusted_device_ids,
+            e2ee_enabled=self._e2ee_enabled,
         )
         self._start_host_thread()
 
@@ -741,9 +903,15 @@ class RelayClient(QObject):
 
     # ── client connection ──
 
-    def join_session(self, host: str, port: int, session_id: str, password: str,
-                     device_id: str = "",
-                     connection_mode: str = "remote_desktop") -> None:
+    def join_session(
+        self,
+        host: str,
+        port: int,
+        session_id: str,
+        password: str,
+        device_id: str = "",
+        connection_mode: str = "remote_desktop",
+    ) -> None:
         """Connect to relay and join a session as client.
 
         Does NOT stop the host session — the host session continues
@@ -761,10 +929,16 @@ class RelayClient(QObject):
         self._current_seq += 1
         self._role = RelayRole.CLIENT
         self._session = _RelaySession(
-            host, port, session_id, password, RelayRole.CLIENT, self._inbox,
+            host,
+            port,
+            session_id,
+            password,
+            RelayRole.CLIENT,
+            self._inbox,
             device_id=device_id,
             session_seq=self._current_seq,
             connection_mode=connection_mode,
+            e2ee_enabled=self._e2ee_enabled,
         )
         self._start_client_thread()
 
@@ -781,7 +955,9 @@ class RelayClient(QObject):
         elif self._host_session and self._host_thread and self._host_thread.is_alive():
             self._host_session.send_message(msg)
 
-    def send_frame(self, data: bytes, width: int, height: int, pts: int, keyframe: bool = False) -> None:
+    def send_frame(
+        self, data: bytes, width: int, height: int, pts: int, keyframe: bool = False
+    ) -> None:
         """Send an encoded H.264 video frame over the relay (host only).
 
         Always sent through the host session.
@@ -799,14 +975,22 @@ class RelayClient(QObject):
             self._host_session.send_message(msg)
 
     def send_mouse_event(
-        self, x: int, y: int, button: int | None = None,
-        pressed: bool | None = None, absolute: bool = True,
+        self,
+        x: int,
+        y: int,
+        button: int | None = None,
+        pressed: bool | None = None,
+        absolute: bool = True,
     ) -> None:
         """Send a mouse event to the remote peer."""
         logger.debug(
             "RelayClient.send_mouse_event: x=%d y=%d button=%s pressed=%s abs=%s "
             "session=%s host_session=%s",
-            x, y, button, pressed, absolute,
+            x,
+            y,
+            button,
+            pressed,
+            absolute,
             self._session is not None,
             self._host_session is not None,
         )
@@ -833,8 +1017,9 @@ class RelayClient(QObject):
     @property
     def is_connected(self) -> bool:
         """Check if any session (host or client) is active."""
-        return (self._thread is not None and self._thread.is_alive()) or \
-               (self._host_thread is not None and self._host_thread.is_alive())
+        return (self._thread is not None and self._thread.is_alive()) or (
+            self._host_thread is not None and self._host_thread.is_alive()
+        )
 
     @property
     def role(self) -> RelayRole | None:
@@ -868,9 +1053,8 @@ class RelayClient(QObject):
         old_thread = self._host_thread
         if old_thread and old_thread.is_alive():
             logger.info(
-                "Previous host thread still alive — "
-                "creating new thread for session %s",
-                getattr(session, 'session_id', '?'),
+                "Previous host thread still alive — " "creating new thread for session %s",
+                getattr(session, "session_id", "?"),
             )
         self._host_thread = threading.Thread(target=session.start, daemon=True)
         self._host_thread.start()
@@ -900,9 +1084,8 @@ class RelayClient(QObject):
         old_thread = self._thread
         if old_thread and old_thread.is_alive():
             logger.info(
-                "Previous client thread still alive — "
-                "creating new thread for session %s",
-                getattr(session, 'session_id', '?'),
+                "Previous client thread still alive — " "creating new thread for session %s",
+                getattr(session, "session_id", "?"),
             )
         self._thread = threading.Thread(target=session.start, daemon=True)
         self._thread.start()
@@ -970,7 +1153,9 @@ class RelayClient(QObject):
             if t_frame > 10:  # only log if frame display takes >10ms
                 logger.debug(
                     "Frame display took %.1fms (discarded %d stale frames, poll took %.1fms)",
-                    t_frame, frame_count - 1, (time.time() - t_start) * 1000,
+                    t_frame,
+                    frame_count - 1,
+                    (time.time() - t_start) * 1000,
                 )
 
     def _poll_host_inbox(self) -> None:

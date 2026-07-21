@@ -21,8 +21,6 @@ from typing import Any
 
 import msgpack
 
-from opendesk.crypto.e2ee import EncryptedMessage
-
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -218,14 +216,18 @@ class Message:
             challenge-response auth to avoid sending the password
             in plaintext over the wire.
         """
-        return cls(MessageType.AUTH_REQUEST, {
-            "session_id": session_id,
-            "nonce": nonce,
-        })
+        return cls(
+            MessageType.AUTH_REQUEST,
+            {
+                "session_id": session_id,
+                "nonce": nonce,
+            },
+        )
 
     @classmethod
-    def auth_response(cls, nonce_hash: str, device_id: str = "",
-                      connection_mode: str = "remote_desktop") -> Message:
+    def auth_response(
+        cls, nonce_hash: str, device_id: str = "", connection_mode: str = "remote_desktop"
+    ) -> Message:
         """Respond to an authentication challenge.
 
         Parameters
@@ -241,11 +243,14 @@ class Message:
             "remote_desktop" (default) for full remote desktop,
             "file_transfer" for file-transfer-only mode (no streaming).
         """
-        return cls(MessageType.AUTH_RESPONSE, {
-            "nonce_hash": nonce_hash,
-            "device_id": device_id,
-            "connection_mode": connection_mode,
-        })
+        return cls(
+            MessageType.AUTH_RESPONSE,
+            {
+                "nonce_hash": nonce_hash,
+                "device_id": device_id,
+                "connection_mode": connection_mode,
+            },
+        )
 
     @classmethod
     def auth_ok(cls) -> Message:
@@ -257,7 +262,12 @@ class Message:
 
     @classmethod
     def video_frame(
-        cls, data: bytes, width: int, height: int, pts: int, keyframe: bool = False,
+        cls,
+        data: bytes,
+        width: int,
+        height: int,
+        pts: int,
+        keyframe: bool = False,
     ) -> Message:
         return cls(
             MessageType.VIDEO_FRAME,
@@ -272,14 +282,21 @@ class Message:
 
     @classmethod
     def mouse_event(
-        cls, x: int, y: int, button: int | None = None,
-        pressed: bool | None = None, absolute: bool = True,
+        cls,
+        x: int,
+        y: int,
+        button: int | None = None,
+        pressed: bool | None = None,
+        absolute: bool = True,
     ) -> Message:
         return cls(
             MessageType.MOUSE_EVENT,
             {
-                "x": x, "y": y, "button": button,
-                "pressed": pressed, "absolute": absolute,
+                "x": x,
+                "y": y,
+                "button": button,
+                "pressed": pressed,
+                "absolute": absolute,
             },
         )
 
@@ -297,8 +314,9 @@ class Message:
     # ── file transfer factories ──
 
     @classmethod
-    def file_request(cls, name: str, size: int, sha256: str = "",
-                     job_id: str = "", dest_path: str = "") -> Message:
+    def file_request(
+        cls, name: str, size: int, sha256: str = "", job_id: str = "", dest_path: str = ""
+    ) -> Message:
         """Request permission to send a file.
 
         Parameters
@@ -309,10 +327,16 @@ class Message:
         dest_path : str
             Remote directory path where the file should be saved.
         """
-        return cls(MessageType.FILE_REQUEST, {
-            "name": name, "size": size, "sha256": sha256,
-            "job_id": job_id, "dest_path": dest_path,
-        })
+        return cls(
+            MessageType.FILE_REQUEST,
+            {
+                "name": name,
+                "size": size,
+                "sha256": sha256,
+                "job_id": job_id,
+                "dest_path": dest_path,
+            },
+        )
 
     @classmethod
     def file_accept(cls, job_id: str) -> Message:
@@ -326,12 +350,22 @@ class Message:
 
     @classmethod
     def file_chunk(
-        cls, job_id: str, seq: int, data: bytes, is_last: bool = False,
+        cls,
+        job_id: str,
+        seq: int,
+        data: bytes,
+        is_last: bool = False,
     ) -> Message:
         """A chunk of file data."""
-        return cls(MessageType.FILE_CHUNK, {
-            "job_id": job_id, "seq": seq, "data": data, "is_last": is_last,
-        })
+        return cls(
+            MessageType.FILE_CHUNK,
+            {
+                "job_id": job_id,
+                "seq": seq,
+                "data": data,
+                "is_last": is_last,
+            },
+        )
 
     @classmethod
     def file_complete(cls, job_id: str) -> Message:
@@ -350,7 +384,10 @@ class Message:
 
     @classmethod
     def file_list_response(
-        cls, path: str, entries: list[dict], error: str = "",
+        cls,
+        path: str,
+        entries: list[dict],
+        error: str = "",
     ) -> Message:
         """Respond with a directory listing.
 
@@ -367,18 +404,24 @@ class Message:
         error : str
             Error message if listing failed.
         """
-        return cls(MessageType.FILE_LIST_RESPONSE, {
-            "path": path,
-            "entries": entries,
-            "error": error,
-        })
+        return cls(
+            MessageType.FILE_LIST_RESPONSE,
+            {
+                "path": path,
+                "entries": entries,
+                "error": error,
+            },
+        )
 
     @classmethod
     def file_download_request(cls, remote_path: str) -> Message:
         """Request to download a file from the remote peer."""
-        return cls(MessageType.FILE_DOWNLOAD_REQUEST, {
-            "remote_path": remote_path,
-        })
+        return cls(
+            MessageType.FILE_DOWNLOAD_REQUEST,
+            {
+                "remote_path": remote_path,
+            },
+        )
 
     @classmethod
     def file_download_accept(cls, job_id: str) -> Message:
@@ -388,9 +431,13 @@ class Message:
     @classmethod
     def file_download_reject(cls, job_id: str, reason: str = "") -> Message:
         """Reject an incoming download request."""
-        return cls(MessageType.FILE_DOWNLOAD_REJECT, {
-            "job_id": job_id, "reason": reason,
-        })
+        return cls(
+            MessageType.FILE_DOWNLOAD_REJECT,
+            {
+                "job_id": job_id,
+                "reason": reason,
+            },
+        )
 
     @classmethod
     def chat_message(cls, text: str) -> Message:
@@ -419,7 +466,8 @@ class Message:
 
     @classmethod
     def relay_register(
-        cls, session_id: str = "",
+        cls,
+        session_id: str = "",
         device_id: str = "",
         device_name: str = "",
     ) -> Message:
@@ -465,8 +513,9 @@ class Message:
         )
 
     @classmethod
-    def camera_frame(cls, data: bytes, width: int, height: int, pts: int,
-                     fmt: str = "jpeg") -> Message:
+    def camera_frame(
+        cls, data: bytes, width: int, height: int, pts: int, fmt: str = "jpeg"
+    ) -> Message:
         """A webcam video frame (JPEG-encoded by default)."""
         return cls(
             MessageType.CAMERA_FRAME,
@@ -480,8 +529,7 @@ class Message:
         )
 
     @classmethod
-    def camera_start(cls, enabled: bool, width: int = 0, height: int = 0,
-                     fps: int = 0) -> Message:
+    def camera_start(cls, enabled: bool, width: int = 0, height: int = 0, fps: int = 0) -> Message:
         """Notify peer that the webcam stream started or stopped."""
         return cls(
             MessageType.CAMERA_START,
