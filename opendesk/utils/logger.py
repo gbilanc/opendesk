@@ -86,7 +86,9 @@ def setup_logging(level: int | None = None) -> None:
 
     1. *level* parameter (if not ``None``)
     2. ``OPENDESK_LOG_LEVEL`` environment variable (if set)
-    3. ``logging.DEBUG`` (default, suitable for development)
+    3. ``logging.INFO`` (default, suitable for production)
+
+    For development with verbose logging, set OPENDESK_LOG_LEVEL=DEBUG.
 
     Logs are written to a file that rotates every 24 hours (at midnight).
     Use ``journalctl`` (Linux systemd), ``Console.app`` (macOS), or
@@ -106,7 +108,7 @@ def setup_logging(level: int | None = None) -> None:
         if env is not None:
             level = parse_log_level(env)
         else:
-            level = logging.DEBUG
+            level = logging.INFO
 
     # ── Log file path ──────────────────────────────────────────────
     log_dir = _log_directory()
