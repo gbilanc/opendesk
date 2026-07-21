@@ -28,6 +28,7 @@ dependencies = [
     "msgpack>=1.0.0",
     "python-xlib>=0.33",
     "soundcard>=0.4.6",
+    "evdev>=1.9.3",
 ]
 
 [project.optional-dependencies]
