@@ -299,16 +299,44 @@ class EncoderWorker(threading.Thread):
                     self._encoder.release()
                     self._encoder = None
 
-        # Flush encoder residuals
+        # Flush only on a natural end. During shutdown the network worker
+        # may already be stopped, therefore blocking puts would deadlock.
         if self._encoder:
-            for pkt in self._encoder.flush():
-                self._pkt_queue.put(pkt)
+            if not self._stop_event.is_set():
+                for pkt in self._encoder.flush():
+                    self._queue_packet(pkt, keyframe=True)
             self._encoder.release()
 
         logger.info("EncoderWorker stopped")
 
     def request_keyframe(self) -> None:
         self._force_full_keyframe = True
+
+    def _queue_packet(self, packet: object, *, keyframe: bool = False) -> bool:
+        """Queue output without letting congestion block encoder shutdown.
+
+        Delta tiles may be dropped under congestion because a subsequent tile
+        refreshes the same region. A keyframe instead replaces stale queued
+        packets, preserving a fresh decoder reference frame.
+        """
+        try:
+            self._pkt_queue.put(packet, timeout=0.1)
+            return True
+        except queue.Full:
+            if not keyframe:
+                logger.debug("EncoderWorker: packet queue full, dropping tile")
+                return False
+            while True:
+                try:
+                    self._pkt_queue.get_nowait()
+                except queue.Empty:
+                    break
+            try:
+                self._pkt_queue.put_nowait(packet)
+                logger.debug("EncoderWorker: replaced stale packets with keyframe")
+                return True
+            except queue.Full:
+                return False
 
     # ── internals ──────────────────────────────────────────────────
 
@@ -320,8 +348,7 @@ class EncoderWorker(threading.Thread):
         self._encoder.request_keyframe()
         packets = self._encoder.encode(rgb)
         for pkt in packets:
-            self._pkt_queue.put(pkt)
-            if self._on_send_full_keyframe:
+            if self._queue_packet(pkt, keyframe=True) and self._on_send_full_keyframe:
                 self._on_send_full_keyframe(pkt.data, w, h, pts, pkt.is_keyframe)
 
     def _do_tiles(self, current: np.ndarray, w: int, h: int, pts: int) -> None:
@@ -383,8 +410,8 @@ class EncoderWorker(threading.Thread):
             return
 
         for tile_data, tx, ty, tw, th in tiles:
-            self._pkt_queue.put(("tile", tile_data, tx, ty, tw, th, pts))
-            if self._on_send_tile:
+            packet = ("tile", tile_data, tx, ty, tw, th, pts)
+            if self._queue_packet(packet) and self._on_send_tile:
                 self._on_send_tile(tile_data, tx, ty, tw, th, pts)
 
     # ── adaptive quality ────────────────────────────────────────────

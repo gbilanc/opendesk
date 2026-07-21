@@ -117,7 +117,8 @@ class _RelaySession:
         self._reference_frame: np.ndarray | None = None
         self._frame_width: int = 0
         self._frame_height: int = 0
-        self._last_keyframe_time: float = 0.0  # for watchdog
+        self._last_keyframe_time: float = 0.0
+        self._last_video_activity_time: float = 0.0
         self._start_time: float = time.time()
 
     # ── lifecycle ───────────────────────────────────────────────────
@@ -495,16 +496,14 @@ class _RelaySession:
         async def _keyframe_watchdog():
             while self._running.is_set():
                 await asyncio.sleep(3.0)
-                elapsed_since_last = 0.0
-                if self._last_keyframe_time > 0:
-                    elapsed_since_last = time.time() - self._last_keyframe_time
-                elif self._last_keyframe_time == 0:
-                    # No keyframe EVER received — started waiting at
-                    # session start, not after first keyframe
-                    elapsed_since_last = time.time() - self._start_time
-                if elapsed_since_last > 5.0:
-                    logger.info("No keyframe for %.0fs — requesting one", elapsed_since_last)
-                    self._last_keyframe_time = time.time()
+                last_activity = self._last_video_activity_time or self._start_time
+                elapsed_since_activity = time.time() - last_activity
+                if elapsed_since_activity > 5.0:
+                    logger.info(
+                        "No video activity for %.0fs — requesting keyframe",
+                        elapsed_since_activity,
+                    )
+                    self._last_video_activity_time = time.time()
                     await self._send_async(
                         Message(MessageType.VIDEO_REQUEST_KEYFRAME, {}),
                     )
@@ -612,7 +611,9 @@ class _RelaySession:
                                 self._reference_frame = rgb.copy()
                                 self._frame_width = width
                                 self._frame_height = height
-                                self._last_keyframe_time = time.time()
+                                now = time.time()
+                                self._last_keyframe_time = now
+                                self._last_video_activity_time = now
                                 self.inbox.put(
                                     ("frame", (rgb.copy(), width, height), self.session_seq),
                                 )
@@ -674,6 +675,7 @@ class _RelaySession:
                                 ref_h, ref_w = self._reference_frame.shape[:2]
                                 if ty + th <= ref_h and tx + tw <= ref_w:
                                     self._reference_frame[ty : ty + th, tx : tx + tw] = tile_rgb
+                                    self._last_video_activity_time = time.time()
                                     self.inbox.put(
                                         (
                                             "frame",
