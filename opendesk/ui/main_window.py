@@ -12,6 +12,7 @@ import logging
 import queue
 import time
 import uuid
+from pathlib import Path
 
 import numpy as np
 
@@ -671,14 +672,25 @@ class MainWindow(QMainWindow):
             if self._clipboard_sync.enabled:
                 self._clipboard_sync.receive_from_remote(msg)
         elif msg.type == MessageType.FILE_REQUEST:
-            # Auto-accept incoming file transfer.
-            # The sender may have included a "dest_path" in the
-            # FILE_REQUEST payload, which handle_file_request will
-            # store as job.file_info.path so _finalize_receive saves
-            # to the chosen remote directory.
             job_id = self._file_transfer.handle_file_request(msg)
-            if job_id:
-                self._relay.send_message(Message.file_accept(job_id))
+            job = self._file_transfer.get_job(job_id) if job_id else None
+            if job is None:
+                return
+            destination = job.file_info.path or str(Path.home() / "Downloads" / "OpenDesk")
+            reply = QMessageBox.question(
+                self,
+                "Incoming file transfer",
+                f"Accept '{job.file_info.name}' ({job.file_info.size:,} bytes)\n"
+                f"Destination: {destination}?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes and self._file_transfer.accept_incoming(job.id):
+                self._relay.send_message(Message.file_accept(job.id))
+            else:
+                reason = job.error or "Rejected by local user"
+                self._file_transfer.reject_incoming(job.id, reason)
+                self._relay.send_message(Message.file_reject(job.id, reason))
         elif msg.type == MessageType.FILE_CHUNK:
             self._file_transfer.handle_chunk(msg)
             job_id = msg.payload.get("job_id", "")
@@ -700,15 +712,16 @@ class MainWindow(QMainWindow):
                 job.error = reason
                 if self._transfer_dock is not None:
                     self._transfer_dock.add_transfer(job)
-        elif msg.type in (MessageType.FILE_COMPLETE, MessageType.FILE_ERROR):
-            job_id = msg.payload.get("job_id", "")
-            job = self._file_transfer.get_job(job_id)
+        elif msg.type == MessageType.FILE_COMPLETE:
+            self._file_transfer.handle_file_complete(msg)
+            job = self._file_transfer.get_job(msg.payload.get("job_id", ""))
+            if job and self._transfer_dock is not None:
+                self._transfer_dock.add_transfer(job)
+        elif msg.type == MessageType.FILE_ERROR:
+            job = self._file_transfer.get_job(msg.payload.get("job_id", ""))
             if job:
-                if msg.type == MessageType.FILE_COMPLETE:
-                    job.state = TransferState.COMPLETED
-                else:
-                    job.state = TransferState.FAILED
-                    job.error = msg.payload.get("error", "Unknown error")
+                job.state = TransferState.FAILED
+                job.error = msg.payload.get("error", "Unknown error")
                 if self._transfer_dock is not None:
                     self._transfer_dock.add_transfer(job)
         elif msg.type == MessageType.FILE_LIST_REQUEST:

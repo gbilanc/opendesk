@@ -5,19 +5,21 @@ Tests for advanced modules: file transfer, clipboard sync, audio, unattended.
 from __future__ import annotations
 
 import asyncio
-import json
 import tempfile
 from pathlib import Path
 
 import pytest
 
 from opendesk.core.file_transfer import (
-    FileTransferManager, TransferJob, TransferDirection, TransferState, FileInfo,
+    FileTransferManager,
+    TransferJob,
+    TransferDirection,
+    TransferState,
+    FileInfo,
 )
 from opendesk.core.clipboard_sync import ClipboardSync
 from opendesk.core.unattended import UnattendedAccess
 from opendesk.crypto.auth import hash_password, verify_password
-
 
 # ======================================================================
 # File transfer tests
@@ -34,50 +36,102 @@ class TestFileTransferManager:
     def test_handle_file_request(self) -> None:
         mgr = FileTransferManager()
         from opendesk.network.protocol import Message, MessageType
-        msg = Message(MessageType.FILE_REQUEST, {
-            "name": "report.pdf",
-            "size": 50000,
-            "sha256": "abc123",
-        })
+
+        msg = Message(
+            MessageType.FILE_REQUEST,
+            {
+                "name": "report.pdf",
+                "size": 50000,
+                "sha256": "abc123",
+            },
+        )
         job_id = mgr.handle_file_request(msg)
         assert job_id is not None
         assert job_id.startswith("recv-")
         assert len(mgr.jobs) == 1
         assert mgr.jobs[0].file_info.name == "report.pdf"
+        assert mgr.jobs[0].state == TransferState.PENDING
+        mgr.shutdown()
 
-    def test_handle_chunk(self) -> None:
-        mgr = FileTransferManager()
+    def test_handle_chunk_streams_to_disk_and_verifies_checksum(self, tmp_path: Path) -> None:
+        mgr = FileTransferManager(receive_root=tmp_path)
         from opendesk.network.protocol import Message, MessageType
 
-        msg = Message(MessageType.FILE_REQUEST, {
-            "name": "data.bin", "size": 200, "sha256": "",
-        })
-        job_id = mgr.handle_file_request(msg)
-        assert job_id is not None
-
-        # Send chunks
         chunk1 = b"hello " * 20
         chunk2 = b"world" * 40
-        msg1 = Message(MessageType.FILE_CHUNK, {
-            "job_id": job_id, "seq": 0, "data": chunk1, "is_last": False,
-        })
-        msg2 = Message(MessageType.FILE_CHUNK, {
-            "job_id": job_id, "seq": 1, "data": chunk2, "is_last": True,
-        })
-        mgr.handle_chunk(msg1)
-        mgr.handle_chunk(msg2)
+        payload = chunk1 + chunk2
+        msg = Message(
+            MessageType.FILE_REQUEST,
+            {
+                "name": "data.bin",
+                "size": len(payload),
+                "sha256": __import__("hashlib").sha256(payload).hexdigest(),
+            },
+        )
+        job_id = mgr.handle_file_request(msg)
+        assert job_id is not None
+        assert mgr.accept_incoming(job_id)
+
+        mgr.handle_chunk(
+            Message(
+                MessageType.FILE_CHUNK,
+                {
+                    "job_id": job_id,
+                    "seq": 0,
+                    "data": chunk1,
+                    "is_last": False,
+                },
+            )
+        )
+        mgr.handle_chunk(
+            Message(
+                MessageType.FILE_CHUNK,
+                {
+                    "job_id": job_id,
+                    "seq": 1,
+                    "data": chunk2,
+                    "is_last": False,
+                },
+            )
+        )
+        assert mgr.handle_file_complete(Message.file_complete(job_id))
 
         job = mgr.jobs[0]
         assert job.state == TransferState.COMPLETED
-        assert job.bytes_transferred == len(chunk1) + len(chunk2)
+        assert Path(job.final_path).read_bytes() == payload
+        assert job.bytes_transferred == len(payload)
+        mgr.shutdown()
+
+    def test_rejects_path_traversal_filename(self) -> None:
+        mgr = FileTransferManager()
+        from opendesk.network.protocol import Message, MessageType
+
+        job_id = mgr.handle_file_request(
+            Message(
+                MessageType.FILE_REQUEST,
+                {
+                    "name": "../../.ssh/authorized_keys",
+                    "size": 1,
+                    "sha256": "",
+                },
+            )
+        )
+        assert job_id is not None
+        assert mgr.jobs[0].file_info.name == "authorized_keys"
+        mgr.shutdown()
 
     def test_cancel_job(self) -> None:
         mgr = FileTransferManager()
         from opendesk.network.protocol import Message, MessageType
 
-        msg = Message(MessageType.FILE_REQUEST, {
-            "name": "cancel.txt", "size": 100, "sha256": "",
-        })
+        msg = Message(
+            MessageType.FILE_REQUEST,
+            {
+                "name": "cancel.txt",
+                "size": 100,
+                "sha256": "",
+            },
+        )
         job_id = mgr.handle_file_request(msg)
         assert mgr.cancel_job(job_id)
         assert mgr.jobs[0].state == TransferState.CANCELLED
@@ -87,33 +141,32 @@ class TestFileTransferManager:
         from opendesk.network.protocol import Message, MessageType
 
         for i in range(3):
-            msg = Message(MessageType.FILE_REQUEST, {
-                "name": f"file{i}.txt", "size": 100, "sha256": "",
-            })
+            msg = Message(
+                MessageType.FILE_REQUEST,
+                {
+                    "name": f"file{i}.txt",
+                    "size": 100,
+                    "sha256": "",
+                },
+            )
             mgr.handle_file_request(msg)
 
         assert len(mgr.jobs) == 3
         assert len(mgr.active_jobs) == 3
 
     def test_send_files_empty_list(self) -> None:
-        """Sending an empty file list returns empty jobs."""
+        """Sending an empty file list leaves the job list empty."""
         mgr = FileTransferManager()
-
-        async def _test():
-            jobs = await mgr.send_files([], lambda m: None)  # type: ignore[arg-type]
-            assert len(jobs) == 0
-
-        asyncio.run(_test())
+        mgr.send_files([], lambda _msg: None).result(timeout=1)
+        assert mgr.jobs == []
+        mgr.shutdown()
 
     def test_send_files_nonexistent(self) -> None:
         """Non-existent files are silently skipped."""
         mgr = FileTransferManager()
-
-        async def _test():
-            jobs = await mgr.send_files(["/nonexistent/file.txt"], lambda m: None)  # type: ignore[arg-type]
-            assert len(jobs) == 0
-
-        asyncio.run(_test())
+        mgr.send_files(["/nonexistent/file.txt"], lambda _msg: None).result(timeout=1)
+        assert mgr.jobs == []
+        mgr.shutdown()
 
     def test_file_info_from_path(self) -> None:
         with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
@@ -157,6 +210,7 @@ class TestClipboardSync:
         cs.text_received.connect(on_text)
 
         from opendesk.network.protocol import Message, MessageType
+
         msg = Message(MessageType.CLIPBOARD_TEXT, {"text": "Hello from remote!"})
 
         async def _test():
@@ -287,6 +341,7 @@ class TestUnattendedAccess:
 class TestInputBackend:
     def test_platform_backend_creation(self) -> None:
         from opendesk.core.input_injection import create_input_backend
+
         backend = create_input_backend()
         assert backend is not None
         assert hasattr(backend, "move_mouse")
@@ -296,9 +351,13 @@ class TestInputBackend:
 
     def test_backend_has_all_methods(self) -> None:
         from opendesk.core.input_injection import (
-            InputBackend, X11InputBackend, WaylandInputBackend,
-            WindowsInputBackend, MacOSInputBackend,
+            InputBackend,
+            X11InputBackend,
+            WaylandInputBackend,
+            WindowsInputBackend,
+            MacOSInputBackend,
         )
+
         for cls in [X11InputBackend, WaylandInputBackend, WindowsInputBackend, MacOSInputBackend]:
             assert issubclass(cls, InputBackend)
 
@@ -311,12 +370,14 @@ class TestInputBackend:
 class TestCaptureBackend:
     def test_auto_detect(self) -> None:
         from opendesk.core.platform_config import get_platform_config
+
         cfg = get_platform_config()
         # On CI/headless this should return MSS, but any valid method is fine
         assert cfg.capture_method is not None
 
     def test_pipewire_availability_check(self) -> None:
         from opendesk.core.screen_capture import PipeWireCapture
+
         pw = PipeWireCapture()
         # On most systems without Wayland, this should be False
         available = pw.is_available()
@@ -324,6 +385,7 @@ class TestCaptureBackend:
 
     def test_monitor_info_frozen(self) -> None:
         from opendesk.core.screen_capture import MonitorInfo
+
         m = MonitorInfo(index=0, name="Test", left=0, top=0, width=1920, height=1080)
         assert m.size == (1920, 1080)
         assert not m.is_primary
@@ -331,6 +393,7 @@ class TestCaptureBackend:
     def test_captured_frame_properties(self) -> None:
         from opendesk.core.screen_capture import CapturedFrame
         import numpy as np
+
         data = np.zeros((100, 200, 3), dtype=np.uint8)
         f = CapturedFrame(data=data, monitor_index=0, timestamp=0.0, region=(0, 0, 200, 100))
         assert f.width == 200

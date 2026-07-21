@@ -14,6 +14,7 @@ import secrets
 import string
 import time
 import uuid
+from pathlib import Path
 
 import numpy as np
 
@@ -89,6 +90,7 @@ class HostService(QObject):
     chat_message_received = Signal(str, bool)
     chat_open_requested = Signal(bool)
     file_transfer_started = Signal()
+    incoming_file_requested = Signal(str)  # pending TransferJob id
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -307,6 +309,20 @@ class HostService(QObject):
         except queue.Empty:
             pass
 
+    def respond_to_incoming_file(self, job_id: str, accepted: bool) -> None:
+        """Accept or reject a file request after the host user decides."""
+        job = self._file_transfer.get_job(job_id)
+        if job is None:
+            return
+        if accepted and self._file_transfer.accept_incoming(job_id):
+            self._relay.send_message(Message.file_accept(job_id))
+            self.file_transfer_started.emit()
+            return
+
+        reason = job.error or "Rejected by local user"
+        self._file_transfer.reject_incoming(job_id, reason)
+        self._relay.send_message(Message.file_reject(job_id, reason))
+
     # ── host event handlers ─────────────────────────────────────────────
 
     @Slot(str, str)
@@ -423,8 +439,7 @@ class HostService(QObject):
         elif t == MessageType.FILE_REQUEST:
             job_id = self._file_transfer.handle_file_request(msg)
             if job_id:
-                self._relay.send_message(Message.file_accept(job_id))
-                self.file_transfer_started.emit()
+                self.incoming_file_requested.emit(job_id)
         elif t == MessageType.FILE_CHUNK:
             self._file_transfer.handle_chunk(msg)
         elif t == MessageType.FILE_ACCEPT:
@@ -439,15 +454,13 @@ class HostService(QObject):
             if job:
                 job.state = TransferState.CANCELLED
                 job.error = reason
-        elif t in (MessageType.FILE_COMPLETE, MessageType.FILE_ERROR):
-            job_id = msg.payload.get("job_id", "")
-            job = self._file_transfer.get_job(job_id)
+        elif t == MessageType.FILE_COMPLETE:
+            self._file_transfer.handle_file_complete(msg)
+        elif t == MessageType.FILE_ERROR:
+            job = self._file_transfer.get_job(msg.payload.get("job_id", ""))
             if job:
-                if t == MessageType.FILE_COMPLETE:
-                    job.state = TransferState.COMPLETED
-                else:
-                    job.state = TransferState.FAILED
-                    job.error = msg.payload.get("error", "Unknown error")
+                job.state = TransferState.FAILED
+                job.error = msg.payload.get("error", "Unknown error")
         elif t == MessageType.FILE_LIST_REQUEST:
             response = self._file_transfer.handle_list_request(msg)
             self._relay.send_message(response)
@@ -839,6 +852,7 @@ class HostWindow(QMainWindow):
         svc.chat_message_received.connect(self._on_chat_message)
         svc.chat_open_requested.connect(self._on_chat_open)
         svc.file_transfer_started.connect(self._on_file_transfer_event)
+        svc.incoming_file_requested.connect(self._on_incoming_file_request)
 
     # ── Slots: stato ─────────────────────────────────────────────────────
 
@@ -918,6 +932,25 @@ class HostWindow(QMainWindow):
         self._service.relay.send_message(Message.chat_message(text))
 
     # ── File transfer handlers ──────────────────────────────────────────
+
+    @Slot(str)
+    def _on_incoming_file_request(self, job_id: str) -> None:
+        """Ask the host user before accepting a remote file upload."""
+        job = self._service.file_transfer.get_job(job_id)
+        if job is None:
+            return
+        destination = job.file_info.path or str(Path.home() / "Downloads" / "OpenDesk")
+        reply = QMessageBox.question(
+            self,
+            "Incoming file transfer",
+            f"Accept '{job.file_info.name}' ({job.file_info.size:,} bytes)\n"
+            f"Destination: {destination}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        self._service.respond_to_incoming_file(
+            job_id, reply == QMessageBox.StandardButton.Yes
+        )
 
     @Slot()
     def _on_file_transfer_event(self) -> None:

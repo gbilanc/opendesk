@@ -23,12 +23,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-import os
 import queue
 import threading
 import time
+import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from concurrent.futures import Future
+from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
 
@@ -42,6 +43,8 @@ logger = logging.getLogger(__name__)
 
 _CHUNK_SIZE = 64 * 1024  # 64 KiB
 _MAX_CONCURRENT = 4
+_MAX_FILE_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB safety limit
+_PART_SUFFIX = ".opendesk-part"
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +102,9 @@ class TransferJob:
     started_at: float = 0.0
     completed_at: float = 0.0
     error: str = ""
-    chunk_buffer: bytearray = field(default_factory=bytearray)
+    expected_seq: int = 0
+    temp_path: str = ""
+    final_path: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -141,10 +146,11 @@ class _BgEventLoop:
         self._loop = None
         self._thread = None
 
-    def run(self, coro) -> asyncio.Future:
+    def run(self, coro) -> Future:
         """Schedule a coroutine on the background loop.
 
-        Returns an ``asyncio.Future`` that can be awaited or polled.
+        Returns a thread-safe future that can be polled or awaited via
+        ``result()`` from non-async callers.
         """
         if self._loop is None or not self._loop.is_running():
             raise RuntimeError("Background event loop not running")
@@ -180,10 +186,17 @@ class FileTransferManager:
     The Qt main thread should poll ``updates`` with a QTimer (~200 ms).
     """
 
-    def __init__(self, max_concurrent: int = _MAX_CONCURRENT) -> None:
+    def __init__(
+        self,
+        max_concurrent: int = _MAX_CONCURRENT,
+        receive_root: str | Path | None = None,
+    ) -> None:
         self._max_concurrent = max_concurrent
         self._jobs: dict[str, TransferJob] = {}
         self._active_count: int = 0
+        self._receive_root = (
+            Path(receive_root or Path.home() / "Downloads" / "OpenDesk").expanduser().resolve()
+        )
 
         # Background event loop for async operations
         self._bg_loop = _BgEventLoop()
@@ -206,9 +219,16 @@ class FileTransferManager:
 
     @property
     def active_jobs(self) -> list[TransferJob]:
-        return [j for j in self._jobs.values() if j.state in (
-            TransferState.PENDING, TransferState.ACCEPTED, TransferState.IN_PROGRESS,
-        )]
+        return [
+            j
+            for j in self._jobs.values()
+            if j.state
+            in (
+                TransferState.PENDING,
+                TransferState.ACCEPTED,
+                TransferState.IN_PROGRESS,
+            )
+        ]
 
     @property
     def completed_jobs(self) -> list[TransferJob]:
@@ -225,7 +245,7 @@ class FileTransferManager:
         paths: list[str | Path],
         send_fn: Callable,
         remote_dest_path: str = "",
-    ) -> None:
+    ) -> Future:
         """Initiate file transfers for the given paths.
 
         Parameters
@@ -239,7 +259,7 @@ class FileTransferManager:
             Remote directory where the files should be saved.
             Passed to the receiver via FILE_REQUEST payload.
         """
-        self._bg_loop.run(self._send_files_async(paths, send_fn, remote_dest_path))
+        return self._bg_loop.run(self._send_files_async(paths, send_fn, remote_dest_path))
 
     async def _send_files_async(
         self,
@@ -256,7 +276,7 @@ class FileTransferManager:
                 continue
 
             file_info = FileInfo.from_path(path_obj)
-            job_id = f"send-{int(time.time())}-{file_info.name}"
+            job_id = f"send-{uuid.uuid4().hex}"
             job = TransferJob(
                 id=job_id,
                 file_info=file_info,
@@ -274,13 +294,15 @@ class FileTransferManager:
         # the same identifier for the transfer.  Include the remote
         # destination path so the receiver knows where to save.
         for job in jobs:
-            send_fn(Message.file_request(
-                job.file_info.name,
-                job.file_info.size,
-                job.file_info.sha256,
-                job_id=job.id,
-                dest_path=remote_dest_path,
-            ))
+            send_fn(
+                Message.file_request(
+                    job.file_info.name,
+                    job.file_info.size,
+                    job.file_info.sha256,
+                    job_id=job.id,
+                    dest_path=remote_dest_path,
+                )
+            )
             self._push_update("transfer", job.id)
 
     def send_chunks(
@@ -321,11 +343,7 @@ class FileTransferManager:
                 if not chunk:
                     break
 
-                msg = Message.file_chunk(
-                    job.id, seq, chunk,
-                    is_last=len(chunk) < _CHUNK_SIZE,
-                )
-                send_fn(msg)
+                send_fn(Message.file_chunk(job.id, seq, chunk, is_last=False))
 
                 job.bytes_transferred += len(chunk)
                 job.progress = job.bytes_transferred / job.file_info.size
@@ -338,6 +356,7 @@ class FileTransferManager:
                 # Yield control between chunks
                 await asyncio.sleep(0)
 
+        send_fn(Message.file_complete(job.id))
         job.state = TransferState.COMPLETED
         job.completed_at = time.time()
         self._push_update("transfer", job.id)
@@ -346,87 +365,139 @@ class FileTransferManager:
     # ── receiving ───────────────────────────────────────────────────
 
     def handle_file_request(self, msg: Message) -> str | None:
-        """Handle an incoming file request.
+        """Register an incoming transfer pending explicit local approval."""
+        try:
+            name = self._safe_filename(msg.payload.get("name", ""))
+            size = int(msg.payload.get("size", 0))
+        except (TypeError, ValueError):
+            return None
+        if size < 0 or size > _MAX_FILE_SIZE:
+            logger.warning("Rejected incoming file %s: invalid size %d", name, size)
+            return None
 
-        Uses the sender's ``job_id`` so both sides agree on the same
-        identifier for the transfer.  If the sender included a
-        ``dest_path``, it is used as the save location, otherwise the
-        default ``~/Downloads/OpenDesk`` is used.
+        job_id = str(msg.payload.get("job_id", "")) or f"recv-{uuid.uuid4().hex}"
+        if job_id in self._jobs:
+            logger.warning("Rejected duplicate incoming job: %s", job_id)
+            return None
 
-        Returns the job ID if accepted, or ``None`` to reject.
-        """
-        name = msg.payload.get("name", "unknown")
-        size = msg.payload.get("size", 0)
-        sha256 = msg.payload.get("sha256", "")
-        # Use the sender's job_id so FILE_ACCEPT echoes back an ID
-        # that the sender can find in its own job registry.
-        job_id = msg.payload.get("job_id", "") or f"recv-{int(time.time())}-{name}"
-
-        file_info = FileInfo(name=name, size=size, sha256=sha256)
         job = TransferJob(
             id=job_id,
-            file_info=file_info,
+            file_info=FileInfo(
+                name=name,
+                size=size,
+                sha256=str(msg.payload.get("sha256", "")),
+                path=str(msg.payload.get("dest_path", "")),
+            ),
             direction=TransferDirection.RECEIVE,
         )
-
-        # If the sender told us where to save, honour it.
-        dest_path = msg.payload.get("dest_path", "")
-        if dest_path:
-            job.file_info.path = dest_path
-            logger.info(
-                "Incoming file: %s (%d bytes) → %s [job=%s]",
-                name, size, dest_path, job_id,
-            )
-        else:
-            logger.info(
-                "Incoming file: %s (%d bytes) → default location [job=%s]",
-                name, size, job_id,
-            )
-
         self._jobs[job_id] = job
-        job.state = TransferState.ACCEPTED
-        job.started_at = time.time()
         self._push_update("transfer", job_id)
+        logger.info("Incoming file awaiting approval: %s (%d bytes) [job=%s]", name, size, job_id)
         return job_id
 
-    def handle_chunk(self, msg: Message) -> None:
-        """Process an incoming file chunk."""
-        job_id = msg.payload.get("job_id", "")
-        seq = msg.payload.get("seq", 0)
-        data = msg.payload.get("data", b"")
-        is_last = msg.payload.get("is_last", False)
-
+    def accept_incoming(self, job_id: str) -> bool:
+        """Approve a pending incoming file and create its temporary target."""
         job = self._jobs.get(job_id)
-        if job is None:
-            logger.warning("Chunk for unknown job: %s", job_id)
-            return
+        if job is None or job.direction != TransferDirection.RECEIVE:
+            return False
+        try:
+            dest_dir = self._resolve_receive_dir(job.file_info.path)
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            final_path = self._unique_destination(dest_dir, job.file_info.name)
+            temp_path = final_path.with_name(f".{final_path.name}.{job.id}{_PART_SUFFIX}")
+            temp_path.touch(exist_ok=False)
+            job.final_path = str(final_path)
+            job.temp_path = str(temp_path)
+            job.file_info.path = str(dest_dir)
+            job.state = TransferState.ACCEPTED
+            job.started_at = time.time()
+            self._push_update("transfer", job.id)
+            return True
+        except OSError as e:
+            self._fail_job(job, f"Cannot prepare destination: {e}")
+            return False
 
-        job.chunk_buffer.extend(data)
-        job.bytes_transferred += len(data)
-        if job.file_info.size > 0:
-            job.progress = job.bytes_transferred / job.file_info.size
-        else:
-            job.progress = 1.0 if is_last else 0.0
-
-        if is_last:
-            if job.file_info.path:
-                custom_path = Path(job.file_info.path)
-                if custom_path.is_dir():
-                    dest_dir = custom_path
-                else:
-                    dest_dir = custom_path.parent
-                self._finalize_receive(job, dest_dir=dest_dir)
-            else:
-                self._finalize_receive(job)
-
-        logger.debug("Chunk %d for %s (%d/%d bytes)", seq, job_id, job.bytes_transferred, job.file_info.size)
-
-    def cancel_job(self, job_id: str) -> bool:
-        """Cancel a transfer job."""
+    def reject_incoming(self, job_id: str, reason: str = "Rejected by local user") -> bool:
+        """Reject a pending incoming transfer and remove partial data."""
         job = self._jobs.get(job_id)
         if job is None:
             return False
         job.state = TransferState.CANCELLED
+        job.error = reason
+        self._remove_partial(job)
+        self._push_update("transfer", job.id)
+        return True
+
+    def handle_chunk(self, msg: Message) -> None:
+        """Append one validated chunk directly to the temporary file."""
+        job_id = str(msg.payload.get("job_id", ""))
+        job = self._jobs.get(job_id)
+        if job is None or job.direction != TransferDirection.RECEIVE:
+            logger.warning("Chunk for unknown job: %s", job_id)
+            return
+        if job.state not in (TransferState.ACCEPTED, TransferState.IN_PROGRESS):
+            self._fail_job(job, "Chunk received before local approval")
+            return
+
+        seq = msg.payload.get("seq")
+        data = msg.payload.get("data", b"")
+        if not isinstance(seq, int) or seq != job.expected_seq or not isinstance(data, bytes):
+            self._fail_job(job, "Invalid or out-of-order file chunk")
+            return
+        if job.file_info.size and job.bytes_transferred + len(data) > job.file_info.size:
+            self._fail_job(job, "Received more bytes than declared")
+            return
+
+        try:
+            with open(job.temp_path, "ab") as target:
+                target.write(data)
+        except OSError as e:
+            self._fail_job(job, f"Write failed: {e}")
+            return
+
+        job.expected_seq += 1
+        job.bytes_transferred += len(data)
+        job.progress = job.bytes_transferred / job.file_info.size if job.file_info.size else 0.0
+        job.state = TransferState.IN_PROGRESS
+        if msg.payload.get("is_last", False):  # compatibility with legacy peers
+            self.handle_file_complete(Message.file_complete(job.id))
+        elif job.expected_seq % 10 == 0:
+            self._push_update("transfer", job.id)
+
+    def handle_file_complete(self, msg: Message) -> bool:
+        """Validate size/hash and atomically promote a completed transfer."""
+        job = self._jobs.get(str(msg.payload.get("job_id", "")))
+        if job is None or job.direction != TransferDirection.RECEIVE:
+            return False
+        if job.file_info.size and job.bytes_transferred != job.file_info.size:
+            self._fail_job(job, "Received size differs from declared size")
+            self._remove_partial(job)
+            return False
+        try:
+            checksum = self._sha256_file(Path(job.temp_path))
+            if job.file_info.sha256 and checksum != job.file_info.sha256:
+                self._fail_job(job, "SHA-256 verification failed")
+                self._remove_partial(job)
+                return False
+            Path(job.temp_path).replace(job.final_path)
+        except OSError as e:
+            self._fail_job(job, f"Finalization failed: {e}")
+            return False
+
+        job.state = TransferState.COMPLETED
+        job.progress = 1.0
+        job.completed_at = time.time()
+        self._push_update("transfer", job.id)
+        logger.info("File received: %s (%d bytes)", job.final_path, job.bytes_transferred)
+        return True
+
+    def cancel_job(self, job_id: str) -> bool:
+        """Cancel a transfer and remove any partial receive file."""
+        job = self._jobs.get(job_id)
+        if job is None:
+            return False
+        job.state = TransferState.CANCELLED
+        self._remove_partial(job)
         self._push_update("transfer", job_id)
         logger.info("Job cancelled: %s", job_id)
         return True
@@ -452,31 +523,46 @@ class FileTransferManager:
         self._push_update("transfer", job.id)
         logger.error("Transfer failed: %s — %s", job.file_info.name, error)
 
-    def _finalize_receive(self, job: TransferJob, dest_dir: str | Path | None = None) -> None:
-        """Write received data to disk.
+    @staticmethod
+    def _safe_filename(value: object) -> str:
+        name = Path(str(value)).name
+        if not name or name in {".", ".."}:
+            raise ValueError("Invalid file name")
+        return name
 
-        Parameters
-        ----------
-        job : TransferJob
-            The completed receive job.
-        dest_dir : str or Path, optional
-            Custom destination directory. Defaults to ~/Downloads/OpenDesk.
-        """
-        if dest_dir is None:
-            dest_dir = Path.home() / "Downloads" / "OpenDesk"
-        dest_dir = Path(dest_dir)
-        dest_dir.mkdir(parents=True, exist_ok=True)
+    def _resolve_receive_dir(self, requested: str) -> Path:
+        if not requested:
+            return self._receive_root
+        candidate = Path(requested).expanduser().resolve()
+        home = Path.home().resolve()
+        if not candidate.is_dir() or not candidate.is_relative_to(home):
+            raise OSError("Destination must be an existing directory inside the home folder")
+        return candidate
 
-        dest = dest_dir / job.file_info.name
+    @staticmethod
+    def _unique_destination(dest_dir: Path, name: str) -> Path:
+        candidate = dest_dir / name
+        index = 1
+        while candidate.exists():
+            candidate = dest_dir / f"{Path(name).stem} ({index}){Path(name).suffix}"
+            index += 1
+        return candidate
 
-        try:
-            dest.write_bytes(bytes(job.chunk_buffer))
-            job.state = TransferState.COMPLETED
-            job.completed_at = time.time()
-            logger.info("File received: %s (%d bytes)", dest, job.bytes_transferred)
-            self._push_update("transfer", job.id)
-        except OSError as e:
-            self._fail_job(job, str(e))
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _remove_partial(job: TransferJob) -> None:
+        if job.temp_path:
+            try:
+                Path(job.temp_path).unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Could not remove partial transfer: %s", job.temp_path)
 
     # ── directory listing ─────────────────────────────────────────────
 
@@ -506,19 +592,23 @@ class FileTransferManager:
             for child in sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
                 try:
                     stat = child.stat()
-                    entries.append({
-                        "name": child.name,
-                        "is_dir": child.is_dir(),
-                        "size": stat.st_size if child.is_file() else 0,
-                        "mtime": stat.st_mtime,
-                    })
+                    entries.append(
+                        {
+                            "name": child.name,
+                            "is_dir": child.is_dir(),
+                            "size": stat.st_size if child.is_file() else 0,
+                            "mtime": stat.st_mtime,
+                        }
+                    )
                 except OSError:
-                    entries.append({
-                        "name": child.name,
-                        "is_dir": child.is_dir(),
-                        "size": 0,
-                        "mtime": 0.0,
-                    })
+                    entries.append(
+                        {
+                            "name": child.name,
+                            "is_dir": child.is_dir(),
+                            "size": 0,
+                            "mtime": 0.0,
+                        }
+                    )
         except PermissionError as e:
             return [], str(e)
 
@@ -534,7 +624,9 @@ class FileTransferManager:
         return Message.file_list_response(path, entries, error=error)
 
     def request_remote_listing(
-        self, path: str, send_fn: Callable,
+        self,
+        path: str,
+        send_fn: Callable,
     ) -> None:
         """Request a directory listing from the remote peer.
 
@@ -574,7 +666,7 @@ class FileTransferManager:
             Local destination path. If None, uses filename in Downloads.
         """
         name = Path(remote_path).name
-        job_id = f"dl-{int(time.time())}-{name}"
+        job_id = f"dl-{uuid.uuid4().hex}"
 
         file_info = FileInfo(path=remote_path, name=name)
         job = TransferJob(
@@ -588,10 +680,12 @@ class FileTransferManager:
         self._jobs[job_id] = job
         self._push_update("transfer", job_id)
 
-        send_fn(Message(
-            MessageType.FILE_DOWNLOAD_REQUEST,
-            {"remote_path": remote_path, "job_id": job_id},
-        ))
+        send_fn(
+            Message(
+                MessageType.FILE_DOWNLOAD_REQUEST,
+                {"remote_path": remote_path, "job_id": job_id},
+            )
+        )
 
     def handle_download_request(self, msg: Message, send_fn: Callable) -> None:
         """Handle an incoming FILE_DOWNLOAD_REQUEST from remote.
@@ -601,7 +695,11 @@ class FileTransferManager:
         remote_path = msg.payload.get("remote_path", "")
         job_id = msg.payload.get("job_id", "")
 
-        path = Path(remote_path)
+        path = Path(remote_path).expanduser().resolve()
+        home = Path.home().resolve()
+        if not path.is_relative_to(home):
+            send_fn(Message.file_download_reject(job_id, "Path outside allowed directory"))
+            return
         if not path.exists() or not path.is_file():
             send_fn(Message.file_download_reject(job_id, "File not found"))
             return
@@ -640,11 +738,7 @@ class FileTransferManager:
                 if not chunk:
                     break
 
-                msg = Message.file_chunk(
-                    job.id, seq, chunk,
-                    is_last=len(chunk) < _CHUNK_SIZE,
-                )
-                send_fn(msg)
+                send_fn(Message.file_chunk(job.id, seq, chunk, is_last=False))
 
                 job.bytes_transferred += len(chunk)
                 job.progress = job.bytes_transferred / job.file_info.size
@@ -655,19 +749,19 @@ class FileTransferManager:
 
                 await asyncio.sleep(0)
 
+        send_fn(Message.file_complete(job.id))
         job.state = TransferState.COMPLETED
         job.completed_at = time.time()
         self._push_update("transfer", job.id)
         logger.info("Download sent: %s (%d chunks)", job.file_info.name, seq)
 
     def handle_download_accept(self, msg: Message) -> None:
-        """Handle FILE_DOWNLOAD_ACCEPT — remote peer will start sending chunks."""
+        """Handle FILE_DOWNLOAD_ACCEPT — prepare the local temporary file."""
         job_id = msg.payload.get("job_id", "")
         job = self._jobs.get(job_id)
-        if job:
+        if job and self.accept_incoming(job.id):
             job.state = TransferState.IN_PROGRESS
-            job.started_at = time.time()
-            self._push_update("transfer", job_id)
+            self._push_update("transfer", job.id)
 
     def handle_download_reject(self, msg: Message) -> None:
         """Handle FILE_DOWNLOAD_REJECT."""
@@ -681,8 +775,6 @@ class FileTransferManager:
 
     @staticmethod
     async def _compute_sha256(path: Path) -> str:
-        """Compute SHA-256 hash asynchronously."""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None, lambda: hashlib.sha256(path.read_bytes()).hexdigest(),
-        )
+        """Compute SHA-256 asynchronously without loading the file in RAM."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, FileTransferManager._sha256_file, path)
