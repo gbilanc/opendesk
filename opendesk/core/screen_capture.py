@@ -12,7 +12,6 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from enum import Enum, auto
 from threading import Lock
 from typing import Iterator
 
@@ -24,16 +23,6 @@ from opendesk.utils.platform import current_platform, Platform, is_wayland
 from opendesk.core.platform_config import get_platform_config, CaptureMethod
 
 logger = logging.getLogger(__name__)
-
-
-class CaptureMethod(Enum):
-    """Preferred backend for screen capture."""
-
-    AUTO = auto()  # Auto-detect
-    MSS = auto()  # Cross-platform (DXGI / CoreGraphics / X11)
-    PIPEWIRE = auto()  # Linux Wayland via PipeWire + xdg-desktop-portal (GStreamer subprocess)
-    PORTAL = auto()  # Linux Wayland via D-Bus portal + GStreamer (reuses portal session)
-    DUMMY = auto()  # Test pattern for development
 
 
 @dataclass(frozen=True)
