@@ -767,6 +767,13 @@ class RelayClient(QObject):
         pressed: bool | None = None, absolute: bool = True,
     ) -> None:
         """Send a mouse event to the remote peer."""
+        logger.debug(
+            "RelayClient.send_mouse_event: x=%d y=%d button=%s pressed=%s abs=%s "
+            "session=%s host_session=%s",
+            x, y, button, pressed, absolute,
+            self._session is not None,
+            self._host_session is not None,
+        )
         self.send_message(Message.mouse_event(x, y, button, pressed, absolute))
 
     def send_key_event(self, key: str, pressed: bool) -> None:

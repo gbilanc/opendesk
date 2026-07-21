@@ -386,6 +386,7 @@ class StreamService(QObject):
     def inject_mouse(self, msg: Message) -> None:
         """Inietta un evento mouse (chiamato dal relay)."""
         if self._input_backend is None:
+            logger.warning("inject_mouse: input_backend is None, ignoring")
             return
         payload = msg.payload
         x = payload.get("x", 0)
@@ -394,7 +395,13 @@ class StreamService(QObject):
         pressed = payload.get("pressed")
         absolute = payload.get("absolute", True)
 
-        if button:
+        logger.debug(
+            "inject_mouse: x=%d y=%d button=%s pressed=%s abs=%s",
+            x, y, button, pressed, absolute,
+        )
+
+        # button=0 dal movimento mouse (non un click)
+        if button is not None and button > 0:
             btn = MouseButton(button)
             state = KeyState.PRESSED if pressed else KeyState.RELEASED
             self._input_backend.move_mouse(x, y, absolute)

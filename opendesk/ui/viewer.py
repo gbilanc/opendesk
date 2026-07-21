@@ -222,6 +222,7 @@ class RemoteViewer(QGraphicsView):
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.MinimalViewportUpdate)
         self.setOptimizationFlag(QGraphicsView.OptimizationFlag.DontAdjustForAntialiasing, True)
+        self.setMouseTracking(True)  # cattura movimento mouse anche senza click
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setBackgroundBrush(QBrush(QColor("#0f172a")))  # dark background
 

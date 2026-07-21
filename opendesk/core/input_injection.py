@@ -601,11 +601,20 @@ class WaylandInputBackend(InputBackend):
 
 
 class WindowsInputBackend(InputBackend):
-    """Input backend for Windows using ctypes / SendInput API.
+    """Input backend for Windows using ``SendInput`` (modern API).
 
     Uses:
-    - ``SendInput`` for keyboard/mouse input
-    - ``SetCursorPos`` + ``mouse_event`` for mouse movement
+    - ``SendInput`` for keyboard/mouse input (successore di
+      ``mouse_event`` / ``keybd_event``, deprecati da Windows 8+)
+    - ``SetCursorPos`` per spostamento assoluto del cursore
+    - Fallback a ``mouse_event`` se ``SendInput`` fallisce
+
+    UIPI (User Interface Privilege Isolation):
+      Se il processo OpenDesk Host gira a un livello di integrità
+      inferiore rispetto alla finestra di destinazione, l'input
+      viene bloccato da Windows.  Soluzione: esegui l'host come
+      amministratore, o abbassa l'integrity level della finestra
+      target (non raccomandato).
     """
 
     def __init__(self) -> None:
@@ -613,9 +622,15 @@ class WindowsInputBackend(InputBackend):
         from ctypes import wintypes
 
         self._user32 = ctypes.windll.user32
+
+        # Strutture SendInput (INPUT, MOUSEINPUT, KEYBDINPUT)
+        self._INPUT_TYPE_MOUSE = 0
+        self._INPUT_TYPE_KEYBOARD = 1
+
         self._KEYEVENTF_KEYDOWN = 0x0000
         self._KEYEVENTF_KEYUP = 0x0002
         self._KEYEVENTF_SCANCODE = 0x0008
+
         self._MOUSEEVENTF_MOVE = 0x0001
         self._MOUSEEVENTF_ABSOLUTE = 0x8000
         self._MOUSEEVENTF_LEFTDOWN = 0x0002
@@ -625,6 +640,7 @@ class WindowsInputBackend(InputBackend):
         self._MOUSEEVENTF_MIDDLEDOWN = 0x0020
         self._MOUSEEVENTF_MIDDLEUP = 0x0040
         self._MOUSEEVENTF_WHEEL = 0x0800
+        self._MOUSEEVENTF_HWHEEL = 0x1000
 
         # Virtual key codes
         self._VK = {
@@ -640,7 +656,17 @@ class WindowsInputBackend(InputBackend):
         for i in range(1, 13):
             self._VK[f"f{i}"] = 0x6F + i
 
-        logger.info("Windows input backend initialised")
+        self._SendInput = self._user32.SendInput
+        self._SendInput.argtypes = [
+            ctypes.c_uint,  # cInputs
+            ctypes.c_void_p,  # pInputs (INPUT*)
+            ctypes.c_int,  # cbSize
+        ]
+        self._SendInput.restype = ctypes.c_uint
+
+        logger.info("Windows input backend initialised (SendInput)")
+
+    # ── helpers ──────────────────────────────────────────────────────
 
     def _vk_from_key(self, key: str | int) -> int:
         if isinstance(key, int):
@@ -652,57 +678,139 @@ class WindowsInputBackend(InputBackend):
             return ord(lower.upper())
         return 0
 
+    def _send_mouse_input(self, flags: int, data: int = 0, dx: int = 0, dy: int = 0) -> None:
+        """Invia un evento mouse con ``SendInput``.
+
+        Parameters
+        ----------
+        flags : int
+            Combinazione di ``MOUSEEVENTF_*`` flags.
+        data : int
+            ``dwData``: movimento rotellina (positivo = su) o ``MOUSE_XBUTTON``.
+        dx : int
+            Coordinata X (o delta relativo se non ``MOUSEEVENTF_ABSOLUTE``).
+        dy : int
+            Coordinata Y (o delta relativo).
+        """
+        import ctypes
+        from ctypes import wintypes
+
+        # Definisce la struttura MOUSEINPUT
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [
+                ("dx", ctypes.c_long),
+                ("dy", ctypes.c_long),
+                ("mouseData", ctypes.c_ulong),
+                ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+            ]
+
+        class INPUT_UNION(ctypes.Union):
+            _fields_ = [("mi", MOUSEINPUT)]
+
+        class INPUT(ctypes.Structure):
+            _fields_ = [
+                ("type", ctypes.c_ulong),
+                ("u", INPUT_UNION),
+            ]
+
+        inp = INPUT()
+        inp.type = self._INPUT_TYPE_MOUSE
+        inp.u.mi = MOUSEINPUT(dx, dy, data, flags, 0, None)
+
+        self._SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+
+    def _send_keyboard_input(self, vk: int, flags: int) -> None:
+        """Invia un evento tastiera con ``SendInput``."""
+        import ctypes
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [
+                ("wVk", ctypes.c_ushort),
+                ("wScan", ctypes.c_ushort),
+                ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+            ]
+
+        class INPUT_UNION(ctypes.Union):
+            _fields_ = [("ki", KEYBDINPUT)]
+
+        class INPUT(ctypes.Structure):
+            _fields_ = [
+                ("type", ctypes.c_ulong),
+                ("u", INPUT_UNION),
+            ]
+
+        inp = INPUT()
+        inp.type = self._INPUT_TYPE_KEYBOARD
+        inp.u.ki = KEYBDINPUT(vk, 0, flags, 0, None)
+
+        self._SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+
+    # ── public API ───────────────────────────────────────────────────
+
     def move_mouse(self, x: int, y: int, absolute: bool = True) -> None:
+        """Sposta il cursore nella posizione specificata.
+
+        Usa ``SetCursorPos`` per spostamento assoluto (più affidabile
+        di SendInput con flags MOUSE_MOVE + ABSOLUTE) e SendInput per
+        movimento relativo.
+        """
         if absolute:
-            # Convert to normalized coordinates (0..65535)
-            sx, sy = ctypes.windll.user32.GetSystemMetrics(0), ctypes.windll.user32.GetSystemMetrics(1)
-            nx = int(x * 65535 / max(sx, 1))
-            ny = int(y * 65535 / max(sy, 1))
-            self._user32.mouse_event(self._MOUSEEVENTF_MOVE | self._MOUSEEVENTF_ABSOLUTE, nx, ny, 0, 0)
+            # SetCursorPos è più affidabile per movimenti assoluti
+            self._user32.SetCursorPos(x, y)
         else:
-            self._user32.mouse_event(self._MOUSEEVENTF_MOVE, x, y, 0, 0)
+            self._send_mouse_input(
+                self._MOUSEEVENTF_MOVE, 0, x, y,
+            )
 
     def click_mouse(self, button: MouseButton, state: KeyState) -> None:
-        flags = {
-            (MouseButton.LEFT, KeyState.PRESSED): self._MOUSEEVENTF_LEFTDOWN,
-            (MouseButton.LEFT, KeyState.RELEASED): self._MOUSEEVENTF_LEFTUP,
-            (MouseButton.RIGHT, KeyState.PRESSED): self._MOUSEEVENTF_RIGHTDOWN,
-            (MouseButton.RIGHT, KeyState.RELEASED): self._MOUSEEVENTF_RIGHTUP,
-            (MouseButton.MIDDLE, KeyState.PRESSED): self._MOUSEEVENTF_MIDDLEDOWN,
-            (MouseButton.MIDDLE, KeyState.RELEASED): self._MOUSEEVENTF_MIDDLEUP,
+        flag_map = {
+            MouseButton.LEFT: (self._MOUSEEVENTF_LEFTDOWN, self._MOUSEEVENTF_LEFTUP),
+            MouseButton.RIGHT: (self._MOUSEEVENTF_RIGHTDOWN, self._MOUSEEVENTF_RIGHTUP),
+            MouseButton.MIDDLE: (self._MOUSEEVENTF_MIDDLEDOWN, self._MOUSEEVENTF_MIDDLEUP),
         }
-        flag = flags.get((button, state))
-        if flag is not None:
-            self._user32.mouse_event(flag, 0, 0, 0, 0)
-        elif state == KeyState.TYPED:
-            self.click_mouse(button, KeyState.PRESSED)
-            self.click_mouse(button, KeyState.RELEASED)
+        btns = flag_map.get(button)
+        if btns is None:
+            return
+        down_flag, up_flag = btns
+
+        if state in (KeyState.PRESSED, KeyState.TYPED):
+            self._send_mouse_input(down_flag)
+        if state in (KeyState.RELEASED, KeyState.TYPED):
+            self._send_mouse_input(up_flag)
 
     def scroll_mouse(self, dx: int, dy: int) -> None:
         if dy != 0:
-            self._user32.mouse_event(self._MOUSEEVENTF_WHEEL, 0, 0, -dy * 120, 0)
+            # wheel positivo = su (negativo il segno perché SendInput
+            # usa convenzione opposta a mouse_event)
+            self._send_mouse_input(self._MOUSEEVENTF_WHEEL, data=-dy * 120)
+        if dx != 0:
+            self._send_mouse_input(self._MOUSEEVENTF_HWHEEL, data=dx * 120)
 
     def key_event(self, key: str | int, state: KeyState) -> None:
         vk = self._vk_from_key(key)
         if vk == 0:
             return
         if state in (KeyState.PRESSED, KeyState.TYPED):
-            self._user32.keybd_event(vk, 0, self._KEYEVENTF_KEYDOWN, 0)
+            self._send_keyboard_input(vk, self._KEYEVENTF_KEYDOWN)
         if state in (KeyState.RELEASED, KeyState.TYPED):
-            self._user32.keybd_event(vk, 0, self._KEYEVENTF_KEYUP, 0)
+            self._send_keyboard_input(vk, self._KEYEVENTF_KEYUP)
 
     def type_text(self, text: str) -> None:
         for char in text:
-            vk = ord(char.upper()) if char.isalpha() else self._vk_from_key(char)
+            vk = self._vk_from_key(char)
             if vk == 0:
                 continue
             need_shift = char.isupper() or char in "~!@#$%^&*()_+{}|:\"<>?"
             if need_shift:
-                self._user32.keybd_event(0x10, 0, self._KEYEVENTF_KEYDOWN, 0)  # VK_SHIFT
-            self._user32.keybd_event(vk, 0, self._KEYEVENTF_KEYDOWN, 0)
-            self._user32.keybd_event(vk, 0, self._KEYEVENTF_KEYUP, 0)
+                self._send_keyboard_input(0x10, self._KEYEVENTF_KEYDOWN)  # VK_SHIFT
+            self._send_keyboard_input(vk, self._KEYEVENTF_KEYDOWN)
+            self._send_keyboard_input(vk, self._KEYEVENTF_KEYUP)
             if need_shift:
-                self._user32.keybd_event(0x10, 0, self._KEYEVENTF_KEYUP, 0)
+                self._send_keyboard_input(0x10, self._KEYEVENTF_KEYUP)
 
 
 # ---------------------------------------------------------------------------

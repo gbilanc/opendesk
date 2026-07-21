@@ -840,6 +840,10 @@ class MainWindow(QMainWindow):
         self, x: int, y: int, button: int, pressed: bool, absolute: bool
     ) -> None:
         if self._relay.is_connected and self._relay.role == RelayRole.CLIENT:
+            logger.debug(
+                "Sending MOUSE_EVENT: x=%d y=%d button=%s pressed=%s abs=%s",
+                x, y, button, pressed, absolute,
+            )
             self._relay.send_mouse_event(x, y, button, pressed, absolute)
 
     @Slot(str, bool)

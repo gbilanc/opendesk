@@ -385,9 +385,24 @@ class HostService(QObject):
         t = msg.type
 
         # ── Input injection ──
-        if t == MessageType.MOUSE_EVENT and self._stream and self._stream.input_backend:
-            self._stream.inject_mouse(msg)
+        if t == MessageType.MOUSE_EVENT:
+            if self._stream and self._stream.input_backend:
+                logger.debug(
+                    "Host received MOUSE_EVENT: x=%d y=%d button=%s pressed=%s",
+                    msg.payload.get("x"), msg.payload.get("y"),
+                    msg.payload.get("button"), msg.payload.get("pressed"),
+                )
+                self._stream.inject_mouse(msg)
+            else:
+                logger.warning(
+                    "Host received MOUSE_EVENT but input_backend is None — "
+                    "remote input disabled"
+                )
         elif t == MessageType.KEYBOARD_EVENT and self._stream and self._stream.input_backend:
+            logger.debug(
+                "Host received KEYBOARD_EVENT: key=%s pressed=%s",
+                msg.payload.get("key"), msg.payload.get("pressed"),
+            )
             self._stream.inject_keyboard(msg)
 
         # ── Chat ──
