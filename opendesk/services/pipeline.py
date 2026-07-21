@@ -369,8 +369,8 @@ class EncoderWorker(threading.Thread):
             QualityLevel.LOSSLESS: 98,
         }[quality]
 
-        # Full-frame diff (vectorised)
-        diff = np.abs(current.astype(np.int16) - prev.astype(np.int16))
+        # Full-frame diff using OpenCV (works directly on uint8, no conversion)
+        diff = cv2.absdiff(current, prev)
         any_changed = np.any(diff > threshold, axis=2)
 
         total_tiles = 0
