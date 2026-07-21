@@ -491,8 +491,10 @@ class _RelaySession:
                                 self._frame_width = width
                                 self._frame_height = height
                                 self._last_keyframe_time = time.time()
+                                # Pass bytes directly — avoids a second
+                                # ndarray copy in the UI thread.
                                 self.inbox.put(
-                                    ("frame", (rgb.copy(), width, height), self.session_seq),
+                                    ("frame", (rgb.tobytes(), width, height), self.session_seq),
                                 )
                                 logger.debug(
                                     "Frame decoded: %dx%d (%s)",
@@ -543,7 +545,7 @@ class _RelaySession:
                                     self._reference_frame[ty:ty+th, tx:tx+tw] = tile_rgb
                                     self.inbox.put(
                                         ("frame", (
-                                            self._reference_frame.copy(),
+                                            self._reference_frame.tobytes(),
                                             self._frame_width,
                                             self._frame_height,
                                         ), self.session_seq),
@@ -937,7 +939,14 @@ class RelayClient(QObject):
         self._poll_host_inbox()
 
     def _poll_client_inbox(self) -> None:
-        """Process client inbox events."""
+        """Process client inbox events.
+
+        Frame events are coalesced: only the most recent frame is kept
+        per poll cycle.  Intermediate frames are discarded to avoid
+        clogging the UI thread with stale frames that would never be
+        displayed anyway.
+        """
+        last_frame = None
         while not self._inbox.empty():
             try:
                 event, data, seq = self._inbox.get_nowait()
@@ -946,16 +955,22 @@ class RelayClient(QObject):
 
             # Skip stale events from a previous client session
             if seq != self._current_seq:
-                logger.debug(
-                    "Skipping stale client event '%s' (seq %d, current %d)",
-                    event, seq, self._current_seq,
-                )
                 continue
 
-            self._route_client_event(event, data)
+            if event == "frame":
+                last_frame = data  # only keep the latest frame
+            else:
+                self._route_client_event(event, data)
+
+        if last_frame is not None:
+            self._route_client_event("frame", last_frame)
 
     def _poll_host_inbox(self) -> None:
-        """Process host inbox events."""
+        """Process host inbox events.
+
+        Frame events are coalesced (same logic as client inbox).
+        """
+        last_frame = None
         while not self._host_inbox.empty():
             try:
                 event, data, seq = self._host_inbox.get_nowait()
@@ -964,13 +979,15 @@ class RelayClient(QObject):
 
             # Skip stale events from a previous host session
             if seq != self._host_seq:
-                logger.debug(
-                    "Skipping stale host event '%s' (seq %d, current %d)",
-                    event, seq, self._host_seq,
-                )
                 continue
 
-            self._route_host_event(event, data)
+            if event == "frame":
+                last_frame = data
+            else:
+                self._route_host_event(event, data)
+
+        if last_frame is not None:
+            self._route_host_event("frame", last_frame)
 
     def _route_client_event(self, event: str, data: Any) -> None:
         """Route a client inbox event to the appropriate signal."""
