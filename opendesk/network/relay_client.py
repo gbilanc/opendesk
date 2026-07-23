@@ -228,7 +228,7 @@ class _RelaySession:
     def _key_exchange_message(self, message_type: MessageType) -> Message:
         """Build a password-authenticated ephemeral public-key message."""
         public_key = self._e2ee.get_public_key_string()
-        proof_input = f"e2ee:{self.session_id}:{public_key}"
+        proof_input = f"e2ee:{public_key}"
         return Message(
             message_type,
             {
@@ -243,7 +243,7 @@ class _RelaySession:
         proof = payload.get("proof", "")
         if not isinstance(public_key, str) or not isinstance(proof, str):
             return False
-        proof_input = f"e2ee:{self.session_id}:{public_key}"
+        proof_input = f"e2ee:{public_key}"
         if not verify_response(proof_input, self.password, proof):
             logger.warning("Rejected E2E key exchange: invalid key proof")
             return False
