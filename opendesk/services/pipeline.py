@@ -520,17 +520,22 @@ class NetworkWorker(threading.Thread):
                 if isinstance(item, tuple) and item[0] == "tile":
                     # Tile JPEG
                     _, data, x, y, tw, th, pts = item
-                    self._send_tile(data, x, y, tw, th, pts)
+                    if not self._send_tile(data, x, y, tw, th, pts):
+                        logger.debug("NetworkWorker: tile dropped (backpressure)")
                 else:
                     # Full H.264 frame (EncodedPacket-like)
                     data = item.data
-                    self._send_frame(
+                    if not self._send_frame(
                         data,
                         item.width,
                         item.height,
                         item.pts,
                         keyframe=item.is_keyframe,
-                    )
+                    ):
+                        logger.debug(
+                            "NetworkWorker: %s dropped (backpressure)",
+                            "keyframe" if item.is_keyframe else "frame",
+                        )
             except Exception as e:
                 logger.warning("NetworkWorker send error: %s", e)
 

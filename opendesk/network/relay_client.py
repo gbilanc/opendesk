@@ -58,6 +58,9 @@ class RelayRole(Enum):
 _POLL_INTERVAL_MS = 50  # poll inbox every 50 ms
 _CONNECT_TIMEOUT = 15.0  # max seconds to wait for TCP connection
 _STOP_JOIN_TIMEOUT = 8.0  # max seconds to wait for session thread to stop
+_SEND_DRAIN_TIMEOUT = 5.0  # max seconds to wait for TCP send buffer to drain
+_SEND_MAX_CONSECUTIVE_TIMEOUTS = 3  # consecutive drain timeouts before disconnecting
+_SEND_MAX_PENDING = 20  # max pending sends before backpressure kicks in
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +123,9 @@ class _RelaySession:
         self._last_keyframe_time: float = 0.0
         self._last_video_activity_time: float = 0.0
         self._start_time: float = time.time()
+        self._pending_sends: int = 0  # atomic counter for pending _send_async tasks
+        self._send_lock = threading.Lock()
+        self._drain_timeout_count: int = 0  # consecutive drain timeouts
 
     # ── lifecycle ───────────────────────────────────────────────────
 
@@ -188,6 +194,56 @@ class _RelaySession:
             MessageType.RELAY_PEER_LIST,
             MessageType.RELAY_DEVICE_LIST,
             MessageType.RELAY_DEVICE_UPDATE,
+        }
+    )
+
+    # Message types that should never be dropped by backpressure.
+    # Everything except video frames/tiles is considered critical.
+    _BACKPRESSURE_BYPASS = frozenset(
+        {
+            MessageType.HELLO,
+            MessageType.HELLO_ACK,
+            MessageType.KEY_EXCHANGE,
+            MessageType.KEY_EXCHANGE_ACK,
+            MessageType.AUTH_REQUEST,
+            MessageType.AUTH_RESPONSE,
+            MessageType.AUTH_OK,
+            MessageType.AUTH_FAIL,
+            MessageType.SESSION_INFO,
+            MessageType.PING,
+            MessageType.PONG,
+            MessageType.DISCONNECT,
+            MessageType.ERROR,
+            MessageType.RELAY_REGISTER,
+            MessageType.RELAY_ROUTE,
+            MessageType.RELAY_PEER_LIST,
+            MessageType.RELAY_DEVICE_LIST,
+            MessageType.RELAY_DEVICE_UPDATE,
+            MessageType.MOUSE_EVENT,
+            MessageType.KEYBOARD_EVENT,
+            MessageType.TEXT_INPUT,
+            MessageType.CLIPBOARD_TEXT,
+            MessageType.CLIPBOARD_IMAGE,
+            MessageType.CLIPBOARD_SYNC,
+            MessageType.FILE_REQUEST,
+            MessageType.FILE_ACCEPT,
+            MessageType.FILE_REJECT,
+            MessageType.FILE_CHUNK,
+            MessageType.FILE_COMPLETE,
+            MessageType.FILE_ERROR,
+            MessageType.FILE_PROGRESS,
+            MessageType.FILE_LIST_REQUEST,
+            MessageType.FILE_LIST_RESPONSE,
+            MessageType.FILE_DOWNLOAD_REQUEST,
+            MessageType.FILE_DOWNLOAD_ACCEPT,
+            MessageType.FILE_DOWNLOAD_REJECT,
+            MessageType.AUDIO_FRAME,
+            MessageType.CAMERA_FRAME,
+            MessageType.CAMERA_START,
+            MessageType.CHAT_MESSAGE,
+            MessageType.CHAT_TYPING,
+            MessageType.CHAT_OPEN,
+            MessageType.VIDEO_REQUEST_KEYFRAME,
         }
     )
 
@@ -286,37 +342,94 @@ class _RelaySession:
             raise ValueError("Invalid decrypted peer payload")
         return Message(msg.type, payload)
 
-    def send_message(self, msg: Message) -> None:
+    def send_message(self, msg: Message) -> bool:
         """Send a message over the relay connection (thread-safe).
 
         Peer-to-peer messages (video frames, input events, clipboard,
         file transfer, chat, audio) are automatically wrapped in
         ``RELAY_ROUTE`` so the relay server forwards them to the
         paired peer.  Relay-internal control messages are sent as-is.
+
+        Returns True if the message was queued, False if backpressure
+        kicked in (too many pending sends).  Control messages always
+        succeed.
         """
         if self._loop and self._running.is_set():
+            is_relay_control = msg.type in self._RELAY_CONTROL_TYPES
+            bypass_backpressure = msg.type in self._BACKPRESSURE_BYPASS
+
+            # Backpressure: only drop video frames/tiles when the send pipe is full
+            if not bypass_backpressure:
+                if self._pending_sends >= _SEND_MAX_PENDING:
+                    logger.debug(
+                        "Send backpressure: %d pending sends, dropping message type=%s",
+                        self._pending_sends,
+                        msg.type.name if hasattr(msg.type, 'name') else msg.type,
+                    )
+                    return False
+                with self._send_lock:
+                    self._pending_sends += 1
+
             # Encrypt and wrap peer-to-peer messages in RELAY_ROUTE.
-            if msg.type not in self._RELAY_CONTROL_TYPES:
+            # Relay-internal control messages are sent as-is.
+            if not is_relay_control:
                 msg = self._encrypt_peer_message(msg)
                 msg = Message.relay_route(
                     inner_type=msg.type.value,
                     inner_payload=msg.payload,
                 )
-            asyncio.run_coroutine_threadsafe(self._send_async(msg), self._loop)
 
-    async def _send_async(self, msg: Message) -> None:
+            asyncio.run_coroutine_threadsafe(
+                self._send_async(msg, bypass_backpressure), self._loop
+            )
+            return True
+        return False
+
+    async def _send_async(self, msg: Message, bypass_backpressure: bool = False) -> None:
         if self._writer is None:
+            if not bypass_backpressure:
+                with self._send_lock:
+                    self._pending_sends = max(0, self._pending_sends - 1)
             return
         try:
             data = msg.encode()
             self._writer.write(data)
-            await self._writer.drain()
+            await asyncio.wait_for(
+                self._writer.drain(),
+                timeout=_SEND_DRAIN_TIMEOUT,
+            )
+            # Reset timeout counter on success
+            self._drain_timeout_count = 0
+        except asyncio.TimeoutError:
+            self._drain_timeout_count = getattr(self, '_drain_timeout_count', 0) + 1
+            logger.warning(
+                "Send drain timeout (%d/%d) — network congested or peer unresponsive",
+                self._drain_timeout_count,
+                _SEND_MAX_CONSECUTIVE_TIMEOUTS,
+            )
+            if self._drain_timeout_count >= _SEND_MAX_CONSECUTIVE_TIMEOUTS:
+                logger.error(
+                    "Send drain timed out %d times consecutively — closing connection",
+                    self._drain_timeout_count,
+                )
+                if self._writer:
+                    try:
+                        self._writer.close()
+                    except Exception:
+                        pass
+                    self._writer = None
+                self.inbox.put(("error", "Connection stalled (send buffer full)", self.session_seq))
+                self.inbox.put(("disconnected", None, self.session_seq))
         except asyncio.CancelledError:
             pass
         except Exception as e:
             logger.warning("Send error: %s", e)
             self.inbox.put(("error", f"Send failed: {e}", self.session_seq))
             self.inbox.put(("disconnected", None, self.session_seq))
+        finally:
+            if not bypass_backpressure:
+                with self._send_lock:
+                    self._pending_sends = max(0, self._pending_sends - 1)
 
     # ── host flow ───────────────────────────────────────────────────
 
@@ -765,8 +878,11 @@ class _RelaySession:
 
     def send_frame(
         self, data: bytes, width: int, height: int, pts: int, keyframe: bool = False
-    ) -> None:
-        """Send an encoded (H.264) VIDEO_FRAME over the relay."""
+    ) -> bool:
+        """Send an encoded (H.264) VIDEO_FRAME over the relay.
+
+        Returns True if queued, False if dropped due to backpressure.
+        """
         logger.debug(
             "send_frame: %dx%d keyframe=%s len=%d pts=%d",
             width, height, keyframe, len(data), pts,
@@ -774,7 +890,7 @@ class _RelaySession:
         msg = Message.video_frame(
             data=data, width=width, height=height, pts=pts, keyframe=keyframe
         )
-        self.send_message(msg)
+        return self.send_message(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -955,35 +1071,41 @@ class RelayClient(QObject):
 
     # ── message sending ──
 
-    def send_message(self, msg: Message) -> None:
+    def send_message(self, msg: Message) -> bool:
         """Send a protocol message.
 
         If the client session is active, sends through it;
         otherwise falls back to the host session.
+        Returns True if queued, False if dropped.
         """
         if self._session and self._thread and self._thread.is_alive():
-            self._session.send_message(msg)
+            return self._session.send_message(msg)
         elif self._host_session and self._host_thread and self._host_thread.is_alive():
-            self._host_session.send_message(msg)
+            return self._host_session.send_message(msg)
+        return False
 
     def send_frame(
         self, data: bytes, width: int, height: int, pts: int, keyframe: bool = False
-    ) -> None:
+    ) -> bool:
         """Send an encoded H.264 video frame over the relay (host only).
 
         Always sent through the host session.
+        Returns True if queued, False if dropped.
         """
         if self._host_session:
-            self._host_session.send_frame(data, width, height, pts, keyframe=keyframe)
+            return self._host_session.send_frame(data, width, height, pts, keyframe=keyframe)
+        return False
 
-    def send_tile(self, data: bytes, x: int, y: int, width: int, height: int, pts: int) -> None:
+    def send_tile(self, data: bytes, x: int, y: int, width: int, height: int, pts: int) -> bool:
         """Send a JPEG-encoded tile update over the relay (host only).
 
         Always sent through the host session.
+        Returns True if queued, False if dropped.
         """
         if self._host_session:
             msg = Message.video_tile(data, x, y, width, height, pts)
-            self._host_session.send_message(msg)
+            return self._host_session.send_message(msg)
+        return False
 
     def send_mouse_event(
         self,
