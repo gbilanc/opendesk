@@ -60,13 +60,22 @@ class CryptoKeyPair:
         return bytes(self.public_key)
 
     def encode_public(self) -> str:
-        """Base64-encoded public key for transmission."""
-        return base64.b64encode(self.public_bytes).decode()
+        """URL-safe Base64-encoded public key for transmission.
+
+        Uses ``base64.urlsafe_b64encode`` to avoid ``/`` and ``+``
+        characters that may be corrupted by intermediaries (e.g. relay
+        servers applying URL-decoding to payloads).
+        """
+        return base64.urlsafe_b64encode(self.public_bytes).decode().rstrip("=")
 
     @classmethod
     def decode_public(cls, encoded: str) -> PublicKey:
-        """Decode a Base64 public key."""
-        return PublicKey(base64.b64decode(encoded))
+        """Decode a URL-safe Base64 public key (padding optional)."""
+        # Add padding if needed: urlsafe_b64decode requires length % 4 == 0
+        padding = 4 - len(encoded) % 4
+        if padding != 4:
+            encoded += "=" * padding
+        return PublicKey(base64.urlsafe_b64decode(encoded))
 
 
 # ---------------------------------------------------------------------------
