@@ -58,6 +58,10 @@ class SettingsDialog(QDialog):
         self._settings = QSettings(_ORG, _APP)
         self._registry = device_registry
 
+        # Load platform config early — needed by _setup_ui (pixel format default)
+        from opendesk.core.platform_config import get_platform_config
+        self._plat_cfg = get_platform_config()
+
         self._setup_ui()
         self._load_settings()
 
@@ -102,9 +106,11 @@ class SettingsDialog(QDialog):
 
         # ── Pixel format ──
         self._pixel_format = QComboBox()
-        self._pixel_format.addItem("Full color (yuv444p — sharp text, recommended)", "yuv444p")
-        self._pixel_format.addItem("Standard (yuv420p — less bandwidth)", "yuv420p")
-        self._pixel_format.setCurrentIndex(0)
+        self._pixel_format.addItem("Full color (yuv444p — sharp text, more bandwidth)", "yuv444p")
+        self._pixel_format.addItem("Standard (yuv420p — less bandwidth, recommended)", "yuv420p")
+        self._pixel_format.setCurrentIndex(
+            0 if self._plat_cfg.default_pixel_format == "yuv444p" else 1
+        )
         video_layout.addRow("Pixel format:", self._pixel_format)
 
         # ── Sharp text in viewer ──
@@ -294,9 +300,6 @@ class SettingsDialog(QDialog):
         plat_form = QFormLayout(plat_group)
         plat_form.setSpacing(8)
 
-        from opendesk.core.platform_config import get_platform_config
-        self._plat_cfg = get_platform_config()
-
         self._plat_name_label = QLabel(f"<b>{self._plat_cfg.display_name}</b>")
         plat_form.addRow("Sistema:", self._plat_name_label)
 
@@ -384,7 +387,9 @@ class SettingsDialog(QDialog):
             self._settings.value("video/hw_encoding", True, type=bool)
         )
 
-        pixel_fmt = self._settings.value("video/pixel_format", "yuv444p")
+        pixel_fmt = self._settings.value(
+            "video/pixel_format", self._plat_cfg.default_pixel_format
+        )
         pf_idx = self._pixel_format.findData(pixel_fmt)
         if pf_idx >= 0:
             self._pixel_format.setCurrentIndex(pf_idx)
