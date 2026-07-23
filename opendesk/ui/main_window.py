@@ -612,8 +612,14 @@ class MainWindow(QMainWindow):
         logger.warning("Frame timeout — no video frame received for 10 seconds")
         # Don't disconnect — the relay/p2p connection may still be
         # healthy; only the video stream is stalled.
-        self._status_text.setText("⚠ No video frames — connection may be stalled")
-        self._stop_streaming()
+        # Only stop our own streaming if we're hosting (not when we're a
+        # client viewing a remote desktop — the remote host's stream is
+        # not ours to stop).
+        if self._connection.role == RelayRole.CLIENT:
+            self._status_text.setText("⚠ No video frames — connection may be stalled")
+        else:
+            self._status_text.setText("⚠ No video frames — connection may be stalled")
+            self._stop_streaming()
 
     @Slot(str)
     def _on_stream_error(self, error_msg: str) -> None:
@@ -622,10 +628,15 @@ class MainWindow(QMainWindow):
         Log the error but do NOT disconnect — the relay connection
         stays alive so the peer doesn't get a spurious "Peer
         disconnected" error.  The host can retry streaming later.
+
+        Only stop our own streaming pipeline if we're hosting;
+        if we're a client, the error is about the remote host's
+        stream and we shouldn't touch our local pipeline.
         """
         logger.error("Stream error: %s", error_msg)
         self._status_text.setText(f"⚠ Streaming error: {error_msg}")
-        self._stop_streaming()
+        if self._connection.role != RelayRole.CLIENT:
+            self._stop_streaming()
 
     @Slot(str)
     def _on_input_unavailable(self, error_msg: str) -> None:
@@ -770,17 +781,32 @@ class MainWindow(QMainWindow):
             return
 
         logger.error("Relay error: %s", error_msg)
+
+        # ── User-friendly error translations ──
+        user_msg = error_msg
+        if "already paired" in error_msg.lower():
+            user_msg = (
+                "This device is already connected to another computer.\n"
+                "Please wait for the current session to end, or ask the "
+                "other user to disconnect."
+            )
+        elif "offline or not found" in error_msg.lower():
+            user_msg = (
+                "The remote device is offline or the session has expired.\n"
+                "Please ask the remote user to create a new session."
+            )
+
         # If we have an active client session, this is likely a client error
         if self._connection.role == RelayRole.CLIENT:
             self._hide_viewer_window()
-            QMessageBox.critical(self, "Connection Error", error_msg)
+            QMessageBox.critical(self, "Connection Error", user_msg)
             self._connection.disconnect_client()
         elif self._connection.is_hosting:
             # Host error: informational — do NOT retry. The host session
             # is still alive and can accept new clients.
-            self._status_text.setText(f"⚠ {error_msg}")
+            self._status_text.setText(f"⚠ {user_msg}")
         else:
-            self._status_text.setText(f"⚠ Error: {error_msg}")
+            self._status_text.setText(f"⚠ Error: {user_msg}")
 
     @Slot(list)
     def _on_device_list_received(self, devices: list[dict]) -> None:

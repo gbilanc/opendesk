@@ -562,7 +562,7 @@ class ConnectionPanel(QWidget):
             f"Enter the password for:\n{device_id[:8]}…",
             QLineEdit.EchoMode.Password,
         )
-        return pwd if ok else None
+        return pwd.strip() if ok else None
 
 
 # ═══════════════════════════════════════════════════════════════════

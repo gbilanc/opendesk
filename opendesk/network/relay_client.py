@@ -35,7 +35,11 @@ import numpy as np
 from PySide6.QtCore import QObject, QSettings, QTimer, Signal, Slot
 
 from opendesk.core.video_codec import VideoDecoder
-from opendesk.crypto.challenge import compute_response, generate_nonce, verify_response
+from opendesk.crypto.challenge import (
+    compute_response,
+    generate_nonce,
+    verify_response,
+)
 from opendesk.crypto.e2ee import E2EEncryption, EncryptedMessage
 from opendesk.network.protocol import Message, MessageType
 
@@ -97,7 +101,7 @@ class _RelaySession:
         self.host = host
         self.port = port
         self.session_id = session_id
-        self.password = password
+        self.password = password.strip()
         self.role = role
         self.inbox = inbox
         self.device_id = device_id
@@ -298,10 +302,22 @@ class _RelaySession:
         public_key = payload.get("public_key", "")
         proof = payload.get("proof", "")
         if not isinstance(public_key, str) or not isinstance(proof, str):
+            logger.warning(
+                "Rejected E2E key exchange: invalid types pk=%s proof=%s",
+                type(public_key).__name__,
+                type(proof).__name__,
+            )
             return False
         proof_input = f"e2ee:{public_key}"
         if not verify_response(proof_input, self.password, proof):
-            logger.warning("Rejected E2E key exchange: invalid key proof")
+            expected = compute_response(proof_input, self.password)
+            logger.warning(
+                "Rejected E2E key exchange: invalid key proof "
+                "(pk_len=%d proof_len=%d expected_len=%d "
+                "proof_start=%s... expected_start=%s...)",
+                len(public_key), len(proof), len(expected),
+                proof[:8], expected[:8],
+            )
             return False
         try:
             self._e2ee.set_remote_key(public_key)
