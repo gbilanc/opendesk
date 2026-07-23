@@ -178,12 +178,15 @@ class _RelaySession:
 
     # Message types that are internal to the relay protocol and must be
     # sent directly (not wrapped in RELAY_ROUTE).
+    #
+    # KEY_EXCHANGE / KEY_EXCHANGE_ACK are NOT relay control types:
+    # they are peer-to-peer messages that must be wrapped in RELAY_ROUTE
+    # so the relay forwards them as opaque data without interpreting
+    # (some relay servers intercept and replace them, breaking E2E).
     _RELAY_CONTROL_TYPES = frozenset(
         {
             MessageType.HELLO,
             MessageType.HELLO_ACK,
-            MessageType.KEY_EXCHANGE,
-            MessageType.KEY_EXCHANGE_ACK,
             MessageType.AUTH_REQUEST,
             MessageType.AUTH_RESPONSE,
             MessageType.AUTH_OK,
@@ -497,7 +500,10 @@ class _RelaySession:
                     # legacy peers that ignore KEY_EXCHANGE remain compatible.
                     if self._e2ee_enabled:
                         await self._send_async(
-                            self._key_exchange_message(MessageType.KEY_EXCHANGE)
+                            Message.relay_route(
+                                inner_type=MessageType.KEY_EXCHANGE.value,
+                                inner_payload=self._key_exchange_message(MessageType.KEY_EXCHANGE).payload,
+                            )
                         )
                     nonce = generate_nonce()
                     self._auth_nonce = nonce
@@ -674,7 +680,10 @@ class _RelaySession:
                         logger.info("Peer offered E2E, but it is disabled locally")
                     elif self._accept_remote_key(msg.payload):
                         await self._send_async(
-                            self._key_exchange_message(MessageType.KEY_EXCHANGE_ACK)
+                            Message.relay_route(
+                                inner_type=MessageType.KEY_EXCHANGE_ACK.value,
+                                inner_payload=self._key_exchange_message(MessageType.KEY_EXCHANGE_ACK).payload,
+                            )
                         )
                     else:
                         logger.warning("E2E key exchange failed, continuing without encryption")
