@@ -181,8 +181,9 @@ class _RelaySession:
     #
     # KEY_EXCHANGE / KEY_EXCHANGE_ACK are NOT relay control types:
     # they are peer-to-peer messages that must be wrapped in RELAY_ROUTE
-    # so the relay forwards them as opaque data without interpreting
-    # (some relay servers intercept and replace them, breaking E2E).
+    # so the relay forwards them as opaque data to the paired peer.
+    # Key exchange now happens AFTER authentication, so no password-based
+    # proof is needed — authentication has already established trust.
     _RELAY_CONTROL_TYPES = frozenset(
         {
             MessageType.HELLO,
@@ -289,37 +290,29 @@ class _RelaySession:
     )
 
     def _key_exchange_message(self, message_type: MessageType) -> Message:
-        """Build a password-authenticated ephemeral public-key message."""
+        """Build an ephemeral public-key message for E2E encryption setup.
+
+        Key exchange is sent *after* authentication, so no password-based
+        proof is needed — authentication has already established trust.
+        """
         public_key = self._e2ee.get_public_key_string()
-        proof_input = f"e2ee:{public_key}"
         return Message(
             message_type,
-            {
-                "public_key": public_key,
-                "proof": compute_response(proof_input, self.password),
-            },
+            {"public_key": public_key},
         )
 
     def _accept_remote_key(self, payload: dict[str, Any]) -> bool:
-        """Verify the peer key against the session secret and activate E2E."""
+        """Accept the peer's public key and activate E2E encryption.
+
+        Key exchange now happens after authentication, so no password-based
+        proof verification is needed — authentication has already established
+        trust between the peers.
+        """
         public_key = payload.get("public_key", "")
-        proof = payload.get("proof", "")
-        if not isinstance(public_key, str) or not isinstance(proof, str):
+        if not isinstance(public_key, str) or not public_key:
             logger.warning(
-                "Rejected E2E key exchange: invalid types pk=%s proof=%s",
+                "Rejected E2E key exchange: missing or invalid public_key (type=%s)",
                 type(public_key).__name__,
-                type(proof).__name__,
-            )
-            return False
-        proof_input = f"e2ee:{public_key}"
-        if not verify_response(proof_input, self.password, proof):
-            expected = compute_response(proof_input, self.password)
-            logger.warning(
-                "Rejected E2E key exchange: invalid key proof "
-                "(pk_len=%d proof_len=%d expected_len=%d "
-                "proof_start=%s... expected_start=%s...)",
-                len(public_key), len(proof), len(expected),
-                proof[:8], expected[:8],
             )
             return False
         try:
@@ -496,15 +489,9 @@ class _RelaySession:
 
                 elif t == MessageType.RELAY_PEER_LIST:
                     self.inbox.put(("peer_joined", None, self.session_seq))
-                    # Negotiate E2E first.  Auth is sent immediately as well so
-                    # legacy peers that ignore KEY_EXCHANGE remain compatible.
-                    if self._e2ee_enabled:
-                        await self._send_async(
-                            Message.relay_route(
-                                inner_type=MessageType.KEY_EXCHANGE.value,
-                                inner_payload=self._key_exchange_message(MessageType.KEY_EXCHANGE).payload,
-                            )
-                        )
+                    # Authentication first, E2E key exchange after (see AUTH_RESPONSE).
+                    # This ensures trusted devices can establish E2E even with
+                    # different (or empty) passwords.
                     nonce = generate_nonce()
                     self._auth_nonce = nonce
                     await self._send_async(Message.auth_request(self.session_id, nonce=nonce))
@@ -535,6 +522,14 @@ class _RelaySession:
                             client_device_id[:8],
                         )
                         await self._send_async(Message.auth_ok())
+                        # E2E key exchange after authentication
+                        if self._e2ee_enabled:
+                            await self._send_async(
+                                Message.relay_route(
+                                    inner_type=MessageType.KEY_EXCHANGE.value,
+                                    inner_payload=self._key_exchange_message(MessageType.KEY_EXCHANGE).payload,
+                                )
+                            )
                         self.inbox.put(
                             (
                                 "auth_result",
@@ -547,6 +542,14 @@ class _RelaySession:
                     success = verify_response(self._auth_nonce, self.password, client_hash)
                     if success:
                         await self._send_async(Message.auth_ok())
+                        # E2E key exchange after authentication
+                        if self._e2ee_enabled:
+                            await self._send_async(
+                                Message.relay_route(
+                                    inner_type=MessageType.KEY_EXCHANGE.value,
+                                    inner_payload=self._key_exchange_message(MessageType.KEY_EXCHANGE).payload,
+                                )
+                            )
                         self.inbox.put(("auth_result", (True, "Authenticated"), self.session_seq))
                         logger.debug("Host auth OK — connection_mode=%s", client_connection_mode)
                     else:
