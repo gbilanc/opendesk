@@ -23,7 +23,7 @@ def main() -> int:
     duration = float(sys.argv[3]) if len(sys.argv) > 3 else 60.0
 
     client = RelayClient()
-    client.join_session("gibisoft.net", 8474, session_id, password, device_id="debug-load")
+    client.join_session("relay.gibisoft.net", 8474, session_id, password, device_id="debug-load")
 
     # Polla l'inbox in un thread (scarta tutto: ci interessa solo generare carico)
     def drain() -> None:

@@ -2,7 +2,7 @@
 ; Produces a per-user wizard installer with:
 ;   - Start Menu + Desktop shortcuts
 ;   - Auto-start at login (minimized in system tray)
-;   - Pre-configured relay (gibisoft.net:8474)
+;   - Pre-configured relay (relay.gibisoft.net:8474)
 
 #define MyAppName "OpenDesk Host"
 ; Version can be overridden from the build script: ISCC /DMyAppVersion=x.y.z
@@ -51,7 +51,7 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameter
 ; Auto-start at login (minimized in system tray)
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#MyAppName}"; ValueData: """{app}\{#MyAppExeName}"" --minimized"; Flags: uninsdeletevalue
 ; Pre-configured relay (QSettings org=OpenDesk app=OpenDesk -> HKCU\Software\OpenDesk\OpenDesk\network)
-Root: HKCU; Subkey: "Software\OpenDesk\OpenDesk\network"; ValueType: string; ValueName: "relay_host"; ValueData: "gibisoft.net"
+Root: HKCU; Subkey: "Software\OpenDesk\OpenDesk\network"; ValueType: string; ValueName: "relay_host"; ValueData: "relay.gibisoft.net"
 Root: HKCU; Subkey: "Software\OpenDesk\OpenDesk\network"; ValueType: dword; ValueName: "relay_port"; ValueData: "8474"
 Root: HKCU; Subkey: "Software\OpenDesk\OpenDesk\network"; ValueType: string; ValueName: "enable_relay"; ValueData: "true"
 

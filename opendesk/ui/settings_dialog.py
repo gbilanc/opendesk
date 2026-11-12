@@ -177,7 +177,7 @@ class SettingsDialog(QDialog):
         net_layout.addRow("STUN Server:", self._stun_server)
 
         self._relay_host = QLineEdit()
-        self._relay_host.setPlaceholderText("relay.example.com")
+        self._relay_host.setPlaceholderText("relay.gibisoft.net")
         net_layout.addRow("Relay Host:", self._relay_host)
 
         self._relay_port = QSpinBox()

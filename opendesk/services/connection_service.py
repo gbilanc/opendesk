@@ -279,7 +279,12 @@ class ConnectionService(QObject):
     # ── relay config ────────────────────────────────────────────────
 
     def _get_relay_config(self) -> tuple[str, int]:
-        host = cast(str, self._settings.value("network/relay_host", "", type=str))
+        host = cast(str, self._settings.value("network/relay_host", "", type=str)).strip()
+        # Tolerate a URL pasted instead of a bare host ("https://host/...").
+        host = host.removeprefix("https://").removeprefix("http://").strip("/")
+        if host in {"gibisoft.net", "www.gibisoft.net"}:
+            # Legacy default written by previous Windows installers.
+            host = "relay.gibisoft.net"
         if not host:
             host = "127.0.0.1"
         if host == "0.0.0.0":

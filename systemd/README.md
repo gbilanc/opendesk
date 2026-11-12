@@ -63,7 +63,7 @@ systemctl --user enable --now opendesk-host
 systemctl --user status opendesk-host
 
 # 3. Configura il client OpenDesk (Tools → Settings → Network)
-#    Relay Host = IP del server
+#    Relay Host = relay.gibisoft.net (o IP del tuo server)
 #    Relay Port = 8474
 ```
 
@@ -146,7 +146,7 @@ tail -f ~/.local/share/opendesk/logs/opendesk.log
 ## Cosa fa
 
 - Avvia opendesk-host in background continuamente, **ridotto a icona nella system tray**
-- Connette al relay (porta 8474)
+- Connette al relay (relay.gibisoft.net, porta 8474)
 - Mostra ID + password nella finestra compatta (riapribile dalla tray)
 - Accetta solo connessioni in ingresso
 - Streaming, input remoto, chat e file transfer automatici

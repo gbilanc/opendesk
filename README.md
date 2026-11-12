@@ -452,6 +452,6 @@ Nelle impostazioni del client OpenDesk (Tools → Settings → Network), imposta
 
 | Campo | Valore |
 |-------|--------|
-| **Relay Host** | IP pubblico del server |
+| **Relay Host** | relay.gibisoft.net (o IP del tuo server) |
 | **Relay Port** | 8474 (o la porta configurata) |
 | **Enable relay** | ✅ |

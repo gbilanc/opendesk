@@ -1,7 +1,7 @@
 ; Inno Setup script for OpenDesk client (Windows)
 ; Produces a per-user wizard installer with:
 ;   - Start Menu + optional Desktop shortcut
-;   - Pre-configured relay (gibisoft.net:8474)
+;   - Pre-configured relay (relay.gibisoft.net:8474)
 ; No auto-start (the client is launched by the user).
 
 #define MyAppName "OpenDesk"
@@ -49,7 +49,7 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 
 [Registry]
 ; Pre-configured relay (QSettings org=OpenDesk app=OpenDesk -> HKCU\Software\OpenDesk\OpenDesk\network)
-Root: HKCU; Subkey: "Software\OpenDesk\OpenDesk\network"; ValueType: string; ValueName: "relay_host"; ValueData: "gibisoft.net"
+Root: HKCU; Subkey: "Software\OpenDesk\OpenDesk\network"; ValueType: string; ValueName: "relay_host"; ValueData: "relay.gibisoft.net"
 Root: HKCU; Subkey: "Software\OpenDesk\OpenDesk\network"; ValueType: dword; ValueName: "relay_port"; ValueData: "8474"
 Root: HKCU; Subkey: "Software\OpenDesk\OpenDesk\network"; ValueType: string; ValueName: "enable_relay"; ValueData: "true"
 
