@@ -16,7 +16,7 @@ import time
 from collections.abc import Callable
 from typing import cast
 
-from PySide6.QtCore import QObject, QSettings, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, QMetaObject, QSettings, Qt, QTimer, Signal, Slot
 
 from opendesk.core.audio_manager import AudioConfig, AudioDirection, AudioManager
 from opendesk.core.camera_manager import CameraConfig, CameraManager
@@ -330,9 +330,23 @@ class StreamService(QObject):
                 pixel_format = cfg.default_pixel_format
             if pixel_format not in ("yuv420p", "yuv444p"):
                 pixel_format = cfg.default_pixel_format
+            # yuv444p in encoder SOFTWARE costa ~2× CPU del yuv420p (profilo
+            # High 4:4:4 Predictive) per un guadagno di nitidezza marginale su
+            # contenuto desktop (RCA 2026-11-14, CPU host vs AnyDesk).  Senza
+            # HW encoder torniamo a yuv420p; con HW il setting utente vale.
+            if pixel_format == "yuv444p" and not cfg.supports_hw_encoding:
+                logger.info(
+                    "yuv444p richiesto ma encoder software: uso yuv420p (~2x CPU in meno)"
+                )
+                pixel_format = "yuv420p"
 
             # Encoder preset: empty = auto by quality level
             encoder_preset = cast(str, self._settings.value("video/encoder_preset", "", type=str))
+
+            # FPS adattivo (schermo fermo → ~2 fps, keepalive tiene il flusso)
+            adaptive_fps = cast(
+                bool, self._settings.value("video/adaptive_fps", True, type=bool)
+            )
 
             # Crea configurazione della pipeline
             config = PipelineConfig(
@@ -345,20 +359,27 @@ class StreamService(QObject):
                 crf=crf,
                 pixel_format=pixel_format,
                 encoder_preset=encoder_preset,
+                adaptive_fps=adaptive_fps,
             )
 
             # Callback per tracciare i byte inviati (bandwidth estimation)
             def _on_send(data: bytes) -> None:
                 self._bw_measure_bytes += len(data)
 
-            # Callback per errori della pipeline (CaptureWorker / EncoderWorker)
-            # Usa QTimer.singleShot per deferire al main thread Qt:
-            # stop_streaming() chiama pipeline.stop() che fa join() sui thread
-            # worker — se chiamato dal worker stesso causa RuntimeError.
+            # Callback per errori della pipeline (CaptureWorker / EncoderWorker).
+            # Viene eseguita su un thread Python raw SENZA event loop Qt:
+            # QMetaObject.invokeMethod queued è il modo valido per deferire
+            # stop_streaming() al main thread.  Non usare QTimer.singleShot
+            # qui: da un thread non-Qt corrompe il dispatcher eventi Win32 del
+            # main thread → timer morti e UI congelata (RCA 2026-11-14,
+            # py-spy --native: MsgWaitForMultipleObjectsEx eterno).  In più
+            # lo stop avviene comunque via self.error → _on_stream_error.
             def _on_pipeline_error(msg: str) -> None:
                 logger.error("Pipeline error: %s", msg)
                 self.error.emit(msg)
-                QTimer.singleShot(0, self.stop_streaming)
+                QMetaObject.invokeMethod(
+                    self, "stop_streaming", Qt.ConnectionType.QueuedConnection
+                )
 
             # Crea e avvia la pipeline
             self._pipeline = StreamingPipeline(
@@ -401,6 +422,7 @@ class StreamService(QObject):
             self.error.emit(str(e))
             self.stop_streaming()
 
+    @Slot()
     def stop_streaming(self) -> None:
         """Ferma la pipeline, audio capture e rilascia le risorse.
 

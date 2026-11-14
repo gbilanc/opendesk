@@ -367,12 +367,17 @@ class PlatformConfig:
                 _try_open_codec,
             )
 
-            # HW encoders
+            # HW encoders — logga ogni candidato: senza questa diagnosi non
+            # si capisce perché l'encoder cade sul software (RCA 2026-11-14,
+            # CPU host elevata: "HW encoders: none" senza motivo noto).
             for name in _candidates(prefer_hw=True):
                 if name in ("hevc", "h264"):
                     continue
                 if _try_open_codec(name):
                     self.hw_encoders_available.append(name)
+                    logger.info("HW encoder disponibile: %s", name)
+                else:
+                    logger.info("HW encoder NON disponibile: %s", name)
 
             self.supports_hw_encoding = len(self.hw_encoders_available) > 0
 

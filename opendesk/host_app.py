@@ -1406,13 +1406,25 @@ def main_host() -> None:
     """
     import sys
 
+    from opendesk.services.pipeline import _QUALITY_FLIP_HYSTERESIS_S
     from opendesk.utils.logger import setup_logging
 
     sys.argv[:], start_minimized, cli_level = _parse_host_args(sys.argv[1:])
 
     setup_logging(level=cli_level)
+
+    # Mitigazione GIL starvation (RCA 2026-11-14): vedi opendesk/app.py.
+    sys.setswitchinterval(0.0005)
+
     version = __import__("opendesk").__version__
-    logger.info("Starting OpenDesk Host v%s (minimized=%s)", version, start_minimized)
+    logger.info(
+        "Starting OpenDesk Host v%s (minimized=%s, switch_interval=%.1fms, "
+        "quality_hysteresis=%.1fs)",
+        version,
+        start_minimized,
+        sys.getswitchinterval() * 1000,
+        _QUALITY_FLIP_HYSTERESIS_S,
+    )
 
     # Log platform configuration
     from opendesk.core.platform_config import get_platform_config

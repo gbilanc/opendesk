@@ -65,6 +65,7 @@ def _try_open_codec(name: str, fps: int = 30) -> bool:
     try:
         container = av.open("pipe:", mode="w", format="h264" if "264" in name else "hevc")
         stream = container.add_stream(name, rate=fps)
+        logger.debug("Provo encoder %s", name)
         assert isinstance(stream, av.VideoStream)
         stream.width = 32
         stream.height = 32
@@ -425,14 +426,22 @@ class VideoEncoder:
             opts = dict(self._config.options)
 
             # Adjust preset based on quality level
-            # Slower presets = better compression efficiency = same quality at lower bitrate
+            # Slower presets = better compression efficiency = same quality at lower bitrate.
+            # Per remote desktop il preset `superfast` è il compromesso CPU/qualità:
+            # `medium` costa ~2-3× CPU a parità di CRF con beneficio impercettibile
+            # su contenuto desktop (RCA 2026-11-14, CPU host vs AnyDesk).
             quality = self._config.quality
             if quality in (QualityLevel.LOSSLESS, QualityLevel.SHARP):
-                opts["preset"] = opts.get("preset", "medium")
+                opts["preset"] = opts.get("preset", "superfast")
             elif quality == QualityLevel.HIGH:
-                opts["preset"] = opts.get("preset", "fast")
+                opts["preset"] = opts.get("preset", "superfast")
             else:
                 opts["preset"] = opts.get("preset", "veryfast")
+
+            # Threads limitati per gli encoder software: libx264 auto-threads
+            # usa tutti i core e sottrae CPU al resto (cattura, UI, rete).
+            if codec in ("h264", "libx264", "hevc", "libx265"):
+                opts["threads"] = opts.get("threads", "2")
 
             # Low-latency tuning
             # NB: ``tune``/``profile`` sono opzioni esclusive di libx264/libx265

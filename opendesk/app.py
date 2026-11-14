@@ -283,6 +283,12 @@ def main(log_level: int | None = None) -> None:
 
     effective_level = log_level if log_level is not None else cli_level
     setup_logging(level=effective_level)
+
+    # Mitigazione GIL starvation (RCA 2026-11-14): con worker che tengono
+    # il GIL per lungo tempo, lo switch di default (5 ms) può far attendere
+    # il main thread Qt anche per secondi → UI congelata.  Un intervallo
+    # basso forza handoff frequenti: il main thread aspetta microsecondi.
+    sys.setswitchinterval(0.0005)
     version = __import__("opendesk").__version__
     logger.info("Starting OpenDesk v%s", version)
 

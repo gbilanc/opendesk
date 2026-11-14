@@ -32,7 +32,7 @@ from typing import Any, cast
 
 import msgpack
 import numpy as np
-from PySide6.QtCore import QObject, QSettings, QTimer, Signal, Slot
+from PySide6.QtCore import QAbstractEventDispatcher, QObject, QSettings, QTimer, Signal, Slot
 
 from opendesk.core.video_codec import VideoDecoder
 from opendesk.crypto.challenge import (
@@ -566,12 +566,32 @@ class _RelaySession:
         return True
 
     def _send_p2p_now(self, msg: Message) -> None:
+        """Invia via data channel P2P; fallback relay se il canale non va.
+
+        Chiamato sull'event loop della sessione.  Il return di
+        ``send()`` NON è ignorato: se il canale control/media non è
+        aperto il messaggio sparisce in silenzio (RCA 2026-11-14: i
+        frame arrivavano via canale media ma mouse/keyboard,
+        instradati sul canale control, non raggiungevano mai l'host).
+        I media droppati NON vanno duplicati sul relay (by design);
+        input e messaggi di controllo sì — sono critici.
+        """
+        sent = False
         try:
             if self._p2p is not None and self._p2p_ready:
-                self._p2p.send(msg)
+                sent = self._p2p.send(msg)
         finally:
             with self._send_lock:
                 self._pending_p2p_sends = max(0, self._pending_p2p_sends - 1)
+        if sent or msg.type in MEDIA_MESSAGE_TYPES:
+            return
+        # Fallback relay per messaggi critici (input, controllo)
+        if self._loop is not None and self._running.is_set():
+            relay_msg = Message.relay_route(
+                inner_type=msg.type.value,
+                inner_payload=msg.payload,
+            )
+            asyncio.create_task(self._write_async(relay_msg.encode(), True))
 
     async def _send_peer_signalling(self, msg: Message) -> None:
         """Send a P2P signalling message through the relay.
@@ -1491,10 +1511,22 @@ class RelayClient(QObject):
         # Un peer host è autenticato e attivo → serve polling veloce
         self._host_peer_active: bool = False
 
-        # ── Single timer to poll both inboxes ──
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._poll_inboxes)
-        self._timer.start(_POLL_INTERVAL_IDLE_MS)
+        # ── Polling inbox: aboutToBlock, non QTimer ──
+        # Un QTimer veloce (16 ms) su Windows può corrompere il
+        # QEventDispatcherWin32: timer morti → MsgWaitForMultipleObjectsEx
+        # eterno → UI congelata (RCA 2026-11-14, py-spy --native;
+        # stessa classe di pyqtgraph#3411).  aboutToBlock fa il drain
+        # dell'inbox ogni volta che l'event loop ha esaurito gli eventi:
+        # più reattivo sotto carico e senza timer veloci.
+        self._timer: QTimer | None = None
+        dispatcher = QAbstractEventDispatcher.instance()
+        if dispatcher is not None:
+            dispatcher.aboutToBlock.connect(self._poll_inboxes)
+        else:
+            # Nessun dispatcher (es. test headless): fallback su QTimer lento
+            self._timer = QTimer(self)
+            self._timer.timeout.connect(self._poll_inboxes)
+            self._timer.start(_POLL_INTERVAL_IDLE_MS)
 
     def _load_p2p_settings(self) -> None:
         """Read P2P/ICE settings from QSettings.
@@ -1849,20 +1881,13 @@ class RelayClient(QObject):
     def _poll_inboxes(self) -> None:
         """Process messages from both host and client network threads.
 
-        Runs in the UI thread via QTimer.  Host events are routed to
-        host-specific signals; client events to client-specific signals.
-        Shared events (message, error, device_list) are emitted on the
-        common signals from both inboxes.
+        Runs in the UI thread via aboutToBlock (o QTimer fallback).  Host
+        events are routed to host-specific signals; client events to
+        client-specific signals.  Shared events (message, error,
+        device_list) are emitted on the common signals from both inboxes.
         """
         self._poll_client_inbox()
         self._poll_host_inbox()
-
-        # Polling adattivo: 16 ms solo quando c'è traffico da smaltire
-        # (sessione client o peer host autenticato); a riposo 100 ms.
-        fast = self._session is not None or self._host_peer_active
-        want = _POLL_INTERVAL_MS if fast else _POLL_INTERVAL_IDLE_MS
-        if self._timer.interval() != want:
-            self._timer.setInterval(want)
 
     def _poll_client_inbox(self) -> None:
         """Process client inbox events.

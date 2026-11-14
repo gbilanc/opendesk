@@ -5,4 +5,6 @@ Multi-platform (Windows, macOS, Linux) remote desktop tool
 with E2E encryption, P2P + relay networking, and PySide6 UI.
 """
 
-__version__ = "2.1.0"
+# NB: tienilo sincronizzato con version = "..." in pyproject.toml
+# (verifica automatica: tests/test_version.py)
+__version__ = "2.2.1"

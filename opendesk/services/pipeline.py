@@ -48,6 +48,11 @@ _KEYFRAME_INTERVAL = 60  # keyframe every N frames (~2s at 30fps) with motion
 
 # Throttle ricreazione encoder per adaptive quality (boost/restore CRF)
 _REBUILD_MIN_INTERVAL = 2.0  # s
+# Isteresi anti-oscillazione dell'adattivo: dopo un flip (boost/restore)
+# non ammettere il flip opposto prima di altrettanti secondi.  Senza,
+# una change_ratio che oscilla attorno a 0.05 rifà l'encoder ogni 2-6 s
+# (10+ rebuild/minuto: pressione GIL + CPU; RCA 2026-11-14).
+_QUALITY_FLIP_HYSTERESIS_S = 5.0
 # Rete di sicurezza: anche a schermo fermo (idle) invia un keyframe di
 # riallineamento ogni N frame catturati — a ~1 fps idle sono ~5 minuti.
 # Il traffico minimo che tiene vivo il flusso è il keepalive 1×1
@@ -84,6 +89,15 @@ class PipelineConfig:
     crf: int | None = None  # None = use bitrate, int = CRF mode
     pixel_format: str = "yuv420p"  # "yuv420p" or "yuv444p"
     encoder_preset: str = ""  # empty = auto by quality level
+    adaptive_fps: bool = True  # riduce l'fps di cattura a schermo fermo
+
+
+# FPS minimo di cattura a schermo fermo.  L'encoder invia comunque il
+# keepalive 1×1 ogni ~1s (serve un frame fresco al secondo) e i keyframe
+# idle periodicamente riallineano il client — la qualità percepita resta
+# quella di uno screenshot vivo, con una frazione del CPU (RCA 2026-11-14:
+# la cattura BitBlt+conversione a 30fps costava anche da fermi).
+_MIN_IDLE_FPS = 2.0
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -109,6 +123,7 @@ class CaptureWorker(threading.Thread):
         frame_queue: queue.Queue,
         stop_event: threading.Event,
         on_error: Callable[[str], None] | None = None,
+        shared: dict | None = None,
     ) -> None:
         super().__init__(name="CaptureWorker", daemon=True)
         self._config = config
@@ -116,6 +131,7 @@ class CaptureWorker(threading.Thread):
         self._stop_event = stop_event
         self._on_error = on_error
         self._capture: ScreenCapture | None = None
+        self._shared = shared
 
     def run(self) -> None:
         logger.info("CaptureWorker started")
@@ -127,12 +143,13 @@ class CaptureWorker(threading.Thread):
             if self._on_error:
                 self._on_error(msg)
             return
-        interval = 1.0 / max(self._config.fps, 1)
+        fps_target = max(self._config.fps, 1)
 
         consec_errors = 0
         max_consec_errors = 10
         frame_idx = 0
         last_status_log = time.monotonic()
+        frames_at_last_log = 0
 
         while not self._stop_event.is_set():
             t0 = time.perf_counter()
@@ -151,7 +168,14 @@ class CaptureWorker(threading.Thread):
                 # Status log ogni 5 secondi
                 now_mono = time.monotonic()
                 if now_mono - last_status_log >= 5.0:
-                    logger.info("CaptureWorker: %d frames captured", frame_idx)
+                    fps_eff = (frame_idx - frames_at_last_log) / 5.0
+                    logger.info(
+                        "CaptureWorker: %d frames captured (%.0f fps effettivi, target %.0f)",
+                        frame_idx,
+                        fps_eff,
+                        fps_target,
+                    )
+                    frames_at_last_log = frame_idx
                     last_status_log = now_mono
 
                 # ── Resolution scaling ──
@@ -195,9 +219,20 @@ class CaptureWorker(threading.Thread):
                 elif consec_errors <= max_consec_errors:
                     logger.debug("CaptureWorker error (%d/10): %s", consec_errors, e)
 
-            # Mantieni il frame rate target
+            # Frame rate: fisso o adattivo al change ratio dell'EncoderWorker
+            # (già calcolato per i tile — nessun diff extra).  A schermo fermo
+            # l'fps scende a _MIN_IDLE_FPS: il keepalive 1×1 dell'encoder e i
+            # keyframe idle tengono il flusso vivo con una frazione del CPU.
+            if self._config.adaptive_fps:
+                ratio = float(self._shared.get("change_ratio", 1.0)) if self._shared else 1.0
+                if ratio < 0.001:
+                    fps_target = _MIN_IDLE_FPS
+                elif ratio < 0.01:
+                    fps_target = max(_MIN_IDLE_FPS, self._config.fps * 0.3)
+                else:
+                    fps_target = self._config.fps
             elapsed = time.perf_counter() - t0
-            sleep = max(0.0, interval - elapsed)
+            sleep = max(0.0, 1.0 / fps_target - elapsed)
             if sleep > 0.001:
                 time.sleep(sleep)
 
@@ -233,6 +268,7 @@ class EncoderWorker(threading.Thread):
         on_send_full_keyframe: Callable | None = None,
         on_send_tile: Callable | None = None,
         on_error: Callable[[str], None] | None = None,
+        shared: dict | None = None,
     ) -> None:
         super().__init__(name="EncoderWorker", daemon=True)
         self._config = config
@@ -242,6 +278,7 @@ class EncoderWorker(threading.Thread):
         self._on_send_full_keyframe = on_send_full_keyframe
         self._on_send_tile = on_send_tile
         self._on_error = on_error
+        self._shared = shared
 
         self._encoder: VideoEncoder | None = None
         self._prev_frame: np.ndarray | None = None
@@ -255,6 +292,7 @@ class EncoderWorker(threading.Thread):
         # Adaptive quality when screen is idle
         self._last_change_ratio: float = 1.0  # 0.0 = idle, 1.0 = full change
         self._idle_frames: int = 0
+        self._last_quality_flip_mono: float = 0.0
         self._normal_crf: int | None = None
         self._is_boosted: bool = False
 
@@ -352,7 +390,10 @@ class EncoderWorker(threading.Thread):
                     self._idle_frames += 1
                 else:
                     self._idle_frames = 0
-                    if self._is_boosted:
+                    if self._is_boosted and (
+                        time.monotonic() - self._last_quality_flip_mono
+                        >= _QUALITY_FLIP_HYSTERESIS_S
+                    ):
                         self._restore_normal_quality()
 
                 # ── Decidi se inviare full keyframe o tile ──
@@ -539,6 +580,8 @@ class EncoderWorker(threading.Thread):
 
         # Aggiorna change ratio per adaptive quality
         self._last_change_ratio = len(changed_boxes) / total_tiles if total_tiles else 0.0
+        if self._shared is not None:
+            self._shared["change_ratio"] = self._last_change_ratio
 
         # Fase 2: se troppi tile cambiati, meglio un full keyframe
         if total_tiles > 0 and self._last_change_ratio > _TILE_MAX_CHANGED_RATIO:
@@ -592,6 +635,7 @@ class EncoderWorker(threading.Thread):
         )
         self._config.crf = boosted
         self._is_boosted = True
+        self._last_quality_flip_mono = time.monotonic()
         self._try_rebuild_encoder()
 
     def _restore_normal_quality(self) -> None:
@@ -607,6 +651,7 @@ class EncoderWorker(threading.Thread):
         self._config.crf = self._normal_crf
         self._normal_crf = None
         self._is_boosted = False
+        self._last_quality_flip_mono = time.monotonic()
         self._try_rebuild_encoder()
 
     def _try_rebuild_encoder(self, force: bool = False) -> None:
@@ -716,11 +761,17 @@ class StreamingPipeline:
         self._pkt_queue: queue.Queue = queue.Queue(maxsize=_PKT_QUEUE_MAX)
         self._stop_event = threading.Event()
 
+        # Stato condiviso fra i worker (lettura/scrittura atomica sotto GIL).
+        # Il CaptureWorker modula l'fps sul change ratio che l'EncoderWorker
+        # calcola comunque per i tile: nessun diff aggiuntivo.
+        self._shared = {"change_ratio": 1.0}
+
         self._capture_worker = CaptureWorker(
             config,
             self._frame_queue,
             self._stop_event,
             on_error=on_error,
+            shared=self._shared,
         )
         self._encoder_worker = EncoderWorker(
             config,
@@ -730,6 +781,7 @@ class StreamingPipeline:
             on_send_full_keyframe=self._on_send_full_keyframe,
             on_send_tile=self._on_send_tile,
             on_error=on_error,
+            shared=self._shared,
         )
         self._network_worker = NetworkWorker(
             self._pkt_queue,

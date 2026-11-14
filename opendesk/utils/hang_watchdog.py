@@ -20,6 +20,9 @@ Usage::
 from __future__ import annotations
 
 import logging
+import os
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -55,6 +58,48 @@ def _log_thread_stacks(stall: float) -> None:
         logger.exception("hang_watchdog: dump stack fallito")
 
 
+def _find_pyspy() -> str | None:
+    """Trova l'eseguibile py-spy: PATH, oppure accanto all'interprete."""
+    exe = shutil.which("py-spy")
+    if exe is None:
+        candidate = os.path.join(os.path.dirname(sys.executable), "py-spy.exe")
+        if os.path.isfile(candidate):
+            exe = candidate
+    return exe
+
+
+def _log_native_stack() -> None:
+    """Dump stack nativo+Python via ``py-spy --native``.
+
+    ``traceback.format_stack`` mostra solo frame Python: un hang dentro
+    l'event loop Qt appare come ``app.exec()`` e il frame C++ reale
+    (dispatcher Win32, clipboard, SendMessage, ...) resta invisibile.
+    py-spy --native lo rivela.  Chiamato dal thread watchdog, una sola
+    volta per episodio di stallo (il dump nativo costa qualche secondo).
+    """
+    exe = _find_pyspy()
+    if exe is None:
+        logger.warning(
+            "hang_watchdog: py-spy non trovato — dump nativo non disponibile "
+            "(installa py-spy nel venv o in PATH per il stack nativo)"
+        )
+        return
+    try:
+        proc = subprocess.run(
+            [exe, "dump", "--pid", str(os.getpid()), "--native"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        out = (proc.stdout + "\n" + proc.stderr).strip()
+        if out:
+            logger.warning("hang_watchdog: dump nativo (py-spy --native):\n%s", out[:8000])
+        else:
+            logger.warning("hang_watchdog: py-spy --native non ha prodotto output")
+    except Exception:  # noqa: BLE001 — il watchdog non deve mai far crashare
+        logger.exception("hang_watchdog: py-spy dump fallito")
+
+
 class HangWatchdog:
     """Rileva stalli del main thread e li logga con gli stack completi."""
 
@@ -67,6 +112,7 @@ class HangWatchdog:
         self._last_beat = time.monotonic()
         self._reported = False
         self._last_report = 0.0
+        self._native_dumped = False
         self._lock = threading.Lock()
 
         self._timer = QTimer()
@@ -86,6 +132,7 @@ class HangWatchdog:
         with self._lock:
             self._last_beat = time.monotonic()
             self._reported = False
+            self._native_dumped = False
 
     def _run(self) -> None:
         while True:
@@ -102,3 +149,6 @@ class HangWatchdog:
                     self._last_report = stall
             if report:
                 _log_thread_stacks(stall)
+                if not self._native_dumped:
+                    self._native_dumped = True
+                    _log_native_stack()

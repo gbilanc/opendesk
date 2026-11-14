@@ -29,7 +29,10 @@ WizardStyle=modern
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-CloseApplications=yes
+; Force: la host vive in tray; senza force l'exe puo' restare quello
+; vecchio se l'utente salta la pagina di chiusura (RCA 2026-11-14:
+; reinstallato v2.2.1 ma continuava a girare il vecchio exe).
+CloseApplications=force
 UninstallDisplayIcon={app}\{#MyAppExeName}
 UninstallDisplayName={#MyAppName}
 

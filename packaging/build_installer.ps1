@@ -38,11 +38,24 @@ uv sync
 Write-Host "==> [2/5] Installing PyInstaller"
 uv pip install --python "$Root\.venv\Scripts\python.exe" pyinstaller
 
+# py-spy serve al bundle per il dump nativo del hang_watchdog (uv sync lo
+# rimuove perche' non e' nei deps di pyproject - reinstallarlo dopo il sync)
+uv pip install --python "$Root\.venv\Scripts\python.exe" py-spy
+
 Write-Host "==> [3/5] Generating icons (opendesk-host.ico, opendesk.ico)"
 & "$Root\.venv\Scripts\python.exe" packaging\make_icon.py
 
 Write-Host "==> [4/5] Building bundle with PyInstaller"
 & "$Root\.venv\Scripts\python.exe" -m PyInstaller $Spec --noconfirm
+
+# py-spy per il dump nativo del hang_watchdog (non e' un import: PyInstaller
+# non lo include; lo copiamo nel bundle se presente nel venv)
+if (Test-Path "$Root\.venv\Scripts\py-spy.exe") {
+    Copy-Item "$Root\.venv\Scripts\py-spy.exe" "$Root\dist\opendesk-host\py-spy.exe" -ErrorAction SilentlyContinue
+    Write-Host "==> py-spy.exe copiato nel bundle (dump nativo hang_watchdog)"
+} else {
+    Write-Warning "py-spy non disponibile - il dump nativo del hang_watchdog non sara' nel bundle"
+}
 
 Write-Host "==> [5/5] Compiling installer with Inno Setup"
 $ISCC = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
