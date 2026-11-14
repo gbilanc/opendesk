@@ -289,6 +289,7 @@ class HostService(QObject):
             self._stream = StreamService(self._relay, self)
             self._stream.error.connect(self._on_stream_error)
             self._stream.input_unavailable.connect(self._on_input_unavailable)
+            self._stream.input_blocked.connect(self._on_input_blocked)
         self._stream.start_streaming()
         self.streaming_started.emit()
         logger.info("Host streaming started")
@@ -420,6 +421,12 @@ class HostService(QObject):
     def _on_input_unavailable(self, error_msg: str) -> None:
         logger.warning("Input backend unavailable: %s", error_msg)
         self.status_changed.emit(f"⚠ Remote input disabled: {error_msg}")
+
+    @Slot(str)
+    def _on_input_blocked(self, message: str) -> None:
+        """UIPI: finestra elevata in focus (Task Manager/UAC) blocca SendInput."""
+        logger.warning("Input remoto bloccato: %s", message)
+        self.status_changed.emit(f"⚠ {message}")
 
     @Slot(str)
     def _on_relay_error(self, error_msg: str) -> None:
@@ -1408,6 +1415,20 @@ def main_host() -> None:
 
     from opendesk.services.pipeline import _QUALITY_FLIP_HYSTERESIS_S
     from opendesk.utils.logger import setup_logging
+
+    # Flag servizio Windows: gestione SCM/autostart elevato (host_service)
+    if "--winsvc" in sys.argv:
+        from opendesk.host_service import run_service
+        run_service()
+        return
+    if "--install-service" in sys.argv:
+        from opendesk.host_service import install_service
+        install_service()
+        return
+    if "--remove-service" in sys.argv:
+        from opendesk.host_service import remove_service
+        remove_service()
+        return
 
     sys.argv[:], start_minimized, cli_level = _parse_host_args(sys.argv[1:])
 

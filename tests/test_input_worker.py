@@ -57,6 +57,11 @@ class FakeBackend:
         with self.lock:
             self.calls.append(("scroll", dx, dy))
 
+    def consume_block_event(self) -> str | None:
+        with self.lock:
+            self.calls.append(("consume_block",))
+        return None
+
     def set_screen_size(self, w: int, h: int) -> None:
         with self.lock:
             self.calls.append(("screen", w, h))
@@ -161,7 +166,8 @@ class TestStreamServiceInputOffMainThread:
             deadline = time.monotonic() + 5.0
             while not backend.calls and time.monotonic() < deadline:
                 time.sleep(0.01)
-            assert backend.calls == [("move", 100, 200)]
+            # la chiamata consume_block_event segue l'iniezione (UIPI check)
+            assert backend.calls == [("move", 100, 200), ("consume_block",)]
         finally:
             svc._input_worker.stop()
 
@@ -176,7 +182,7 @@ class TestStreamServiceInputOffMainThread:
             deadline = time.monotonic() + 5.0
             while not backend.calls and time.monotonic() < deadline:
                 time.sleep(0.01)
-            assert len(backend.calls) == 1
+            assert len(backend.calls) == 2  # key_event + consume_block
             assert backend.calls[0][0] == "key"
             assert backend.calls[0][1] == "a"
         finally:
@@ -189,7 +195,7 @@ class TestStreamServiceInputOffMainThread:
         svc._input_worker = None
         svc.inject_mouse(Message.mouse_event(5, 6))
         backend: FakeBackend = svc._input_backend
-        assert backend.calls == [("move", 5, 6)]
+        assert backend.calls == [("move", 5, 6), ("consume_block",)]
 
 
 # ═══════════════════════════════════════════════════════════════════

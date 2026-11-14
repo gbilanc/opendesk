@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import IntEnum, auto
@@ -97,6 +98,13 @@ class InputBackend(ABC):
         correctly scale pixel coordinates to the device range.
         """
         return
+
+    def consume_block_event(self) -> str | None:
+        """Messaggio utente se l'ultimo invio input è stato bloccato.
+
+        Solo il backend Windows (UIPI) lo produce; default ``None``.
+        """
+        return None
 
     def release(self) -> None:
         """Clean up backend resources."""
@@ -956,7 +964,12 @@ class WindowsInputBackend(InputBackend):
 
     def __init__(self) -> None:
 
-        self._user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        # use_last_error=True: SendInput ritorna 0 quando UIPI blocca
+        # l'iniezione su finestre elevate (Task Manager/UAC) — senza il
+        # codice errore la perdita era silenziosa (RCA 2026-11-14).
+        self._user32 = ctypes.WinDLL("user32", use_last_error=True)
+        self._last_block_log_mono: float = 0.0
+        self._uipi_block_episode_open: bool = False
 
         # Strutture SendInput (INPUT, MOUSEINPUT, KEYBDINPUT)
         self._INPUT_TYPE_MOUSE = 0
@@ -1016,14 +1029,53 @@ class WindowsInputBackend(InputBackend):
         inp = _INPUT()
         inp.type = self._INPUT_TYPE_MOUSE
         inp.u.mi = _MOUSEINPUT(dx, dy, data, flags, 0, 0)
-        self._SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
+        if self._SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT)) == 0:
+            self._note_input_block("mouse")
 
     def _send_keyboard_input(self, vk: int, flags: int) -> None:
         """Invia un evento tastiera con ``SendInput``."""
         inp = _INPUT()
         inp.type = self._INPUT_TYPE_KEYBOARD
         inp.u.ki = _KEYBDINPUT(vk, 0, flags, 0, 0)
-        self._SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
+        if self._SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT)) == 0:
+            self._note_input_block("tastiera")
+
+    def _note_input_block(self, kind: str) -> None:
+        """Logga (con throttle) l'input bloccato da UIPI.
+
+        SendInput ritorna 0 e GetLastError=5 quando una finestra a
+        integrity level superiore ha il focus: tipicamente Task Manager
+        o un prompt UAC.  Non è un bug di OpenDesk: è una policy di
+        sistema.  Rimedio: eseguire l'host elevato (l'installer crea
+        l'autostart elevato se l'utente è admin).
+        """
+        self._uipi_block_episode_open = True
+        now = time.monotonic()
+        if now - self._last_block_log_mono < 5.0:
+            return
+        self._last_block_log_mono = now
+        err = ctypes.get_last_error()
+        logger.warning(
+            "SendInput %s BLOCCATO (WinError %s) — finestra elevata in focus "
+            "(UIPI, es. Task Manager/UAC).  Avvia l'host come amministratore "
+            "per controllare finestre elevate.",
+            kind,
+            err,
+        )
+
+    def consume_block_event(self) -> str | None:
+        """Messaggio per l'utente, una sola volta per episodio di blocco.
+
+        Consumato da StreamService per segnalare lo stato sull'interfaccia
+        host; ``None`` quando l'ultimo invio non è stato bloccato.
+        """
+        if not self._uipi_block_episode_open:
+            return None
+        self._uipi_block_episode_open = False
+        return (
+            "Input remoto bloccato su finestra elevata (UIPI, es. Task "
+            "Manager/UAC) — avvia OpenDesk Host come amministratore"
+        )
 
     # ── public API ───────────────────────────────────────────────────
 

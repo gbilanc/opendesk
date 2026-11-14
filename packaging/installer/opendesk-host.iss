@@ -60,3 +60,55 @@ Root: HKCU; Subkey: "Software\OpenDesk\OpenDesk\network"; ValueType: string; Val
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--minimized"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent
+
+[UninstallRun]
+Filename: "sc.exe"; Parameters: "stop OpenDeskHostSvc"; Flags: runhidden; RunOnceId: "StopSvc"
+Filename: "sc.exe"; Parameters: "delete OpenDeskHostSvc"; Flags: runhidden; RunOnceId: "DelSvc"
+Filename: "schtasks.exe"; Parameters: "/Delete /F /TN ""OpenDesk Host"""; Flags: runhidden; RunOnceId: "DelTask"
+
+[Code]
+// Autostart elevato (RCA 2026-11-14): una finestra elevata (Task Manager,
+// UAC) blocca SendInput da un processo a integrit media (UIPI) - il mouse
+// remoto smette di funzionare.  Con utente admin creiamo il SERVIZIO
+// OpenDeskHostSvc (SYSTEM): supervisore che riavvia l'host elevato nella
+// sessione utente via attivita' pianificata /RL HIGHEST, senza UAC.
+// Fallback: senza admin resta il Run-key HKCU non elevato.
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ResultCode: Integer;
+  ExePath: string;
+begin
+  if CurStep <> ssPostInstall then
+    exit;
+  if not IsAdminLoggedOn then
+    exit;
+  ExePath := ExpandConstant('{app}\{#MyAppExeName}');
+  if Exec(
+       'sc.exe',
+       Format('create OpenDeskHostSvc binPath= "\"%s\" --winsvc" ' +
+              'start= auto DisplayName= "OpenDesk Host Service"', [ExePath]),
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
+     and (ResultCode = 0) then
+  begin
+    Log('Servizio OpenDeskHostSvc creato');
+    Exec('sc.exe',
+         'description OpenDeskHostSvc "Supervisore OpenDesk Host: mantiene l''host elevato nella sessione utente (controllo finestre elevate, UIPI)."',
+         '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    // Il servizio gestisce l'autostart: il Run-key creerebbe un doppio avvio
+    RegDeleteValue(HKEY_CURRENT_USER,
+      'Software\Microsoft\Windows\CurrentVersion\Run', 'OpenDesk Host');
+    exit;
+  end;
+  Log(Format('sc create fallita (%d) - fallback attivita pianificata', [ResultCode]));
+  if Exec(
+       'schtasks.exe',
+       Format('/Create /F /TN "OpenDesk Host" /SC ONLOGON /RL HIGHEST ' +
+              '/TR "\"%s\" --minimized"', [ExePath]),
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    if ResultCode = 0 then
+      Log('Attivita pianificata elevata creata')
+    else
+      Log(Format('schtasks fallita (%d) - resta il Run-key', [ResultCode]));
+  end;
+end;

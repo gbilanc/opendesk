@@ -177,6 +177,10 @@ class StreamService(QObject):
     frame_ready = Signal(object, int, int)  # np.ndarray, width, height
     bitrate_changed = Signal(float)
     input_unavailable = Signal(str)  # non-fatal: input backend could not start
+    # Input bloccato dall'OS su finestra elevata (UIPI — Task Manager/UAC):
+    # segnalato una volta per episodio per far capire all'utente host perché
+    # il client non controlla più (RCA 2026-11-14).
+    input_blocked = Signal(str)
     error = Signal(str)
 
     def __init__(self, relay: RelayClient, parent: QObject | None = None) -> None:
@@ -596,6 +600,9 @@ class StreamService(QObject):
             self._input_backend.click_mouse(btn, state)
         else:
             self._input_backend.move_mouse(x, y, absolute)
+        blocked = self._input_backend.consume_block_event()
+        if blocked:
+            self.input_blocked.emit(blocked)
 
     def inject_keyboard(self, msg: Message) -> None:
         """Inietta un evento tastiera (chiamato dal relay, main thread Qt)."""
@@ -614,6 +621,9 @@ class StreamService(QObject):
         state = KeyState.PRESSED if pressed else KeyState.RELEASED
         if key:
             self._input_backend.key_event(key, state)
+        blocked = self._input_backend.consume_block_event()
+        if blocked:
+            self.input_blocked.emit(blocked)
 
     def sync_remote_caps_lock(self, remote_active: bool) -> None:
         """Allinea il Caps Lock locale allo stato del client remoto.
