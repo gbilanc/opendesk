@@ -25,6 +25,9 @@ from opendesk.network.relay_client import RelayClient, RelayRole
 
 logger = logging.getLogger(__name__)
 
+# Intervallo di riconnessione della sessione host al relay.
+_RECONNECT_INTERVAL_MS = 10_000
+
 # ═══════════════════════════════════════════════════════════════════
 # ConnectionService
 # ═══════════════════════════════════════════════════════════════════
@@ -119,8 +122,10 @@ class ConnectionService(QObject):
         # Device registry
         self._device_registry = DeviceRegistry()
 
-        # Retry (solo per la sessione host)
-        self._host_retries = 0
+        # Retry (solo per la sessione host): timer ciclico ogni 10 s
+        self._reconnect_timer = QTimer(self)
+        self._reconnect_timer.setInterval(_RECONNECT_INTERVAL_MS)
+        self._reconnect_timer.timeout.connect(self._try_reconnect_host)
 
     # ── properties ──────────────────────────────────────────────────
 
@@ -229,10 +234,15 @@ class ConnectionService(QObject):
             device_name=self._device_name,
             trusted_devices=self._device_registry.trusted_secrets(),
         )
+        self._reconnect_timer.start()
 
     def stop_hosting(self) -> None:
-        """Ferma la sessione host."""
-        self._host_retries = 0
+        """Ferma la sessione host.
+
+        Il timer di riconnessione resta attivo: questo metodo è usato per
+        espellere un client remoto, dopodiché l'hosting deve tornare
+        disponibile automaticamente.
+        """
         self._relay.stop_hosting()
 
     def join_session(
@@ -269,7 +279,7 @@ class ConnectionService(QObject):
 
     def disconnect(self) -> None:  # type: ignore[override]
         """Disconnetti completamente: ferma sia host che client."""
-        self._host_retries = 0
+        self._reconnect_timer.stop()
         self._relay.disconnect()
 
     def disconnect_client(self) -> None:
@@ -298,42 +308,24 @@ class ConnectionService(QObject):
 
     # ── retry (solo per la sessione host) ───────────────────────────
 
-    def schedule_retry(self, status_callback) -> None:
-        """Riprova la connessione host con backoff esponenziale.
+    @Slot()
+    def _try_reconnect_host(self) -> None:
+        """Riconnetti l'hosting al relay ogni 10 s finché non riesce.
 
-        La sessione client NON viene ritentata automaticamente
-        (viene gestita dall'UI).
+        No-op se l'hosting è già attivo. La sessione client NON viene
+        ritentata automaticamente.
         """
-        if self._host_retries >= 5:
-            status_callback("⚠ Relay unavailable — local session only")
-            return
-        delay = min(2**self._host_retries * 2, 30)
-        self._host_retries += 1
-        logger.info("Retrying relay in %ds (attempt %d/5)", delay, self._host_retries)
-        QTimer.singleShot(int(delay * 1000), lambda: self._retry_now(status_callback))
-
-    def _retry_now(self, status_callback) -> None:
-        # Guard: don't reconnect if hosting is already active
         if not self._host_session_id or self._relay.is_hosting():
             return
         host, port = self._get_relay_config()
-        status_callback("Reconnecting to relay...")
-        self._relay.start_hosting(
-            host,
-            port,
-            self._host_session_id,
-            self._password,
-            device_id=self._device_id,
-            device_name=self._device_name,
-            trusted_devices=self._device_registry.trusted_secrets(),
-        )
+        logger.info("Reconnecting host to relay %s:%s", host, port)
+        self.start_hosting()
 
     # ── host event handlers → forward as signals ────────────────────
 
     @Slot(str, str)
     def _on_host_connected(self, role: str, session_id: str) -> None:
         """Host session connected to relay."""
-        self._host_retries = 0
         # Emit connected only if there's no active client session
         if self._relay.role != RelayRole.CLIENT:
             self.connected.emit(role, session_id)
@@ -342,9 +334,7 @@ class ConnectionService(QObject):
     def _on_host_disconnected(self) -> None:
         """Host session disconnected from relay."""
         logger.info("Host session disconnected from relay")
-        # Schedule retry for host session
-        if self._host_session_id:
-            self.schedule_retry(lambda m: logger.info("Host retry: %s", m))
+        # Il retry è gestito dal timer _reconnect_timer.
         # Emit disconnected only if there's no active client session
         if self._relay.role != RelayRole.CLIENT:
             self.disconnected.emit()

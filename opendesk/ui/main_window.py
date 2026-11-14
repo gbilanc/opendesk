@@ -484,9 +484,9 @@ class MainWindow(QMainWindow):
         self._peer_id = ""
 
         if not was_hosting and self._host_session_id:
-            # Host connection dropped unexpectedly — auto-retry
+            # Host connection dropped unexpectedly — il retry è gestito
+            # da ConnectionService ogni 10 s
             self._status_text.setText("⚠ Relay disconnected — reconnecting...")
-            self._connection.schedule_retry(lambda m: self._status_text.setText(m))
         else:
             self._status_text.setText("Disconnected")
 

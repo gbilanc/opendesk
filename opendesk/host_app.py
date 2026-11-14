@@ -58,6 +58,7 @@ logger = logging.getLogger(__name__)
 _FT_POLL_INTERVAL = 200  # ms — poll file-transfer updates queue
 _FT_POLL_IDLE_INTERVAL = 1000  # ms — quando la coda è vuota (risparmio CPU/RAM)
 _SINGLE_INSTANCE_NAME = "OpenDeskHostInstance"  # lock QLocalServer
+_RECONNECT_INTERVAL_MS = 10_000  # ms — retry ciclico host → relay
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -147,7 +148,18 @@ class HostService(QObject):
         # ── State ──
         self._peer_connected = False
         self._peer_device_id: str = ""
-        self._host_retries = 0
+
+        # Retry ciclico host → relay ogni 10 s
+        self._reconnect_timer = QTimer(self)
+        self._reconnect_timer.setInterval(_RECONNECT_INTERVAL_MS)
+        self._reconnect_timer.timeout.connect(self._try_reconnect_host)
+
+        # Guardia: nessuna pipeline attiva senza un peer autenticato.
+        # Copre i disconnect persi (relay caduto, eventi mancanti): senza
+        # client la cattura+encode continuerebbe a bruciare CPU a vuoto.
+        self._peer_watchdog = QTimer(self)
+        self._peer_watchdog.setInterval(5000)
+        self._peer_watchdog.timeout.connect(self._check_peer_stream)
 
     # ── properties ──────────────────────────────────────────────────────
 
@@ -226,9 +238,13 @@ class HostService(QObject):
             device_name=self._device_name,
             trusted_devices=self._device_registry.trusted_secrets(),
         )
+        self._reconnect_timer.start()
+        self._peer_watchdog.start()
 
     def stop(self) -> None:
         """Ferma l'hosting e disconnetti dal relay."""
+        self._reconnect_timer.stop()
+        self._peer_watchdog.stop()
         self._stop_streaming()
         self._relay.disconnect()
         self._peer_connected = False
@@ -284,32 +300,32 @@ class HostService(QObject):
             self.streaming_stopped.emit()
             logger.info("Host streaming stopped")
 
-    # ── retry (exponential backoff) ─────────────────────────────────────
+    @Slot()
+    def _check_peer_stream(self) -> None:
+        """Ferma la pipeline se non c'è più un peer autenticato.
 
-    def schedule_retry(self) -> None:
-        """Riprova la connessione relay con backoff esponenziale."""
-        if self._host_retries >= 5:
-            self.status_changed.emit("⚠ Relay unavailable — local session only")
+        Rete di sicurezza contro eventi di disconnect persi (relay caduto,
+        sessione chiusa lato client): senza un destinatario la pipeline
+        cattura ed encoda a 30 fps per niente.
+        """
+        if self._stream is None or not self._stream.is_streaming:
             return
-        delay = min(2**self._host_retries * 2, 30)
-        self._host_retries += 1
-        logger.info("Retrying relay in %ds (attempt %d/5)", delay, self._host_retries)
-        QTimer.singleShot(int(delay * 1000), self._retry_now)
+        if self._peer_connected:
+            return
+        logger.info("No authenticated peer — stopping idle streaming pipeline")
+        self._stop_streaming()
 
-    def _retry_now(self) -> None:
+    # ── retry (ciclico ogni 10 s) ───────────────────────────────────────
+
+    @Slot()
+    def _try_reconnect_host(self) -> None:
+        """Riconnetti l'hosting al relay ogni 10 s finché non riesce."""
         if not self._session_id or self._relay.is_hosting():
             return
         host, port = self._get_relay_config()
+        logger.info("Reconnecting host to relay %s:%s", host, port)
         self.status_changed.emit("Reconnecting to relay...")
-        self._relay.start_hosting(
-            host,
-            port,
-            self._session_id.replace(" ", ""),
-            self._password,
-            device_id=self._device_id,
-            device_name=self._device_name,
-            trusted_devices=self._device_registry.trusted_secrets(),
-        )
+        self.start()
 
     # ── file transfer polling ──────────────────────────────────────────
 
@@ -354,7 +370,6 @@ class HostService(QObject):
 
     @Slot(str, str)
     def _on_host_connected(self, role: str, session_id: str) -> None:
-        self._host_retries = 0
         self.status_changed.emit("Connected to relay — waiting for incoming connection...")
         logger.info("Host connected to relay: %s", session_id)
 
@@ -362,9 +377,10 @@ class HostService(QObject):
     def _on_host_disconnected(self) -> None:
         logger.info("Host disconnected from relay")
         self._peer_connected = False
-        self.status_changed.emit("Disconnected from relay")
-        if self._session_id:
-            self.schedule_retry()
+        # Senza sessione relay send_frame non ha destinazione: la pipeline
+        # continuerebbe a catturare/encodare a vuoto (CPU alta da idle).
+        self._stop_streaming()
+        self.status_changed.emit("Disconnected from relay — reconnecting...")
 
     @Slot()
     def _on_host_peer_joined(self) -> None:

@@ -67,6 +67,8 @@ class RelayRole(Enum):
 _POLL_INTERVAL_MS = 16  # poll inbox every 16 ms (~60 Hz); i frame stale
 # sono coalesced per ciclo, quindi il costo risveglio e' quasi nullo
 # e la latenza di presentazione non puo' superare 16 ms
+_POLL_INTERVAL_IDLE_MS = 100  # senza sessione/peer attivo: 60 wakeup/s a
+# vuoto costavano ~2% di CPU anche da fermi; a riposo basta 10 Hz
 _CONNECT_TIMEOUT = 15.0  # max seconds to wait for TCP connection
 _STOP_JOIN_TIMEOUT = 8.0  # max seconds to wait for session thread to stop
 _SEND_DRAIN_TIMEOUT = 5.0  # max seconds to wait for TCP send buffer to drain
@@ -1486,11 +1488,13 @@ class RelayClient(QObject):
         self._inbox: queue.Queue = queue.Queue()
         self._current_seq: int = 0
         self._role: RelayRole | None = None
+        # Un peer host è autenticato e attivo → serve polling veloce
+        self._host_peer_active: bool = False
 
         # ── Single timer to poll both inboxes ──
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll_inboxes)
-        self._timer.start(_POLL_INTERVAL_MS)
+        self._timer.start(_POLL_INTERVAL_IDLE_MS)
 
     def _load_p2p_settings(self) -> None:
         """Read P2P/ICE settings from QSettings.
@@ -1853,6 +1857,13 @@ class RelayClient(QObject):
         self._poll_client_inbox()
         self._poll_host_inbox()
 
+        # Polling adattivo: 16 ms solo quando c'è traffico da smaltire
+        # (sessione client o peer host autenticato); a riposo 100 ms.
+        fast = self._session is not None or self._host_peer_active
+        want = _POLL_INTERVAL_MS if fast else _POLL_INTERVAL_IDLE_MS
+        if self._timer.interval() != want:
+            self._timer.setInterval(want)
+
     def _poll_client_inbox(self) -> None:
         """Process client inbox events.
 
@@ -1972,13 +1983,16 @@ class RelayClient(QObject):
         elif event == "disconnected":
             self._host_session = None
             self._host_thread = None
+            self._host_peer_active = False
             self.host_disconnected.emit()
         elif event == "peer_joined":
             self.host_peer_joined.emit()
         elif event == "auth_result":
             success, msg = data
+            self._host_peer_active = bool(success)
             self.host_auth_result.emit(success, msg)
         elif event == "peer_disconnected":
+            self._host_peer_active = False
             self.host_peer_disconnected.emit()
         elif event == "keyframe_requested":
             self.host_keyframe_requested.emit()

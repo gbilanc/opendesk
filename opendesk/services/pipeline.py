@@ -49,9 +49,15 @@ _KEYFRAME_INTERVAL = 60  # keyframe every N frames (~2s at 30fps) with motion
 # Throttle ricreazione encoder per adaptive quality (boost/restore CRF)
 _REBUILD_MIN_INTERVAL = 2.0  # s
 # Rete di sicurezza: anche a schermo fermo (idle) invia un keyframe di
-# riallineamento ogni N frame (~10s), così il client recupera da tile
-# persi/droppati invece di restare su un'immagine vecchia.
+# riallineamento ogni N frame catturati — a ~1 fps idle sono ~5 minuti.
+# Il traffico minimo che tiene vivo il flusso è il keepalive 1×1
+# (``_IDLE_KEEPALIVE_INTERVAL``), non questo keyframe.
 _KEYFRAME_IDLE_INTERVAL = 300
+# Heartbeat: se non parte nulla da N secondi (desktop fermo o bloccato),
+# invia un tile 1×1 del frame corrente. Senza traffico il client
+# interpreta il silenzio come stream morto e martella di richieste
+# keyframe da ~340 KB; il tile costa ~600 B/s e tiene vivo il flusso.
+_IDLE_KEEPALIVE_INTERVAL = 1.0  # s
 # JPEG quality per quality preset (lossy ma ~10× più veloce del PNG).
 _TILE_JPEG_QUALITY: dict[QualityLevel, int] = {
     QualityLevel.LOW: 50,
@@ -259,6 +265,9 @@ class EncoderWorker(threading.Thread):
         self._last_rebuild_mono: float = 0.0
         self._rebuild_pending: bool = False
 
+        # Ultimo pacchetto effettivamente accodato (heartbeat idle).
+        self._last_packet_mono: float = time.monotonic()
+
     def run(self) -> None:
         logger.info("EncoderWorker started")
         last_frame_time = time.monotonic()
@@ -277,6 +286,9 @@ class EncoderWorker(threading.Thread):
                     logger.info("EncoderWorker: %d frames encoded", encoded_count)
                     last_status_log = now_mono
             except queue.Empty:
+                # Schermo fermo/bloccato: nessun tile da inviare.  Un
+                # heartbeat tiene vivo il flusso senza banda apprezzabile.
+                self._maybe_send_keepalive()
                 # Watchdog: se non arrivano frame per 60s, CaptureWorker e' morto
                 # Il timeout è alto per coprire l'avvio lento di Wayland
                 # (PORTAL dialog 30s + PIPEWIRE startup 10s).
@@ -390,6 +402,35 @@ class EncoderWorker(threading.Thread):
     def request_keyframe(self) -> None:
         self._force_full_keyframe = True
 
+    def _maybe_send_keepalive(self) -> None:
+        """Invia un tile 1×1 se non parte nulla da ``_IDLE_KEEPALIVE_INTERVAL``.
+
+        Serve solo a dire al client "lo stream è vivo": il tile contiene il
+        pixel reale del frame corrente, quindi la composizione sul reference
+        frame del client resta coerente e non si vede alcun artefatto.
+        """
+        prev = self._prev_frame
+        if (
+            prev is None
+            or time.monotonic() - self._last_packet_mono < _IDLE_KEEPALIVE_INTERVAL
+        ):
+            return
+        try:
+            ok, encoded = cv2.imencode(
+                ".jpg",
+                cv2.cvtColor(prev[0:1, 0:1], cv2.COLOR_RGB2BGR),
+                [cv2.IMWRITE_JPEG_QUALITY, _TILE_JPEG_QUALITY[self._config.quality]],
+            )
+        except Exception as e:  # noqa: BLE001 — heartbeat cosmetico
+            logger.debug("EncoderWorker: keepalive encode failed: %s", e)
+            return
+        if not ok:
+            return
+        data = encoded.tobytes()
+        pts = int(time.time() * 1000)
+        if self._queue_packet(("tile", data, 0, 0, 1, 1, pts)) and self._on_send_tile:
+            self._on_send_tile(data, 0, 0, 1, 1, pts)
+
     def _queue_packet(self, packet: object, *, keyframe: bool = False) -> bool:
         """Queue output without letting congestion block encoder shutdown.
 
@@ -399,6 +440,7 @@ class EncoderWorker(threading.Thread):
         """
         try:
             self._pkt_queue.put(packet, timeout=0.1)
+            self._last_packet_mono = time.monotonic()
             if not keyframe:
                 self._dropped_tiles = 0
             return True
