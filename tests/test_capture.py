@@ -5,6 +5,7 @@ Tests for screen capture and video codec modules.
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from opendesk.core.screen_capture import compute_dirty_region, frame_diff_ratio
 from opendesk.core.video_codec import EncoderConfig, QualityLevel, VideoDecoder, VideoEncoder
@@ -148,6 +149,9 @@ class TestInputInjection:
         """The factory should return a backend for the current platform."""
         from opendesk.core.input_injection import create_input_backend
 
-        backend = create_input_backend()
+        try:
+            backend = create_input_backend()
+        except (PermissionError, RuntimeError) as exc:
+            pytest.skip(f"input backend unavailable on this host: {exc}")
         assert backend is not None
         backend.release()

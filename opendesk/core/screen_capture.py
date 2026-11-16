@@ -313,7 +313,9 @@ class PipeWireCapture:
             self._frame_buf = bytearray(frame_size)
             self._frame_fill = 0
         try:
-            n = self._helper_process.stdout.readinto(memoryview(self._frame_buf)[self._frame_fill :])
+            n = self._helper_process.stdout.readinto(  # type: ignore[attr-defined]
+                memoryview(self._frame_buf)[self._frame_fill :]
+            )
         except BlockingIOError:
             return None  # no data yet
         if n:

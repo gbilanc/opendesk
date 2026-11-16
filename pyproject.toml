@@ -84,6 +84,11 @@ include = ["opendesk*"]
 "*" = ["*.qss", "*.png", "*.svg", "*.ico"]
 
 
+[tool.pytest.ini_options]
+# pytest-asyncio: usa il loop di default per i fixture async
+asyncio_default_fixture_loop_scope = "function"
+
+
 [tool.black]
 line-length = 99
 target-version = ["py312"]
@@ -101,6 +106,12 @@ select = ["E", "F", "I", "N", "W", "UP"]
 "tools/diagnostics/repro_*.py" = ["N806"]
 # Win32 API: nomi di struttura/handler replicano l'SDK (SERVICE_STATUS, HandlerEx...)
 "opendesk/host_service.py" = ["N801", "N806"]
+
+[[tool.mypy.overrides]]
+# ctypes.WinDLL/WINFUNCTYPE/get_last_error esistono solo su Windows: i
+# typeshed di Linux/macOS non li dichiarano, quindi attr-defined fallisce.
+module = ["opendesk.host_service", "opendesk.core.input_injection"]
+disable_error_code = ["attr-defined"]
 
 [tool.mypy]
 python_version = "3.12"

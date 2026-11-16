@@ -85,7 +85,10 @@ def main() -> None:
         nargs="?",
         const="auto",
         default=None,
-        help="Codifica H.264 nell'helper (zero-copy GPU→encoder): 'auto' o nome elemento GStreamer",
+        help=(
+            "Codifica H.264 nell'helper (zero-copy GPU→encoder): "
+            "'auto' o nome elemento GStreamer"
+        ),
     )
     args = parser.parse_args()
 

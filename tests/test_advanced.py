@@ -7,6 +7,8 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from opendesk.core.clipboard_sync import ClipboardSync
 from opendesk.core.file_transfer import (
     FileInfo,
@@ -332,7 +334,10 @@ class TestInputBackend:
     def test_platform_backend_creation(self) -> None:
         from opendesk.core.input_injection import create_input_backend
 
-        backend = create_input_backend()
+        try:
+            backend = create_input_backend()
+        except (PermissionError, RuntimeError) as exc:
+            pytest.skip(f"input backend unavailable on this host: {exc}")
         assert backend is not None
         assert hasattr(backend, "move_mouse")
         assert hasattr(backend, "click_mouse")

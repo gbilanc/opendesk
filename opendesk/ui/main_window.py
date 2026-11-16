@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import queue
+from collections.abc import Callable
 from typing import cast
 
 import numpy as np
@@ -114,7 +115,8 @@ class MainWindow(QMainWindow):
 
         # File transfer manager
         self._file_transfer = FileTransferManager()
-        self._file_transfer_send_fn = None  # set after connection
+        # Callable impostato dopo l'autenticazione (None se disconnesso)
+        self._file_transfer_send_fn: Callable[[Message], None] | None = None
 
         # Poll the file-transfer updates queue from the background thread
         # (only while a session is active — see ``_set_connected``)

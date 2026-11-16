@@ -93,9 +93,7 @@ class _RecordingWorker:
     def __init__(self, recorder: ScreenRecorder) -> None:
         self._recorder = recorder
         self._queue: queue.Queue[QImage | None] = queue.Queue(maxsize=8)
-        self._thread = threading.Thread(
-            target=self._run, name="ScreenRecorder", daemon=True
-        )
+        self._thread = threading.Thread(target=self._run, name="ScreenRecorder", daemon=True)
         self._thread.start()
 
     def submit(self, image: QImage) -> None:
