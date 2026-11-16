@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opendesk"
-version = "2.2.1"
+version = "2.3.0"
 description = "Remote desktop application (TeamViewer/AnyDesk-like)"
 readme = "README.md"
 license = {text = "MIT"}
@@ -96,21 +96,16 @@ target-version = "py312"
 select = ["E", "F", "I", "N", "W", "UP"]
 
 [tool.ruff.lint.per-file-ignores]
-# Costanti Win32 (WM_*, SC_*) negli script di debug/repro: naming Win32 intenzionale
-"tests/probe_*.py" = ["N806"]
-"tests/repro_*.py" = ["N806"]
+# Costanti Win32 (WM_*, SC_*) negli script di diagnostica: naming Win32 intenzionale
+"tools/diagnostics/probe_*.py" = ["N806"]
+"tools/diagnostics/repro_*.py" = ["N806"]
+# Win32 API: nomi di struttura/handler replicano l'SDK (SERVICE_STATUS, HandlerEx...)
+"opendesk/host_service.py" = ["N801", "N806"]
 
 [tool.mypy]
 python_version = "3.12"
 strict = false
 ignore_missing_imports = true
-
-[dependency-groups]
-dev = [
-    "pytest>=9.1.1",
-]
-
-
 
 [project.scripts]
 opendesk = "opendesk.app:main"

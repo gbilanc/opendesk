@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import logging
 import queue
-import secrets
-import string
 import time
 import traceback
 import uuid
@@ -40,13 +38,15 @@ from PySide6.QtWidgets import (
 
 from opendesk import __version__
 from opendesk.core.device_registry import DeviceRegistry
-from opendesk.core.file_transfer import FileTransferManager, TransferState
+from opendesk.core.file_transfer import FILE_MESSAGE_TYPES, FileTransferManager
 from opendesk.core.platform_config import HealthSeverity, get_platform_config
-from opendesk.crypto.auth import AuthManager
+from opendesk.core.unattended import UnattendedAccess
+from opendesk.crypto.auth import AuthManager, generate_otp
 from opendesk.network.protocol import Message, MessageType
 from opendesk.network.relay_client import RelayClient
 from opendesk.services.stream_service import StreamService
 from opendesk.ui.chat_panel import ChatPanel
+from opendesk.ui.session_info import SessionInfoWidget
 from opendesk.ui.settings_dialog import SettingsDialog
 
 logger = logging.getLogger(__name__)
@@ -145,6 +145,9 @@ class HostService(QObject):
         # ── Device registry (pre-authorization) ──
         self._device_registry = DeviceRegistry()
 
+        # ── Accesso non presidiato (allowlist di device) ──
+        self._unattended = UnattendedAccess()
+
         # ── State ──
         self._peer_connected = False
         self._peer_device_id: str = ""
@@ -213,7 +216,7 @@ class HostService(QObject):
     def create_session(self, password: str | None = None) -> tuple[str, str]:
         """Crea una nuova sessione.  Restituisce (session_id, password)."""
         if password is None:
-            password = self._generate_password()
+            password = generate_otp()
         session = self._auth.create_session(password, one_time=False)
         self._session_id = session.session_id
         self._password = password
@@ -237,9 +240,16 @@ class HostService(QObject):
             device_id=self._device_id,
             device_name=self._device_name,
             trusted_devices=self._device_registry.trusted_secrets(),
+            allowed_peer_ids=self._unattended_allowlist(),
         )
         self._reconnect_timer.start()
         self._peer_watchdog.start()
+
+    def _unattended_allowlist(self) -> set[str]:
+        """Device autorizzati dall'accesso non presidiato (vuoto = nessun filtro)."""
+        if not self._unattended.enabled:
+            return set()
+        return set(self._unattended.config.allowed_peers)
 
     def stop(self) -> None:
         """Ferma l'hosting e disconnetti dal relay."""
@@ -250,14 +260,18 @@ class HostService(QObject):
         self._peer_connected = False
         self.status_changed.emit("Disconnected")
 
-    def regenerate_session(self) -> None:
-        """Genera nuova sessione (ID + password) e ri-avvia l'hosting."""
+    def regenerate_session(self, password: str | None = None) -> None:
+        """Genera nuova sessione (ID + password) e ri-avvia l'hosting.
+
+        ``password`` permette alla UI di proporre una password già mostrata
+        all'utente, evitando che il valore visibile diverga da quello attivo.
+        """
         logger.info(
             "regenerate_session chiamato (caller=\n%s)",
             "".join(traceback.format_stack()[-4:-1]),
         )
         self._relay.stop_hosting()
-        self.create_session()
+        self.create_session(password)
         self.start()
 
     # ── relay config ────────────────────────────────────────────────────
@@ -510,38 +524,8 @@ class HostService(QObject):
             if job_id:
                 # Auto-accept: trasferimento in background, nessuna conferma host.
                 self.respond_to_incoming_file(job_id, True)
-        elif t == MessageType.FILE_CHUNK:
-            self._file_transfer.handle_chunk(msg)
-        elif t == MessageType.FILE_ACCEPT:
-            job_id = msg.payload.get("job_id", "")
-            job = self._file_transfer.get_job(job_id)
-            if job:
-                self._file_transfer.send_chunks(job, self._relay.send_message)
-        elif t == MessageType.FILE_REJECT:
-            job_id = msg.payload.get("job_id", "")
-            reason = msg.payload.get("reason", "Rejected by remote")
-            job = self._file_transfer.get_job(job_id)
-            if job:
-                job.state = TransferState.CANCELLED
-                job.error = reason
-        elif t == MessageType.FILE_COMPLETE:
-            self._file_transfer.handle_file_complete(msg)
-        elif t == MessageType.FILE_ERROR:
-            job = self._file_transfer.get_job(msg.payload.get("job_id", ""))
-            if job:
-                job.state = TransferState.FAILED
-                job.error = msg.payload.get("error", "Unknown error")
-        elif t == MessageType.FILE_LIST_REQUEST:
-            response = self._file_transfer.handle_list_request(msg)
-            self._relay.send_message(response)
-        elif t == MessageType.FILE_LIST_RESPONSE:
-            self._file_transfer.handle_list_response(msg)
-        elif t == MessageType.FILE_DOWNLOAD_REQUEST:
-            self._file_transfer.handle_download_request(msg, self._relay.send_message)
-        elif t == MessageType.FILE_DOWNLOAD_ACCEPT:
-            self._file_transfer.handle_download_accept(msg)
-        elif t == MessageType.FILE_DOWNLOAD_REJECT:
-            self._file_transfer.handle_download_reject(msg)
+        elif t in FILE_MESSAGE_TYPES:
+            self._file_transfer.dispatch(msg, self._relay.send_message)
 
         # ── Ignored ──
         elif t in (MessageType.CAMERA_FRAME, MessageType.CAMERA_START):
@@ -552,11 +536,6 @@ class HostService(QObject):
             pass
 
     # ── helpers ─────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _generate_password() -> str:
-        alphabet = string.ascii_uppercase + string.digits
-        return "".join(secrets.choice(alphabet) for _ in range(8))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -708,107 +687,16 @@ class HostWindow(QMainWindow):
         content_layout.setContentsMargins(20, 20, 20, 16)
         content_layout.setSpacing(16)
 
-        # ── 2a. Credentials card ───────────────────────────────────────
-        card = QFrame()
-        card.setObjectName("CredentialsCard")
-        card.setStyleSheet(f"""
-            QFrame#CredentialsCard {{
-                background: {self._C_SURFACE};
-                border: 1px solid {self._C_BORDER};
-                border-radius: 10px;
-            }}
-        """)
-        card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(20, 18, 20, 18)
-        card_layout.setSpacing(4)
-
-        # ── Your ID ──
-        id_label = QLabel("YOUR ID")
-        id_label.setStyleSheet(
-            f"font-size: 10px; font-weight: 700; color: {self._C_TEXT_SECONDARY}; "
-            f"letter-spacing: 1px;"
+        # ── 2a. Credentials (widget condiviso con il client) ───────────
+        self._session_info = SessionInfoWidget(
+            device_id=self._service.device_id,
+            device_name=self._service.device_name,
+            theme_toggle=False,  # l'host usa sempre il tema chiaro
+            parent=self,
         )
-        card_layout.addWidget(id_label)
-
-        id_row = QHBoxLayout()
-        id_row.setSpacing(8)
-
-        self._id_display = QLabel("—")
-        self._id_display.setObjectName("HostIdDisplay")
-        self._id_display.setToolTip(
-            f"Device UUID: {self._service.device_id}\n"
-            "Usa questo UUID per pre-autorizzare il dispositivo"
-        )
-        self._id_display.setFixedHeight(44)
-        self._id_display.setStyleSheet(f"""
-            QLabel#HostIdDisplay {{
-                font-size: 26px; font-weight: 800;
-                font-family: {self._FONT_MONO};
-                letter-spacing: 4px;
-                color: {self._C_TEXT};
-                padding: 6px 12px;
-                background: #f8fafc;
-                border: 1px solid #e2e8f0;
-                border-radius: 8px;
-            }}
-        """)
-        id_row.addWidget(self._id_display)
-        id_row.addStretch()
-
-        self._copy_id_btn = QPushButton("📋  Copy ID")
-        self._copy_id_btn.setFixedHeight(32)
-        self._copy_id_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._copy_id_btn.setStyleSheet(self._copy_button_style())
-        self._copy_id_btn.clicked.connect(self._copy_session_id)
-        id_row.addWidget(self._copy_id_btn)
-
-        card_layout.addLayout(id_row)
-
-        # Separator
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet(f"max-height: 1px; background: {self._C_BORDER}; margin: 8px 0;")
-        card_layout.addWidget(sep)
-
-        # ── Password ──
-        pwd_label = QLabel("PASSWORD")
-        pwd_label.setStyleSheet(
-            f"font-size: 10px; font-weight: 700; color: {self._C_TEXT_SECONDARY}; "
-            f"letter-spacing: 1px;"
-        )
-        card_layout.addWidget(pwd_label)
-
-        pwd_row = QHBoxLayout()
-        pwd_row.setSpacing(8)
-
-        self._pwd_display = QLabel("—")
-        self._pwd_display.setObjectName("HostPwdDisplay")
-        self._pwd_display.setFixedHeight(44)
-        self._pwd_display.setStyleSheet(f"""
-            QLabel#HostPwdDisplay {{
-                font-size: 20px; font-weight: 700;
-                font-family: {self._FONT_MONO};
-                letter-spacing: 3px;
-                color: {self._C_TEXT};
-                padding: 6px 12px;
-                background: #f8fafc;
-                border: 1px solid #e2e8f0;
-                border-radius: 8px;
-            }}
-        """)
-        pwd_row.addWidget(self._pwd_display)
-        pwd_row.addStretch()
-
-        self._copy_pwd_btn = QPushButton("📋  Copy Pwd")
-        self._copy_pwd_btn.setFixedHeight(32)
-        self._copy_pwd_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._copy_pwd_btn.setStyleSheet(self._copy_button_style())
-        self._copy_pwd_btn.clicked.connect(self._copy_password)
-        pwd_row.addWidget(self._copy_pwd_btn)
-
-        card_layout.addLayout(pwd_row)
-
-        content_layout.addWidget(card)
+        self._session_info.session_refreshed.connect(self._on_session_refreshed)
+        self._session_info.device_name_changed.connect(self._on_device_name_changed)
+        content_layout.addWidget(self._session_info)
 
         # ── 2b. Device UUID info ───────────────────────────────────────
         uuid_info = QLabel(f"Device UUID: {self._service.device_id}")
@@ -822,16 +710,10 @@ class HostWindow(QMainWindow):
 
         # ── 2c. Action buttons ─────────────────────────────────────────
         # Solo Settings: Chat e File Transfer si attivano automaticamente
-        # quando il computer remoto li richiede.
+        # quando il computer remoto li richiede.  "New Session" è nel widget
+        # credenziali.
         actions_layout = QHBoxLayout()
         actions_layout.setSpacing(8)
-
-        self._refresh_btn = QPushButton("🔄  New Session")
-        self._refresh_btn.setFixedHeight(36)
-        self._refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._refresh_btn.setStyleSheet(self._secondary_button_style())
-        self._refresh_btn.clicked.connect(self._on_refresh_session)
-        actions_layout.addWidget(self._refresh_btn)
 
         actions_layout.addStretch()
 
@@ -850,33 +732,6 @@ class HostWindow(QMainWindow):
         self.setCentralWidget(central)
 
     # ── Button styles ───────────────────────────────────────────────────
-
-    @staticmethod
-    def _copy_button_style() -> str:
-        return """
-            QPushButton {
-                padding: 4px 14px;
-                font-size: 12px;
-                font-weight: 600;
-                border: 1px solid #e2e8f0;
-                border-radius: 6px;
-                background: #f8fafc;
-                color: #2563eb;
-            }
-            QPushButton:hover {
-                background: #2563eb;
-                color: #ffffff;
-                border-color: #2563eb;
-            }
-            QPushButton:pressed {
-                background: #1d4ed8;
-            }
-            QPushButton:disabled {
-                background: #f1f5f9;
-                color: #94a3b8;
-                border-color: #e2e8f0;
-            }
-        """
 
     @staticmethod
     def _secondary_button_style() -> str:
@@ -1051,6 +906,10 @@ class HostWindow(QMainWindow):
         svc.chat_open_requested.connect(self._on_chat_open)
         svc.file_transfer_started.connect(self._on_file_transfer_event)
 
+        # Stato iniziale: la sessione può esistere già prima della finestra.
+        if svc.session_id:
+            self._session_info.set_session(svc.session_id, svc.password)
+
     # ── Slots: stato ─────────────────────────────────────────────────────
 
     @Slot(str)
@@ -1070,8 +929,7 @@ class HostWindow(QMainWindow):
 
     @Slot(str, str)
     def _on_device_info_changed(self, session_id: str, password: str) -> None:
-        self._id_display.setText(self._format_session_id(session_id))
-        self._pwd_display.setText(password)
+        self._session_info.set_session(session_id, password)
 
     @Slot(str)
     def _on_peer_connected(self, peer_name: str) -> None:
@@ -1083,9 +941,18 @@ class HostWindow(QMainWindow):
 
     # ── Slots: azioni ───────────────────────────────────────────────────
 
-    @Slot()
-    def _on_refresh_session(self) -> None:
-        self._service.regenerate_session()
+    @Slot(str, str)
+    def _on_session_refreshed(self, _session_id: str, password: str) -> None:
+        """Nuova sessione richiesta dal widget credenziali.
+
+        La password è già quella mostrata all'utente: la passiamo a
+        ``regenerate_session`` così UI e stato del servizio non divergono.
+        """
+        self._service.regenerate_session(password)
+
+    @Slot(str)
+    def _on_device_name_changed(self, new_name: str) -> None:
+        self._service.device_name = new_name
 
     # Chat e File Transfer si aprono SOLO su richiesta del computer remoto.
     # L'host non ha pulsanti per avviarli manualmente.
@@ -1189,29 +1056,9 @@ class HostWindow(QMainWindow):
         """Copia il session ID (senza spazi) negli appunti."""
         raw = self._service.session_id.replace(" ", "")
         QApplication.clipboard().setText(raw)
-        self._flash_button(self._copy_id_btn, "Copied!")
 
     def _copy_password(self) -> None:
         QApplication.clipboard().setText(self._service.password)
-        self._flash_button(self._copy_pwd_btn, "Copied!")
-
-    def _flash_button(self, btn: QPushButton, text: str) -> None:
-        original = btn.text()
-        btn.setText(text)
-        btn.setEnabled(False)
-        QTimer.singleShot(1500, lambda: self._restore_btn(btn, original))
-
-    def _restore_btn(self, btn: QPushButton, text: str) -> None:
-        btn.setText(text)
-        btn.setEnabled(True)
-
-    @staticmethod
-    def _format_session_id(session_id: str) -> str:
-        """Formatta il session ID leggibile: rimuove spazi e ri-formatta."""
-        raw = session_id.replace(" ", "")
-        # Gruppi di 3 cifre
-        blocks = [raw[i : i + 3] for i in range(0, len(raw), 3)]
-        return " ".join(blocks)
 
     # ── About ───────────────────────────────────────────────────────────
 
@@ -1419,14 +1266,17 @@ def main_host() -> None:
     # Flag servizio Windows: gestione SCM/autostart elevato (host_service)
     if "--winsvc" in sys.argv:
         from opendesk.host_service import run_service
+
         run_service()
         return
     if "--install-service" in sys.argv:
         from opendesk.host_service import install_service
+
         install_service()
         return
     if "--remove-service" in sys.argv:
         from opendesk.host_service import remove_service
+
         remove_service()
         return
 

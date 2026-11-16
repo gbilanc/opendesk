@@ -2,7 +2,7 @@
 minimize → restore (i messaggi Win32 che Qt gestisce sul main thread),
 mentre il HangWatchdog nel processo host misura da solo gli stalli.
 
-Usage: uv run python tests/probe_host_window.py
+Usage: uv run python tools/diagnostics/probe_host_window.py
 """
 
 from __future__ import annotations

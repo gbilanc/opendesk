@@ -121,7 +121,7 @@ cartella *Esecuzione automatica*; su macOS usare un LaunchAgent.
 # Clone and install from source
 git clone https://github.com/gbilanc/opendesk-client
 cd opendesk-client
-uv sync --dev          # install with dev dependencies
+uv sync --extra dev    # install with dev dependencies
 
 # Or with pip
 pip install -e ".[dev]"

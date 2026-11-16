@@ -165,6 +165,31 @@ class SettingsDialog(QDialog):
 
         video_layout.addRow(codec_group)
 
+        # ── Benchmark encoder ──
+        bench_group = QGroupBox("Prestazioni")
+        bench_layout = QVBoxLayout(bench_group)
+        bench_layout.setSpacing(8)
+
+        bench_desc = QLabel(
+            "Misura fps e banda reali dell'encoder su questa macchina "
+            "(~10-30 s, gira in background)."
+        )
+        bench_desc.setWordWrap(True)
+        bench_desc.setStyleSheet("font-size: 12px;")
+        bench_layout.addWidget(bench_desc)
+
+        bench_row = QHBoxLayout()
+        self._bench_btn = QPushButton("Misura prestazioni")
+        self._bench_btn.clicked.connect(self._run_benchmark)
+        bench_row.addWidget(self._bench_btn)
+        self._bench_result = QLabel("")
+        self._bench_result.setWordWrap(True)
+        self._bench_result.setStyleSheet("font-size: 12px;")
+        bench_row.addWidget(self._bench_result, 1)
+        bench_layout.addLayout(bench_row)
+
+        video_layout.addRow(bench_group)
+
         tabs.addTab(video_tab, "Video")
 
         # ── Tab 2: Network ──
@@ -250,6 +275,40 @@ class SettingsDialog(QDialog):
         auth_dev_layout.addLayout(btn_row)
 
         sec_layout.addWidget(auth_dev_group)
+
+        # ── Accesso non presidiato ──
+        unatt_group = QGroupBox("Accesso non presidiato")
+        unatt_layout = QVBoxLayout(unatt_group)
+
+        self._unattended_check = QCheckBox(
+            "Consenti connessioni solo dai device autorizzati qui sotto"
+        )
+        unatt_layout.addWidget(self._unattended_check)
+
+        unatt_note = QLabel(
+            "Le connessioni da altri device vengono rifiutate prima della verifica "
+            "della password. La password resta comunque richiesta (la verifica è "
+            "challenge-response, quindi non è memorizzabile)."
+        )
+        unatt_note.setWordWrap(True)
+        unatt_note.setStyleSheet("font-size: 11px;")
+        unatt_layout.addWidget(unatt_note)
+
+        self._unattended_list = QListWidget()
+        self._unattended_list.setMinimumHeight(90)
+        unatt_layout.addWidget(self._unattended_list)
+
+        unatt_btn_row = QHBoxLayout()
+        self._add_unattended_btn = QPushButton("Authorize device…")
+        self._add_unattended_btn.clicked.connect(self._add_unattended_peer)
+        unatt_btn_row.addWidget(self._add_unattended_btn)
+        self._remove_unattended_btn = QPushButton("Remove")
+        self._remove_unattended_btn.clicked.connect(self._remove_unattended_peer)
+        unatt_btn_row.addWidget(self._remove_unattended_btn)
+        unatt_btn_row.addStretch()
+        unatt_layout.addLayout(unatt_btn_row)
+
+        sec_layout.addWidget(unatt_group)
         sec_layout.addStretch()
 
         tabs.addTab(sec_tab, "Security")
@@ -475,6 +534,17 @@ class SettingsDialog(QDialog):
             self._camera_quality_combo.setCurrentIndex(cq_idx)
 
         self._populate_trusted_devices()
+        self._populate_unattended()
+
+    def _populate_unattended(self) -> None:
+        """Carica lo stato dell'accesso non presidiato dal file di config."""
+        from opendesk.core.unattended import UnattendedAccess
+
+        ua = UnattendedAccess()
+        self._unattended_check.setChecked(ua.enabled)
+        self._unattended_list.clear()
+        for peer_id in ua.config.allowed_peers:
+            self._unattended_list.addItem(peer_id)
 
     def _populate_camera_devices(self) -> None:
         """Populate the camera device combo with detected cameras."""
@@ -510,6 +580,78 @@ class SettingsDialog(QDialog):
             self._trusted_list.addItem(item)
 
     @Slot()
+    def _write_unattended_config(self) -> None:
+        """Trasferisce la UI allowlist su ``UnattendedAccess``."""
+        from opendesk.core.unattended import UnattendedAccess
+
+        ua = UnattendedAccess()
+        for peer_id in list(ua.config.allowed_peers):
+            ua.remove_allowed_peer(peer_id)
+        for i in range(self._unattended_list.count()):
+            item = self._unattended_list.item(i)
+            if item is not None:
+                ua.add_allowed_peer(item.text())
+        if self._unattended_check.isChecked():
+            ua.enable_allowlist_only()
+        else:
+            ua.disable()
+
+    def _add_unattended_peer(self) -> None:
+        """Aggiunge un device all'allowlist dell'accesso non presidiato."""
+        from PySide6.QtWidgets import QInputDialog, QLineEdit
+
+        raw, ok = QInputDialog.getText(
+            self,
+            "Autorizza dispositivo",
+            "UUID del dispositivo remoto da autorizzare:",
+            QLineEdit.EchoMode.Normal,
+        )
+        if ok and raw.strip():
+            self._unattended_list.addItem(raw.strip())
+
+    def _remove_unattended_peer(self) -> None:
+        row = self._unattended_list.currentRow()
+        if row >= 0:
+            self._unattended_list.takeItem(row)
+
+    def _run_benchmark(self) -> None:
+        """Misura l'encoder su questa macchina e propone i valori migliori.
+
+        ``run_full_benchmark`` blocca il thread per alcuni secondi: gira su
+        un thread separato via ``run_async``.
+        """
+        from opendesk.core.benchmark import run_full_benchmark
+        from opendesk.utils.async_task import run_async
+
+        self._bench_btn.setEnabled(False)
+        self._bench_result.setText("Misura in corso…")
+
+        def _on_done(report) -> None:
+            self._bench_btn.setEnabled(True)
+            if not report.results:
+                self._bench_result.setText("Nessun encoder utilizzabile")
+                return
+            self._bench_result.setText(
+                f"Consigliato: {report.recommended_resolution[0]}×"
+                f"{report.recommended_resolution[1]} @ {report.recommended_bitrate // 1000} kbps "
+                f"({report.recommended_quality.name}, max {report.max_supported_fps:.0f} fps)"
+            )
+            # Applica le raccomandazioni ai controlli (salvate con OK/Apply).
+            idx = self._quality_combo.findText(report.recommended_quality.name.title())
+            if idx >= 0:
+                self._quality_combo.setCurrentIndex(idx)
+            scale_idx = self._resolution_scale.findData(1.0)
+            if scale_idx >= 0:
+                self._resolution_scale.setCurrentIndex(scale_idx)
+            self._fps_spin.setValue(max(1, int(report.max_supported_fps)))
+            logger.info("Benchmark completato: %s", report.summary)
+
+        def _on_error(message: str) -> None:
+            self._bench_btn.setEnabled(True)
+            self._bench_result.setText(f"Errore: {message}")
+
+        run_async(run_full_benchmark, _on_done, parent=self, on_error=_on_error)
+
     def _add_trusted_device(self) -> None:
         """Aggiunge manualmente un dispositivo alla lista trusted."""
         from PySide6.QtWidgets import QInputDialog, QLineEdit, QMessageBox
@@ -628,6 +770,7 @@ class SettingsDialog(QDialog):
 
         self._settings.setValue("security/require_auth", self._require_auth.isChecked())
         self._settings.setValue("security/e2ee", self._e2ee_check.isChecked())
+        self._write_unattended_config()
 
         self._settings.setValue("general/clipboard_sync", self._enable_clipboard_sync.isChecked())
         self._settings.setValue("audio/enabled", self._enable_audio.isChecked())

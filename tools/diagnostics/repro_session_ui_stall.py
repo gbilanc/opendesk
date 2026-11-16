@@ -15,7 +15,7 @@ Fasi e misura:
 Il beat QTimer (20ms) sul main thread misura i gap; stalli > 1s = FAIL.
 Viene misurato anche il flusso frame host→client (wrapper su NetworkWorker).
 
-Usage:  uv run python tests/repro_session_ui_stall.py
+Usage:  uv run python tools/diagnostics/repro_session_ui_stall.py
 """
 
 from __future__ import annotations

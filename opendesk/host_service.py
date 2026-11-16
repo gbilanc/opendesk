@@ -88,15 +88,12 @@ def _host_process_running(session: int) -> bool:
     try:
         entry = _PROCESSENTRY32()
         entry.dwSize = ctypes.sizeof(_PROCESSENTRY32)
-        pid = wintypes.DWORD()
         proc_session = wintypes.DWORD()
         ok = _kernel32.Process32First(snapshot, ctypes.byref(entry))
         while ok:
             name = entry.szExeFile.decode("utf-8", errors="ignore").lower()
             if name == _HOST_EXE and entry.th32ProcessID != os.getpid():
-                if _kernel32.ProcessIdToSessionId(
-                    entry.th32ProcessID, ctypes.byref(proc_session)
-                ):
+                if _kernel32.ProcessIdToSessionId(entry.th32ProcessID, ctypes.byref(proc_session)):
                     if proc_session.value == session:
                         return True
             ok = _kernel32.Process32Next(snapshot, ctypes.byref(entry))
@@ -207,7 +204,6 @@ def run_service() -> None:
 
     stop = threading.Event()
     status = _SERVICE_STATUS()
-    status_ref = [None]  # handle settato da service_main
     svc_handle = ctypes.c_void_p()
 
     HandlerEx = ctypes.WINFUNCTYPE(
@@ -225,10 +221,13 @@ def run_service() -> None:
     # SetServiceStatus riceve un handle invalido (stato START_PENDING eterno).
     _advapi32.RegisterServiceCtrlHandlerExW.restype = ctypes.c_void_p
     _advapi32.RegisterServiceCtrlHandlerExW.argtypes = [
-        wintypes.LPCWSTR, HandlerEx, ctypes.c_void_p,
+        wintypes.LPCWSTR,
+        HandlerEx,
+        ctypes.c_void_p,
     ]
     _advapi32.SetServiceStatus.argtypes = [
-        ctypes.c_void_p, ctypes.POINTER(_SERVICE_STATUS),
+        ctypes.c_void_p,
+        ctypes.POINTER(_SERVICE_STATUS),
     ]
 
     def _set_state(handle: int | None, state: int, accepted: int = 0) -> None:
@@ -246,15 +245,15 @@ def run_service() -> None:
     ServiceMain = ctypes.WINFUNCTYPE(wintypes.DWORD, wintypes.DWORD, wintypes.LPSTR)
 
     def service_main(_argc: int, _argv) -> int:
-        svc_handle.value = _advapi32.RegisterServiceCtrlHandlerExW(
-            SERVICE_NAME, handler_ref, None
-        )
+        svc_handle.value = _advapi32.RegisterServiceCtrlHandlerExW(SERVICE_NAME, handler_ref, None)
         if not svc_handle.value:
-            logger.error("RegisterServiceCtrlHandlerExW fallita (WinError %s)",
-                         ctypes.get_last_error())
+            logger.error(
+                "RegisterServiceCtrlHandlerExW fallita (WinError %s)", ctypes.get_last_error()
+            )
             return 1
-        _set_state(svc_handle.value, _SERVICE_RUNNING,
-                   _SERVICE_ACCEPT_STOP | _SERVICE_ACCEPT_SHUTDOWN)
+        _set_state(
+            svc_handle.value, _SERVICE_RUNNING, _SERVICE_ACCEPT_STOP | _SERVICE_ACCEPT_SHUTDOWN
+        )
         logger.info("Stato: RUNNING — supervisore in avvio")
         _supervisor_loop(stop)
         _set_state(svc_handle.value, _SERVICE_STOPPED)
@@ -271,14 +270,17 @@ def run_service() -> None:
         err = ctypes.get_last_error()
         # ERROR_FAILED_SERVICE_CONTROLLER_CONNECT (1063): avvio da console
         if err == 1063:
-            print("Questo processo è un servizio: installarlo con --install-service "
-                  "oppure avviare l'host normalmente (senza --winsvc).")
+            print(
+                "Questo processo è un servizio: installarlo con --install-service "
+                "oppure avviare l'host normalmente (senza --winsvc)."
+            )
         else:
             print(f"StartServiceCtrlDispatcher fallita (WinError {err})")
         sys.exit(1)
 
 
 # ── install / remove (sc.exe) ──────────────────────────────────────
+
 
 def install_service() -> None:
     """Registra il servizio (richiede admin).  Solo per il bundle installato."""
@@ -292,17 +294,32 @@ def install_service() -> None:
         sys.exit(1)
     bin_path = f"{exe} --winsvc"
     proc = subprocess.run(
-        ["sc", "create", SERVICE_NAME, "binPath=", bin_path, "start=", "auto",
-         "DisplayName=", "OpenDesk Host Service"],
-        capture_output=True, text=True,
+        [
+            "sc",
+            "create",
+            SERVICE_NAME,
+            "binPath=",
+            bin_path,
+            "start=",
+            "auto",
+            "DisplayName=",
+            "OpenDesk Host Service",
+        ],
+        capture_output=True,
+        text=True,
     )
     if proc.returncode != 0 or "FAILED" in (proc.stdout + proc.stderr).upper():
         print(f"sc create fallita:\n{proc.stdout}{proc.stderr}")
         sys.exit(1)
     subprocess.run(
-        ["sc", "description", SERVICE_NAME,
-         "Supervisore OpenDesk Host: mantiene l'host elevato nella sessione utente."],
-        capture_output=True, text=True,
+        [
+            "sc",
+            "description",
+            SERVICE_NAME,
+            "Supervisore OpenDesk Host: mantiene l'host elevato nella sessione utente.",
+        ],
+        capture_output=True,
+        text=True,
     )
     print(f"Servizio {SERVICE_NAME} installato ({bin_path})")
     print("Avvio: sc start " + SERVICE_NAME)
@@ -311,8 +328,6 @@ def install_service() -> None:
 def remove_service() -> None:
     """Ferma e rimuove il servizio (richiede admin)."""
     subprocess.run(["sc", "stop", SERVICE_NAME], capture_output=True, text=True)
-    proc = subprocess.run(
-        ["sc", "delete", SERVICE_NAME], capture_output=True, text=True
-    )
+    proc = subprocess.run(["sc", "delete", SERVICE_NAME], capture_output=True, text=True)
     out = (proc.stdout + proc.stderr).strip()
     print(out or f"Servizio {SERVICE_NAME} rimosso")

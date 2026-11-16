@@ -3,7 +3,7 @@
 Genera esattamente il traffico di un client reale (auth, keyframe
 watchdog, mouse 60/s) SENZA UI.  Il video ricevuto viene scartato.
 
-Usage: uv run python tests/debug_client_load.py <session_id> <password> [durata_s]
+Usage: uv run python tools/diagnostics/debug_client_load.py <session_id> <password> [durata_s]
 """
 
 from __future__ import annotations

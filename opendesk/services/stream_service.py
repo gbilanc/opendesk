@@ -16,7 +16,7 @@ import time
 from collections.abc import Callable
 from typing import cast
 
-from PySide6.QtCore import QObject, QMetaObject, QSettings, Qt, QTimer, Signal, Slot
+from PySide6.QtCore import QMetaObject, QObject, QSettings, Qt, QTimer, Signal, Slot
 
 from opendesk.core.audio_manager import AudioConfig, AudioDirection, AudioManager
 from opendesk.core.camera_manager import CameraConfig, CameraManager
@@ -28,7 +28,12 @@ from opendesk.core.input_injection import (
 )
 from opendesk.core.keyboard_state import caps_lock_active
 from opendesk.core.platform_config import get_platform_config
-from opendesk.core.video_codec import _QUALITY_CRF, QualityLevel, VideoEncoder
+from opendesk.core.video_codec import (
+    _QUALITY_BITRATE,
+    _QUALITY_CRF,
+    QualityLevel,
+    VideoEncoder,
+)
 from opendesk.network.protocol import Message
 from opendesk.network.relay_client import RelayClient
 from opendesk.services.pipeline import (
@@ -56,15 +61,6 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
-
-# Bitrate defaults per quality level (mirrors video_codec._QUALITY_BITRATE)
-_DEFAULT_BITRATES = {
-    QualityLevel.LOW: 500_000,
-    QualityLevel.MEDIUM: 2_000_000,
-    QualityLevel.HIGH: 8_000_000,
-    QualityLevel.SHARP: 15_000_000,
-    QualityLevel.LOSSLESS: 20_000_000,
-}
 
 # ═══════════════════════════════════════════════════════════════════
 # Tile grid / keyframe constants
@@ -265,6 +261,98 @@ class StreamService(QObject):
 
     # ── streaming lifecycle ─────────────────────────────────────────
 
+    def _start_input_backend(self) -> None:
+        """Crea il backend di input e il worker di iniezione (non bloccante)."""
+        try:
+            self._input_backend = create_input_backend()
+        except Exception as e:
+            logger.warning("Input backend unavailable — remote input disabled: %s", e)
+            self._input_backend = None
+            self.input_unavailable.emit(str(e))
+
+        # Thread di iniezione input: l'iniezione (SendInput/X11/CoreGraphics)
+        # NON gira sul main thread Qt — vedi InputInjectionWorker.
+        if self._input_backend is not None:
+            if self._input_worker is None:
+                self._input_worker = InputInjectionWorker()
+                self._input_worker.start()
+
+        # Imposta la risoluzione dello schermo sul backend di input
+        # (necessaria per il corretto scaling delle coordinate ABS su Wayland)
+        if self._input_backend is not None:
+            try:
+                from PySide6.QtWidgets import QApplication
+
+                screen = QApplication.primaryScreen()
+                if screen is not None:
+                    size = screen.size()
+                    self._input_backend.set_screen_size(
+                        size.width(),
+                        size.height(),
+                    )
+            except Exception:
+                logger.debug("Could not query screen size for input backend")
+
+    def _read_pipeline_config(self) -> PipelineConfig:
+        """Costruisce la ``PipelineConfig`` dalle impostazioni utente."""
+        # Reset bandwidth
+        self._bw_measure_bytes = 0
+        self._bw_measure_time = time.time()
+        self._bw_estimated_kbps = 0.0
+
+        # Leggi impostazioni
+        fps = cast(int, self._settings.value("video/max_fps", 30, type=int))
+        quality_name = cast(str, self._settings.value("video/quality", "SHARP", type=str))
+        quality = getattr(QualityLevel, quality_name, QualityLevel.SHARP)
+        resolution_scale = cast(
+            float, self._settings.value("video/resolution_scale", 1.0, type=float)
+        )
+
+        # Codice video: preferisci HEVC HW se disponibile, altrimenti H.264
+        codec = cast(str, self._settings.value("video/codec", "", type=str))  # auto-detect
+        prefer_hw = cast(bool, self._settings.value("video/hw_encoding", True, type=bool))
+        if not codec:
+            codec = VideoEncoder.default_codec(prefer_hw=prefer_hw)
+
+        # Pixel format: default dal PlatformConfig
+        cfg = get_platform_config()
+
+        # CRF mode: mappa qualita' a CRF
+        crf = _QUALITY_CRF.get(quality)
+
+        # Pixel format: default dal PlatformConfig, poi da impostazioni
+        pixel_format = cast(str, self._settings.value("video/pixel_format", "", type=str))
+        if not pixel_format:
+            pixel_format = cfg.default_pixel_format
+        if pixel_format not in ("yuv420p", "yuv444p"):
+            pixel_format = cfg.default_pixel_format
+        # yuv444p in encoder SOFTWARE costa ~2× CPU del yuv420p (profilo
+        # High 4:4:4 Predictive) per un guadagno di nitidezza marginale su
+        # contenuto desktop (RCA 2026-11-14, CPU host vs AnyDesk).  Senza
+        # HW encoder torniamo a yuv420p; con HW il setting utente vale.
+        if pixel_format == "yuv444p" and not cfg.supports_hw_encoding:
+            logger.info("yuv444p richiesto ma encoder software: uso yuv420p (~2x CPU in meno)")
+            pixel_format = "yuv420p"
+
+        # Encoder preset: empty = auto by quality level
+        encoder_preset = cast(str, self._settings.value("video/encoder_preset", "", type=str))
+
+        # FPS adattivo (schermo fermo → ~2 fps, keepalive tiene il flusso)
+        adaptive_fps = cast(bool, self._settings.value("video/adaptive_fps", True, type=bool))
+
+        return PipelineConfig(
+            fps=fps,
+            quality=quality,
+            bitrate=_QUALITY_BITRATE[quality],
+            resolution_scale=resolution_scale,
+            monitor_index=0,
+            codec=codec,
+            crf=crf,
+            pixel_format=pixel_format,
+            encoder_preset=encoder_preset,
+            adaptive_fps=adaptive_fps,
+        )
+
     def start_streaming(self) -> None:
         """Avvia la pipeline multi-thread (capture + encode + send)."""
         if self._pipeline is not None:
@@ -272,99 +360,8 @@ class StreamService(QObject):
             return
 
         try:
-            # Input backend (non bloccante)
-            try:
-                self._input_backend = create_input_backend()
-            except Exception as e:
-                logger.warning("Input backend unavailable — remote input disabled: %s", e)
-                self._input_backend = None
-                self.input_unavailable.emit(str(e))
-
-            # Thread di iniezione input: l'iniezione (SendInput/X11/CoreGraphics)
-            # NON gira sul main thread Qt — vedi InputInjectionWorker.
-            if self._input_backend is not None:
-                if self._input_worker is None:
-                    self._input_worker = InputInjectionWorker()
-                    self._input_worker.start()
-
-            # Imposta la risoluzione dello schermo sul backend di input
-            # (necessaria per il corretto scaling delle coordinate ABS su Wayland)
-            if self._input_backend is not None:
-                try:
-                    from PySide6.QtWidgets import QApplication
-
-                    screen = QApplication.primaryScreen()
-                    if screen is not None:
-                        size = screen.size()
-                        self._input_backend.set_screen_size(
-                            size.width(),
-                            size.height(),
-                        )
-                except Exception:
-                    logger.debug("Could not query screen size for input backend")
-
-            # Reset bandwidth
-            self._bw_measure_bytes = 0
-            self._bw_measure_time = time.time()
-            self._bw_estimated_kbps = 0.0
-
-            # Leggi impostazioni
-            fps = cast(int, self._settings.value("video/max_fps", 30, type=int))
-            quality_name = cast(str, self._settings.value("video/quality", "SHARP", type=str))
-            quality = getattr(QualityLevel, quality_name, QualityLevel.SHARP)
-            resolution_scale = cast(
-                float, self._settings.value("video/resolution_scale", 1.0, type=float)
-            )
-
-            # Codice video: preferisci HEVC HW se disponibile, altrimenti H.264
-            codec = cast(str, self._settings.value("video/codec", "", type=str))  # auto-detect
-            prefer_hw = cast(bool, self._settings.value("video/hw_encoding", True, type=bool))
-            if not codec:
-                codec = VideoEncoder.default_codec(prefer_hw=prefer_hw)
-
-            # Pixel format: default dal PlatformConfig
-            cfg = get_platform_config()
-
-            # CRF mode: mappa qualita' a CRF
-            crf = _QUALITY_CRF.get(quality)
-
-            # Pixel format: default dal PlatformConfig, poi da impostazioni
-            pixel_format = cast(str, self._settings.value("video/pixel_format", "", type=str))
-            if not pixel_format:
-                pixel_format = cfg.default_pixel_format
-            if pixel_format not in ("yuv420p", "yuv444p"):
-                pixel_format = cfg.default_pixel_format
-            # yuv444p in encoder SOFTWARE costa ~2× CPU del yuv420p (profilo
-            # High 4:4:4 Predictive) per un guadagno di nitidezza marginale su
-            # contenuto desktop (RCA 2026-11-14, CPU host vs AnyDesk).  Senza
-            # HW encoder torniamo a yuv420p; con HW il setting utente vale.
-            if pixel_format == "yuv444p" and not cfg.supports_hw_encoding:
-                logger.info(
-                    "yuv444p richiesto ma encoder software: uso yuv420p (~2x CPU in meno)"
-                )
-                pixel_format = "yuv420p"
-
-            # Encoder preset: empty = auto by quality level
-            encoder_preset = cast(str, self._settings.value("video/encoder_preset", "", type=str))
-
-            # FPS adattivo (schermo fermo → ~2 fps, keepalive tiene il flusso)
-            adaptive_fps = cast(
-                bool, self._settings.value("video/adaptive_fps", True, type=bool)
-            )
-
-            # Crea configurazione della pipeline
-            config = PipelineConfig(
-                fps=fps,
-                quality=quality,
-                bitrate=_DEFAULT_BITRATES[quality],
-                resolution_scale=resolution_scale,
-                monitor_index=0,
-                codec=codec,
-                crf=crf,
-                pixel_format=pixel_format,
-                encoder_preset=encoder_preset,
-                adaptive_fps=adaptive_fps,
-            )
+            self._start_input_backend()
+            config = self._read_pipeline_config()
 
             # Callback per tracciare i byte inviati (bandwidth estimation)
             def _on_send(data: bytes) -> None:
@@ -417,9 +414,9 @@ class StreamService(QObject):
 
             logger.info(
                 "Streaming started: pipeline 3-thread, %d FPS, %s, scale=%.2f",
-                fps,
-                quality_name,
-                resolution_scale,
+                config.fps,
+                config.quality.name,
+                config.resolution_scale,
             )
         except Exception as e:
             logger.exception("Failed to start streaming: %s", e)

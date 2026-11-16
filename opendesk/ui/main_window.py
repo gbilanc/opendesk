@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 
 from opendesk import __version__
 from opendesk.core.clipboard_sync import ClipboardSync
-from opendesk.core.file_transfer import FileTransferManager, TransferState
+from opendesk.core.file_transfer import FILE_MESSAGE_TYPES, FileTransferManager
 from opendesk.core.keyboard_state import caps_lock_active
 from opendesk.core.platform_config import HealthSeverity, get_platform_config
 from opendesk.crypto.auth import hash_password
@@ -693,57 +693,8 @@ class MainWindow(QMainWindow):
             if job_id and self._file_transfer.accept_incoming(job_id):
                 # Auto-accept: trasferimento in background, nessuna conferma utente.
                 self._relay.send_message(Message.file_accept(job_id))
-        elif msg.type == MessageType.FILE_CHUNK:
-            self._file_transfer.handle_chunk(msg)
-            job_id = msg.payload.get("job_id", "")
-            if job_id:
-                job = self._file_transfer.get_job(job_id)
-                if job and self._transfer_dock is not None:
-                    self._transfer_dock.add_transfer(job)
-        elif msg.type == MessageType.FILE_ACCEPT:
-            job_id = msg.payload.get("job_id", "")
-            job = self._file_transfer.get_job(job_id)
-            if job and self._file_transfer_send_fn:
-                self._file_transfer.send_chunks(job, self._file_transfer_send_fn)
-        elif msg.type == MessageType.FILE_REJECT:
-            job_id = msg.payload.get("job_id", "")
-            reason = msg.payload.get("reason", "Rejected by remote")
-            job = self._file_transfer.get_job(job_id)
-            if job:
-                job.state = TransferState.CANCELLED
-                job.error = reason
-                if self._transfer_dock is not None:
-                    self._transfer_dock.add_transfer(job)
-        elif msg.type == MessageType.FILE_COMPLETE:
-            self._file_transfer.handle_file_complete(msg)
-            job = self._file_transfer.get_job(msg.payload.get("job_id", ""))
-            if job and self._transfer_dock is not None:
-                self._transfer_dock.add_transfer(job)
-        elif msg.type == MessageType.FILE_ERROR:
-            job = self._file_transfer.get_job(msg.payload.get("job_id", ""))
-            if job:
-                job.state = TransferState.FAILED
-                job.error = msg.payload.get("error", "Unknown error")
-                if self._transfer_dock is not None:
-                    self._transfer_dock.add_transfer(job)
-        elif msg.type == MessageType.FILE_LIST_REQUEST:
-            # Remote peer wants a directory listing — respond
-            response = self._file_transfer.handle_list_request(msg)
-            if self._file_transfer_send_fn:
-                self._file_transfer_send_fn(response)
-        elif msg.type == MessageType.FILE_LIST_RESPONSE:
-            # Remote directory listing received
-            self._file_transfer.handle_list_response(msg)
-        elif msg.type == MessageType.FILE_DOWNLOAD_REQUEST:
-            # Remote peer wants to download a file from us
-            if self._file_transfer_send_fn:
-                self._file_transfer.handle_download_request(msg, self._file_transfer_send_fn)
-        elif msg.type == MessageType.FILE_DOWNLOAD_ACCEPT:
-            # Remote peer accepted our download request
-            self._file_transfer.handle_download_accept(msg)
-        elif msg.type == MessageType.FILE_DOWNLOAD_REJECT:
-            # Remote peer rejected our download request
-            self._file_transfer.handle_download_reject(msg)
+        elif msg.type in FILE_MESSAGE_TYPES:
+            self._handle_file_message(msg)
         elif msg.type == MessageType.DISCONNECT:
             self._on_disconnect()
 
@@ -1182,6 +1133,14 @@ class MainWindow(QMainWindow):
         """Request a remote directory listing."""
         if self._file_transfer_send_fn:
             self._file_transfer.request_remote_listing(path, self._file_transfer_send_fn)
+
+    def _handle_file_message(self, msg: Message) -> None:
+        """Smista un messaggio FILE_* tramite il FileTransferManager."""
+        if self._file_transfer_send_fn is None:
+            return
+        _, job = self._file_transfer.dispatch(msg, self._file_transfer_send_fn)
+        if job is not None and self._transfer_dock is not None:
+            self._transfer_dock.add_transfer(job)
 
     def _poll_file_transfer_updates(self) -> None:
         """Poll the FileTransferManager updates queue (runs on main thread via QTimer)."""

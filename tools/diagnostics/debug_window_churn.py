@@ -1,7 +1,7 @@
 """Churn di FINESTRE REALI del desktop (come l'utente remoto): minimizza,
 ripristina e ri-chiude le finestre top-level visibili, in rotazione.
 
-Usage: uv run python tests/debug_window_churn.py [durata_s]
+Usage: uv run python tools/diagnostics/debug_window_churn.py [durata_s]
 """
 
 from __future__ import annotations

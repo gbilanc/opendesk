@@ -396,3 +396,120 @@ QToolTip {
     padding: 6px 12px;
     font-size: 12px;
 }
+
+/* ==========================================
+   Dialoghi condivisi (monitor selector)
+   ========================================== */
+QLabel#DialogTitle {
+    font-size: 16px;
+    font-weight: 600;
+    color: #0f172a;
+}
+QLabel#DialogSubtitle {
+    font-size: 13px;
+    color: #64748b;
+}
+QListWidget#MonitorList::item {
+    padding: 12px;
+    margin: 2px 0;
+}
+
+/* Pulsante outlined neutro */
+QPushButton[class="secondary"] {
+    background-color: #ffffff;
+    border: 1px solid #e2e8f0;
+    color: #475569;
+}
+QPushButton[class="secondary"]:hover {
+    background-color: #f8fafc;
+    border-color: #94a3b8;
+}
+
+/* ==========================================
+   File browser dock
+   ========================================== */
+QWidget#fileBrowserToolbar {
+    background: #ffffff;
+    border-bottom: 1px solid #e2e8f0;
+    padding: 4px;
+}
+QWidget#filePane, QWidget#transferSection {
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+}
+QWidget#filePaneHeader {
+    background: #f8fafc;
+    border-radius: 8px 8px 0 0;
+}
+QLabel#filePaneTitle {
+    font-size: 13px;
+    font-weight: 700;
+    color: #0f172a;
+    background: transparent;
+}
+QLineEdit#filePathBar {
+    border: 1px solid #e2e8f0;
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-size: 12px;
+    background: #ffffff;
+}
+QPushButton#fileHomeBtn {
+    border: none;
+    border-radius: 4px;
+    font-size: 14px;
+    background: transparent;
+}
+QPushButton#fileHomeBtn:hover {
+    background: #e2e8f0;
+}
+QTreeView#fileTree {
+    border: none;
+    border-radius: 0px;
+    font-size: 13px;
+    outline: none;
+}
+QTreeView#fileTree::item {
+    padding: 4px 8px;
+    min-height: 28px;
+}
+QTreeView#fileTree::item:selected {
+    background-color: #dbeafe;
+    color: #0f172a;
+}
+QTreeView#fileTree::item:selected:active {
+    background-color: #bfdbfe;
+}
+QTreeView#fileTree::item:hover {
+    background-color: #f8fafc;
+}
+QListView#transferList {
+    border: none;
+    background: transparent;
+}
+QStatusBar#fileStatusBar {
+    background: #f8fafc;
+    border-top: 1px solid #e2e8f0;
+    font-size: 12px;
+    color: #64748b;
+    padding: 2px 8px;
+}
+
+/* Accenti e pillole (file status bar) */
+QLabel[class="accent"] {
+    color: #2563eb;
+    font-weight: 600;
+}
+QPushButton[class="pill"] {
+    border: none;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 700;
+    color: #64748b;
+    background: #f1f5f9;
+}
+QPushButton[class="pill"]:hover {
+    background: #e2e8f0;
+    color: #0f172a;
+}

@@ -100,6 +100,20 @@ class UnattendedAccess:
         self._save()
         logger.info("Unattended access disabled")
 
+    def enable_allowlist_only(self) -> None:
+        """Abilita il filtro allowlist senza password fissa.
+
+        La password fissa non è utilizzabile con l'handshake
+        challenge-response (il server non conserva il plaintext), quindi
+        l'accesso non presidiato si esprime come *allowlist di device*:
+        i peer fuori lista vengono rifiutati prima della verifica password.
+        """
+        self._config.enabled = True
+        self._config.fixed_password = ""
+        self._config.auto_accept = True
+        self._save()
+        logger.info("Allowlist-only unattended access enabled")
+
     def set_master_password(self, password: str) -> None:
         """Set a master password to lock the unattended config."""
         self._config.master_password_hash = hash_password(password)

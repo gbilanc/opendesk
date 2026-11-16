@@ -166,7 +166,7 @@ MainThread dentro `app.exec()` nativo e TUTTI i thread Python in attesa.
 
 ### Diagnosi (faulthandler, senza GIL)
 
-`tests/repro_session_ui_stall.py` — riproduttore end-to-end con relay
+`tools/diagnostics/repro_session_ui_stall.py` — riproduttore end-to-end con relay
 REALE locale (opendesk-relay), HostService+HostWindow Qt reali,
 RelayClient reale, fasi: baseline / minimize / restore / flood input /
 close-to-tray / reshow, con beat QTimer (20ms) sul main thread e

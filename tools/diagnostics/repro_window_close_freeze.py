@@ -16,7 +16,7 @@ flusso frame della pipeline nelle 4 fasi:
 Output: per ogni fase max-gap del main thread e frame catturati.
 Exit code 0 se: main thread sempre reattivo (< 1s) e frame in flusso.
 
-Usage:  uv run python tests/repro_window_close_freeze.py [durata_fase_s]
+Usage:  uv run python tools/diagnostics/repro_window_close_freeze.py [durata_fase_s]
 """
 
 from __future__ import annotations

@@ -745,49 +745,25 @@ class FileBrowserDock(QDialog):
 
         # ── Status bar ──
         self._status_bar = QStatusBar()
-        self._status_bar.setStyleSheet("""
-            QStatusBar {
-                background: #f8fafc;
-                border-top: 1px solid #e2e8f0;
-                font-size: 12px;
-                color: #64748b;
-                padding: 2px 8px;
-            }
-        """)
+        self._status_bar.setObjectName("fileStatusBar")
         self._status_label = QLabel("Ready")
         self._status_bar.addWidget(self._status_label, 1)
 
         # Selection info with inline clear button
         self._selection_info = QLabel("")
-        self._selection_info.setStyleSheet("color: #2563eb; font-weight: 600;")
+        self._selection_info.setProperty("class", "accent")
         self._status_bar.addPermanentWidget(self._selection_info)
 
         self._clear_sel_btn = QPushButton("✕")
         self._clear_sel_btn.setFixedSize(20, 20)
         self._clear_sel_btn.setVisible(False)
-        self._clear_sel_btn.setStyleSheet("""
-            QPushButton {
-                border: none; border-radius: 10px;
-                font-size: 11px; font-weight: 700;
-                color: #64748b; background: #f1f5f9;
-            }
-            QPushButton:hover {
-                background: #e2e8f0; color: #0f172a;
-            }
-        """)
+        self._clear_sel_btn.setProperty("class", "pill")
         self._status_bar.addPermanentWidget(self._clear_sel_btn)
         layout.addWidget(self._status_bar)
 
     def _build_toolbar(self) -> QWidget:
         """Build the action toolbar."""
         toolbar = QWidget()
-        toolbar.setStyleSheet("""
-            QWidget#fileBrowserToolbar {
-                background: #ffffff;
-                border-bottom: 1px solid #e2e8f0;
-                padding: 4px;
-            }
-        """)
         toolbar.setObjectName("fileBrowserToolbar")
 
         layout = QHBoxLayout(toolbar)
@@ -797,30 +773,14 @@ class FileBrowserDock(QDialog):
         # Upload button
         self._upload_btn = QPushButton("↑ Upload")
         self._upload_btn.setMinimumHeight(32)
-        self._upload_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #2563eb; color: white;
-                border: none; border-radius: 6px;
-                padding: 6px 18px; font-weight: 600; font-size: 13px;
-            }
-            QPushButton:hover { background-color: #1d4ed8; }
-            QPushButton:disabled { background-color: #94a3b8; }
-        """)
+        self._upload_btn.setProperty("class", "primary")
         self._upload_btn.setEnabled(False)
         layout.addWidget(self._upload_btn)
 
         # Download button
         self._download_btn = QPushButton("↓ Download")
         self._download_btn.setMinimumHeight(32)
-        self._download_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #059669; color: white;
-                border: none; border-radius: 6px;
-                padding: 6px 18px; font-weight: 600; font-size: 13px;
-            }
-            QPushButton:hover { background-color: #047857; }
-            QPushButton:disabled { background-color: #94a3b8; }
-        """)
+        self._download_btn.setProperty("class", "success")
         self._download_btn.setEnabled(False)
         layout.addWidget(self._download_btn)
 
@@ -829,27 +789,13 @@ class FileBrowserDock(QDialog):
         # Refresh remote button
         self._refresh_btn = QPushButton("🔄 Refresh")
         self._refresh_btn.setMinimumHeight(32)
-        self._refresh_btn.setStyleSheet("""
-            QPushButton {
-                background: transparent; border: 1px solid #e2e8f0;
-                border-radius: 6px; padding: 6px 16px;
-                font-size: 13px; font-weight: 500;
-            }
-            QPushButton:hover { background: #f1f5f9; }
-        """)
+        self._refresh_btn.setProperty("class", "secondary")
         layout.addWidget(self._refresh_btn)
 
         # Clear completed
         self._clear_btn = QPushButton("✕ Clear")
         self._clear_btn.setMinimumHeight(32)
-        self._clear_btn.setStyleSheet("""
-            QPushButton {
-                background: transparent; border: 1px solid #e2e8f0;
-                border-radius: 6px; padding: 6px 16px;
-                font-size: 13px; font-weight: 500;
-            }
-            QPushButton:hover { background: #f1f5f9; }
-        """)
+        self._clear_btn.setProperty("class", "secondary")
         layout.addWidget(self._clear_btn)
 
         return toolbar
@@ -857,13 +803,6 @@ class FileBrowserDock(QDialog):
     def _build_pane(self, title: str, model, is_local: bool) -> QWidget:
         """Build one side of the dual-pane browser."""
         pane = QWidget()
-        pane.setStyleSheet("""
-            QWidget#filePane {
-                background: #ffffff;
-                border: 1px solid #e2e8f0;
-                border-radius: 8px;
-            }
-        """)
         pane.setObjectName("filePane")
 
         layout = QVBoxLayout(pane)
@@ -872,34 +811,23 @@ class FileBrowserDock(QDialog):
 
         # ── Pane header ──
         header = QWidget()
-        header.setStyleSheet("background: #f8fafc; border-radius: 8px 8px 0 0;")
+        header.setObjectName("filePaneHeader")
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(12, 8, 12, 8)
 
         title_label = QLabel(title)
-        title_label.setStyleSheet(
-            "font-size: 13px; font-weight: 700; color: #0f172a; background: transparent;"
-        )
+        title_label.setObjectName("filePaneTitle")
         header_layout.addWidget(title_label)
 
         # Path bar
         path_bar = QLineEdit()
-        path_bar.setStyleSheet("""
-            QLineEdit {
-                border: 1px solid #e2e8f0; border-radius: 4px;
-                padding: 4px 8px; font-size: 12px; background: white;
-            }
-        """)
+        path_bar.setObjectName("filePathBar")
         header_layout.addWidget(path_bar, 1)
 
         # Home button
         home_btn = QPushButton("🏠")
         home_btn.setFixedSize(28, 28)
-        home_btn.setStyleSheet("""
-            QPushButton { border: none; border-radius: 4px;
-                          font-size: 14px; background: transparent; }
-            QPushButton:hover { background: #e2e8f0; }
-        """)
+        home_btn.setObjectName("fileHomeBtn")
         header_layout.addWidget(home_btn)
 
         if is_local:
@@ -920,25 +848,7 @@ class FileBrowserDock(QDialog):
         tree.setAlternatingRowColors(True)
         tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         tree.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        tree.setStyleSheet("""
-            QTreeView {
-                border: none; border-radius: 0px;
-                font-size: 13px;
-                outline: none;
-            }
-            QTreeView::item {
-                padding: 4px 8px; min-height: 28px;
-            }
-            QTreeView::item:selected {
-                background-color: #dbeafe; color: #0f172a;
-            }
-            QTreeView::item:selected:active {
-                background-color: #bfdbfe;
-            }
-            QTreeView::item:hover {
-                background-color: #f8fafc;
-            }
-        """)
+        tree.setObjectName("fileTree")
 
         # Hide size/type/modified columns for local (use QFileSystemModel defaults)
         if is_local:
@@ -973,13 +883,6 @@ class FileBrowserDock(QDialog):
     def _build_transfers_section(self) -> QWidget:
         """Build the active transfers section at the bottom."""
         section = QWidget()
-        section.setStyleSheet("""
-            QWidget#transferSection {
-                background: #ffffff;
-                border: 1px solid #e2e8f0;
-                border-radius: 8px;
-            }
-        """)
         section.setObjectName("transferSection")
 
         layout = QVBoxLayout(section)
@@ -987,9 +890,7 @@ class FileBrowserDock(QDialog):
         layout.setSpacing(4)
 
         header = QLabel("Active Transfers")
-        header.setStyleSheet(
-            "font-size: 13px; font-weight: 700; color: #0f172a; background: transparent;"
-        )
+        header.setObjectName("filePaneTitle")
         layout.addWidget(header)
 
         self._transfer_list = QListView()
@@ -1001,9 +902,7 @@ class FileBrowserDock(QDialog):
         self._transfer_list.setFrameShape(QFrame.Shape.NoFrame)
         self._transfer_list.setMinimumHeight(80)
         self._transfer_list.setMaximumHeight(150)
-        self._transfer_list.setStyleSheet("""
-            QListView { border: none; background: transparent; }
-        """)
+        self._transfer_list.setObjectName("transferList")
         layout.addWidget(self._transfer_list, 1)
 
         return section

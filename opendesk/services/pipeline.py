@@ -143,7 +143,7 @@ class CaptureWorker(threading.Thread):
             if self._on_error:
                 self._on_error(msg)
             return
-        fps_target = max(self._config.fps, 1)
+        fps_target: float = max(self._config.fps, 1)
 
         consec_errors = 0
         max_consec_errors = 10
@@ -451,10 +451,7 @@ class EncoderWorker(threading.Thread):
         frame del client resta coerente e non si vede alcun artefatto.
         """
         prev = self._prev_frame
-        if (
-            prev is None
-            or time.monotonic() - self._last_packet_mono < _IDLE_KEEPALIVE_INTERVAL
-        ):
+        if prev is None or time.monotonic() - self._last_packet_mono < _IDLE_KEEPALIVE_INTERVAL:
             return
         try:
             ok, encoded = cv2.imencode(

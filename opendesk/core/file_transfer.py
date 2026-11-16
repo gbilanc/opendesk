@@ -47,6 +47,24 @@ _MAX_CONCURRENT = 4
 _MAX_FILE_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB safety limit
 _PART_SUFFIX = ".opendesk-part"
 
+# Tipi di messaggio gestiti da ``FileTransferManager.dispatch()``:
+# la policy di accettazione (FILE_REQUEST) resta alle finestre, perché
+# cambia per ruolo.
+FILE_MESSAGE_TYPES = frozenset(
+    {
+        MessageType.FILE_CHUNK,
+        MessageType.FILE_ACCEPT,
+        MessageType.FILE_REJECT,
+        MessageType.FILE_COMPLETE,
+        MessageType.FILE_ERROR,
+        MessageType.FILE_LIST_REQUEST,
+        MessageType.FILE_LIST_RESPONSE,
+        MessageType.FILE_DOWNLOAD_REQUEST,
+        MessageType.FILE_DOWNLOAD_ACCEPT,
+        MessageType.FILE_DOWNLOAD_REJECT,
+    }
+)
+
 
 # ---------------------------------------------------------------------------
 # State
@@ -790,6 +808,56 @@ class FileTransferManager:
             job.state = TransferState.CANCELLED
             job.error = reason
             self._push_update("transfer", job_id)
+
+    def dispatch(
+        self, msg: Message, send_fn: Callable[[Message], object]
+    ) -> tuple[bool, TransferJob | None]:
+        """Smista i messaggi FILE_* la cui gestione non dipende dalla UI.
+
+        Le due finestre (client e host) avevano la stessa catena di ``elif``
+        per questi tipi; la policy di accettazione (FILE_REQUEST) resta
+        invece nei chiamanti perché cambia per ruolo.
+
+        Returns
+        -------
+        (handled, job)
+            ``handled`` è ``False`` se il tipo non è di competenza;
+            ``job`` è il trasferimento toccato (per l'aggiornamento della UI).
+        """
+        t = msg.type
+        job_id = str(msg.payload.get("job_id", ""))
+        job = self._jobs.get(job_id)
+
+        if t == MessageType.FILE_CHUNK:
+            self.handle_chunk(msg)
+        elif t == MessageType.FILE_ACCEPT:
+            if job is not None:
+                self.send_chunks(job, send_fn)
+        elif t == MessageType.FILE_REJECT:
+            if job is not None:
+                job.state = TransferState.CANCELLED
+                job.error = msg.payload.get("reason", "Rejected by remote")
+                self._push_update("transfer", job.id)
+        elif t == MessageType.FILE_COMPLETE:
+            self.handle_file_complete(msg)
+        elif t == MessageType.FILE_ERROR:
+            if job is not None:
+                job.state = TransferState.FAILED
+                job.error = msg.payload.get("error", "Unknown error")
+                self._push_update("transfer", job.id)
+        elif t == MessageType.FILE_LIST_REQUEST:
+            send_fn(self.handle_list_request(msg))
+        elif t == MessageType.FILE_LIST_RESPONSE:
+            self.handle_list_response(msg)
+        elif t == MessageType.FILE_DOWNLOAD_REQUEST:
+            self.handle_download_request(msg, send_fn)
+        elif t == MessageType.FILE_DOWNLOAD_ACCEPT:
+            self.handle_download_accept(msg)
+        elif t == MessageType.FILE_DOWNLOAD_REJECT:
+            self.handle_download_reject(msg)
+        else:
+            return False, None
+        return True, job
 
     @staticmethod
     async def _compute_sha256(path: Path) -> str:

@@ -54,6 +54,7 @@ from PySide6.QtWidgets import (
 )
 
 from opendesk.core.keyboard_state import caps_lock_active
+from opendesk.core.screen_recorder import ScreenRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,7 @@ _MAX_ZOOM = 5.0
 _ZOOM_STEP = 1.15
 _HUD_UPDATE_MS = 1000  # HUD refresh interval
 _FRAME_TIMEOUT_MS = 10000  # 10 s without a frame → show warning
+_RECORD_INTERVAL_MS = 100  # 10 fps di registrazione (sufficiente, costo basso)
 
 # ── Camera PiP overlay ──
 _CAMERA_OVERLAY_WIDTH = 240
@@ -402,7 +404,6 @@ class RemoteViewer(QGraphicsView):
 
     def display_tile(self, rgb_data: np.ndarray, x: int, y: int, w: int, h: int) -> None:
         """Blit a single JPEG tile region into the current frame pixmap.
-
         Avoids the full-frame copy + QPixmap rebuild that a per-tile
         "frame" update would cost (~6 MB @1080p per tile).  Tiles are
         only sent after a keyframe established the pixmap, so
@@ -477,6 +478,15 @@ class RemoteViewer(QGraphicsView):
         self._fit_mode = self.FitMode.FIXED_RATIO
         self._zoom_level = 1.0
         self._apply_zoom()
+
+    def current_frame_image(self) -> QImage | None:
+        """Immagine RGB dell'ultimo frame compositato, o ``None``."""
+        if self._pixmap_item is None:
+            return None
+        pixmap = self._pixmap_item.pixmap()
+        if pixmap.isNull():
+            return None
+        return pixmap.toImage().convertToFormat(QImage.Format.Format_RGB888)
 
     @Slot()
     def toggle_fullscreen(self) -> None:
@@ -864,6 +874,7 @@ class ViewerToolbar(QToolBar):
     ctrl_alt_del_requested = Signal()
     chat_requested = Signal()
     files_requested = Signal()
+    record_toggled = Signal(bool)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__("Viewer Controls", parent)
@@ -925,6 +936,14 @@ class ViewerToolbar(QToolBar):
         self._cam_act.triggered.connect(self.camera_toggled)
         self.addAction(self._cam_act)
 
+        # Registrazione sessione su file
+        self._rec_act = QAction("⏺ Rec", self)
+        self._rec_act.setToolTip("Registra la sessione in un file MP4")
+        self._rec_act.setCheckable(True)
+        self._rec_act.setChecked(False)
+        self._rec_act.toggled.connect(self.record_toggled)
+        self.addAction(self._rec_act)
+
         self.addSeparator()
 
         # Chat (acts on the current connection)
@@ -958,6 +977,13 @@ class ViewerToolbar(QToolBar):
     def set_mic_checked(self, checked: bool) -> None:
         """Set mic toggle button state without emitting signal."""
         self._mic_act.setChecked(checked)
+
+    def set_recording(self, active: bool) -> None:
+        """Aggiorna lo stato del pulsante Rec senza riemettere il segnale."""
+        self._rec_act.blockSignals(True)
+        self._rec_act.setChecked(active)
+        self._rec_act.blockSignals(False)
+        self._rec_act.setText("⏺ Rec" if not active else "⏹ Stop rec")
 
     def set_camera_checked(self, checked: bool) -> None:
         """Set camera toggle button state without emitting signal."""
@@ -1029,6 +1055,13 @@ class ViewerWindow(QMainWindow):
         self._toolbar.disconnect_requested.connect(self._on_disconnect_clicked)
         self._toolbar.chat_requested.connect(self.chat_requested)
         self._toolbar.files_requested.connect(self.files_requested)
+        self._toolbar.record_toggled.connect(self._on_record_toggled)
+
+        # ── Registrazione sessione (opt-in) ──
+        self._recorder: ScreenRecorder | None = None
+        self._rec_timer = QTimer(self)
+        self._rec_timer.setInterval(_RECORD_INTERVAL_MS)
+        self._rec_timer.timeout.connect(self._write_recording_frame)
         self.addToolBar(self._toolbar)
         # Sync viewer with the toolbar default (sharp text on)
         self._viewer.set_sharp_text(self._toolbar._sharp_act.isChecked())
@@ -1058,6 +1091,14 @@ class ViewerWindow(QMainWindow):
     def viewer(self) -> RemoteViewer:
         """The embedded RemoteViewer widget."""
         return self._viewer
+
+    def current_frame_image(self) -> QImage | None:
+        """Immagine RGB dell'ultimo frame compositato (None se assente).
+
+        Usata dalla registrazione: il pixmap del viewer contiene già i tile
+        applicati, quindi è l'unica sorgente completa della sessione.
+        """
+        return self._viewer.current_frame_image()
 
     @Slot()
     def _on_frame_timeout(self) -> None:
@@ -1118,6 +1159,56 @@ class ViewerWindow(QMainWindow):
         """Forward camera toggle to external callback."""
         if self._on_camera_toggle_cb:
             self._on_camera_toggle_cb(checked)
+
+    # ── registrazione ───────────────────────────────────────────────
+
+    def _on_record_toggled(self, active: bool) -> None:
+        """Avvia/ferma la registrazione della sessione su MP4."""
+        if active:
+            image = self._viewer.current_frame_image()
+            if image is None:
+                logger.warning("Registrazione: nessun frame disponibile")
+                self._toolbar.set_recording(False)
+                return
+            self._recorder = ScreenRecorder()
+            path = self._recorder.start(
+                width=image.width(),
+                height=image.height(),
+                fps=1000 // _RECORD_INTERVAL_MS,
+            )
+            self._rec_timer.start()
+            self._status_label.setText(f"Recording → {path}")
+            logger.info("Registrazione avviata: %s", path)
+        else:
+            self._rec_timer.stop()
+            if self._recorder is not None:
+                status = self._recorder.stop()
+                self._status_label.setText(
+                    f"Recording salvato: {status.output_path} "
+                    f"({status.frames_written} frame, {status.duration_sec:.0f}s)"
+                )
+                logger.info("Registrazione fermata: %s", status.output_path)
+                self._recorder = None
+            self._toolbar.set_recording(False)
+
+    def _write_recording_frame(self) -> None:
+        """Copia il frame compositato corrente nel file di registrazione."""
+        if self._recorder is None:
+            return
+        image = self._viewer.current_frame_image()
+        if image is None:
+            return
+        width, height = image.width(), image.height()
+        try:
+            raw = np.frombuffer(image.constBits(), dtype=np.uint8)
+            frame = raw.reshape(height, image.bytesPerLine())[:, : width * 3].reshape(
+                height, width, 3
+            )
+        except (ValueError, BufferError) as e:
+            logger.debug("Registrazione: frame non convertibile: %s", e)
+            return
+        if not self._recorder.write_frame(frame):
+            logger.debug("Registrazione: frame scartato")
 
     def _on_ctrl_alt_del(self) -> None:
         """Send Ctrl+Alt+Del to the remote peer."""

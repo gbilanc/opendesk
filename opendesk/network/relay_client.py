@@ -27,6 +27,7 @@ import logging
 import queue
 import threading
 import time
+from collections.abc import Awaitable, Callable
 from enum import Enum, auto
 from typing import Any, cast
 
@@ -123,6 +124,7 @@ class _RelaySession:
         p2p_enabled: bool = False,
         ice_servers: list | None = None,
         relay_fallback: bool = True,
+        allowed_peer_ids: set[str] | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -149,6 +151,9 @@ class _RelaySession:
         self._trusted_device_ids: set[str] = set(self._trusted_devices)
         # Per-device secrets WE already know for peers (client side).
         self._known_device_secrets: dict[str, str] = known_device_secrets or {}
+        # Allowlist host-side (accesso non presidiato): se non vuota, solo
+        # questi device_id possono autenticarsi.
+        self._allowed_peer_ids: set[str] = allowed_peer_ids or set()
         # Secret used for the E2EE key-exchange proof.  Empty → session
         # password.  For trusted (password-less) sessions it is set to the
         # per-device secret so the proof doesn't depend on the password.
@@ -837,25 +842,64 @@ class _RelaySession:
                 with self._send_lock:
                     self._pending_sends = max(0, self._pending_sends - 1)
 
-    # ── host flow ───────────────────────────────────────────────────
+    # ── connection setup (shared by both roles) ─────────────────────
 
-    async def _run_host(self) -> None:
-        logger.info("Host connecting to relay %s:%s", self.host, self.port)
+    async def _teardown(self, *tasks: asyncio.Task) -> None:
+        """Cancella i task di sessione e chiude socket/P2P (usato in ``finally``)."""
+        for task in tasks:
+            task.cancel()
+        await self._aclose_p2p()
+        await self._close_writer()
+
+    async def _connect(self, role_label: str) -> bool:
+        """Apre la connessione TCP verso il relay.
+
+        Su fallimento emette gli eventi ``error`` e ``disconnected`` e
+        ritorna ``False``; i chiamanti escono subito dal flusso del ruolo.
+        """
+        logger.info("%s connecting to relay %s:%s", role_label, self.host, self.port)
         try:
             self._reader, self._writer = await asyncio.wait_for(
                 asyncio.open_connection(self.host, self.port),
                 timeout=_CONNECT_TIMEOUT,
             )
+            return True
         except TimeoutError:
             err = f"Connection to relay {self.host}:{self.port} timed out ({_CONNECT_TIMEOUT}s)"
-            logger.error(err)
-            self.inbox.put(("error", err, self.session_seq))
-            self.inbox.put(("disconnected", None, self.session_seq))
-            return
         except OSError as e:
-            logger.error("Host connection failed: %s", e)
-            self.inbox.put(("error", str(e), self.session_seq))
-            self.inbox.put(("disconnected", None, self.session_seq))
+            err = str(e)
+        logger.error("%s connection failed: %s", role_label, err)
+        self.inbox.put(("error", err, self.session_seq))
+        self.inbox.put(("disconnected", None, self.session_seq))
+        return False
+
+    # ── host flow ───────────────────────────────────────────────────
+
+    async def _receive_loop(
+        self, role_label: str, dispatch: Callable[[MessageType, Message], Awaitable[bool]]
+    ) -> None:
+        """Loop di ricezione condiviso dai due ruoli.
+
+        Legge, decifra e pubblica sull'inbox i messaggi in arrivo; la
+        gestione per tipo è delegata a ``dispatch``, che ritorna ``True``
+        quando la sessione va chiusa (DISCONNECT ricevuto).
+        """
+        while self._running.is_set():
+            msg = await self._next_incoming()
+            if msg is None:
+                break
+            try:
+                msg = self._decrypt_peer_message(msg)
+            except ValueError as e:
+                logger.warning("Dropped encrypted %s message: %s", role_label.lower(), e)
+                continue
+            if msg.type not in _P2P_SIGNAL_TYPES:
+                self.inbox.put(("message", msg, self.session_seq))
+            if await dispatch(msg.type, msg):
+                break
+
+    async def _run_host(self) -> None:
+        if not await self._connect("Host"):
             return
 
         # Register session with device identity
@@ -870,19 +914,8 @@ class _RelaySession:
         ping_task = asyncio.create_task(self._ping_loop())
         reader_task = asyncio.create_task(self._relay_reader_task())
         try:
-            while self._running.is_set():
-                msg = await self._next_incoming()
-                if msg is None:
-                    break
-                try:
-                    msg = self._decrypt_peer_message(msg)
-                except ValueError as e:
-                    logger.warning("Dropped encrypted host message: %s", e)
-                    continue
-                if msg.type not in _P2P_SIGNAL_TYPES:
-                    self.inbox.put(("message", msg, self.session_seq))
 
-                t = msg.type
+            async def _dispatch(t: MessageType, msg: Message) -> bool:
                 if t == MessageType.RELAY_REGISTER:
                     self.inbox.put(("connected", ("host", self.session_id), self.session_seq))
 
@@ -935,6 +968,24 @@ class _RelaySession:
                     client_connection_mode = msg.payload.get("connection_mode", "remote_desktop")
                     self.connection_mode = client_connection_mode
 
+                    # Accesso non presidiato: se è configurata una allowlist,
+                    # i device fuori lista vengono rifiutati prima di qualsiasi
+                    # verifica di password (fail fast, nessun oracolo).
+                    if self._allowed_peer_ids and client_device_id not in self._allowed_peer_ids:
+                        logger.warning(
+                            "Peer %s rejected: not in the unattended allowlist",
+                            (client_device_id or "<unknown>")[:8],
+                        )
+                        await self._send_async(Message.auth_fail("Device not allowed"))
+                        self.inbox.put(
+                            (
+                                "auth_result",
+                                (False, "Device not allowed"),
+                                self.session_seq,
+                            )
+                        )
+                        return False
+
                     # Trusted device bypass: skip password verification
                     if client_device_id and client_device_id in self._trusted_device_ids:
                         logger.info(
@@ -964,7 +1015,7 @@ class _RelaySession:
                                 self.session_seq,
                             )
                         )
-                        continue
+                        return False
 
                     success = verify_response(self._auth_nonce, self.password, client_hash)
                     if success:
@@ -1023,7 +1074,7 @@ class _RelaySession:
 
                 elif t == MessageType.DISCONNECT:
                     logger.debug("Host received DISCONNECT — breaking loop")
-                    break
+                    return True
 
                 elif t in self._PEER_PASSTHROUGH:
                     pass  # forwarded to UI via generic "message" inbox event
@@ -1036,33 +1087,18 @@ class _RelaySession:
 
                 else:
                     logger.debug("Host received unhandled message type %s", t)
+                return False
+
+            await self._receive_loop("Host", _dispatch)
         finally:
-            ping_task.cancel()
-            reader_task.cancel()
-            await self._aclose_p2p()
-            await self._close_writer()
+            await self._teardown(ping_task, reader_task)
         self.inbox.put(("disconnected", None, self.session_seq))
         logger.debug("Host session ended: disconnected event queued")
 
     # ── client flow ─────────────────────────────────────────────────
 
     async def _run_client(self) -> None:
-        logger.info("Client connecting to relay %s:%s", self.host, self.port)
-        try:
-            self._reader, self._writer = await asyncio.wait_for(
-                asyncio.open_connection(self.host, self.port),
-                timeout=_CONNECT_TIMEOUT,
-            )
-        except TimeoutError:
-            err = f"Connection to relay {self.host}:{self.port} timed out ({_CONNECT_TIMEOUT}s)"
-            logger.error(err)
-            self.inbox.put(("error", err, self.session_seq))
-            self.inbox.put(("disconnected", None, self.session_seq))
-            return
-        except OSError as e:
-            logger.error("Client connection failed: %s", e)
-            self.inbox.put(("error", str(e), self.session_seq))
-            self.inbox.put(("disconnected", None, self.session_seq))
+        if not await self._connect("Client"):
             return
 
         # Look up device by ID (device_id) → relay pairs us with its session
@@ -1111,19 +1147,9 @@ class _RelaySession:
         ping_task = asyncio.create_task(self._ping_loop())
         reader_task = asyncio.create_task(self._relay_reader_task())
         try:
-            while self._running.is_set():
-                msg = await self._next_incoming()
-                if msg is None:
-                    break
-                try:
-                    msg = self._decrypt_peer_message(msg)
-                except ValueError as e:
-                    logger.warning("Dropped encrypted client message: %s", e)
-                    continue
-                if msg.type not in _P2P_SIGNAL_TYPES:
-                    self.inbox.put(("message", msg, self.session_seq))
 
-                t = msg.type
+            async def _dispatch(t: MessageType, msg: Message) -> bool:
+                nonlocal _frame_count
                 if t == MessageType.RELAY_REGISTER:
                     if msg.payload.get("paired"):
                         self.inbox.put(
@@ -1136,7 +1162,7 @@ class _RelaySession:
                             ("error", f"Session {self.session_id} not found", self.session_seq)
                         )
                         self.inbox.put(("disconnected", None, self.session_seq))
-                        break
+                        return True
 
                 elif t == MessageType.P2P_OFFER:
                     await self._handle_p2p_offer(msg.payload)
@@ -1187,7 +1213,7 @@ class _RelaySession:
                 elif t == MessageType.AUTH_FAIL:
                     reason = msg.payload.get("reason", "Authentication failed")
                     self.inbox.put(("auth_result", (False, reason), self.session_seq))
-                    break
+                    return True
 
                 elif t == MessageType.RELAY_DEVICE_LIST:
                     devices = msg.payload.get("devices", [])
@@ -1361,11 +1387,11 @@ class _RelaySession:
                         relay_err = f"Relay error (code={msg.payload.get('code', 'N/A')})"
                     logger.debug("Client received ERROR: %s — breaking loop", relay_err)
                     self.inbox.put(("error", relay_err, self.session_seq))
-                    break
+                    return True
 
                 elif t == MessageType.DISCONNECT:
                     logger.debug("Client received DISCONNECT — breaking loop")
-                    break
+                    return True
 
                 elif t in self._PEER_PASSTHROUGH:
                     pass  # forwarded to UI via generic "message" inbox event
@@ -1378,12 +1404,11 @@ class _RelaySession:
 
                 else:
                     logger.debug("Client received unhandled message type %s", t)
+                return False
+
+            await self._receive_loop("Client", _dispatch)
         finally:
-            watchdog_task.cancel()
-            ping_task.cancel()
-            reader_task.cancel()
-            await self._aclose_p2p()
-            await self._close_writer()
+            await self._teardown(watchdog_task, ping_task, reader_task)
         self.inbox.put(("disconnected", None, self.session_seq))
         logger.debug("Client session ended: disconnected event queued")
 
@@ -1583,6 +1608,7 @@ class RelayClient(QObject):
         device_id: str = "",
         device_name: str = "",
         trusted_devices: dict[str, str] | None = None,
+        allowed_peer_ids: set[str] | None = None,
     ) -> None:
         """Connect to relay and register as host.
 
@@ -1609,6 +1635,7 @@ class RelayClient(QObject):
             p2p_enabled=self._p2p_enabled,
             ice_servers=self._ice_servers,
             relay_fallback=self._relay_fallback,
+            allowed_peer_ids=allowed_peer_ids,
         )
         self._start_host_thread()
 

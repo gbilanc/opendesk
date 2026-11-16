@@ -8,9 +8,8 @@ of the main window, with copy buttons and a refresh action.
 from __future__ import annotations
 
 import logging
-import string
 
-from PySide6.QtCore import Qt, QTimer, Signal, Slot
+from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -22,6 +21,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from opendesk.crypto.auth import generate_otp
+from opendesk.ui.widgets.flash_button import flash_button
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,7 @@ class SessionInfoWidget(QWidget):
         self,
         device_id: str = "",
         device_name: str = "",
+        theme_toggle: bool = True,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -48,6 +51,7 @@ class SessionInfoWidget(QWidget):
         self._password = ""
         self._device_id = device_id
         self._device_name = device_name
+        self._theme_toggle = theme_toggle
         self._name_editing = False
         self._setup_ui()
         # Don't auto-create session — MainWindow pushes it via set_session()
@@ -152,6 +156,7 @@ class SessionInfoWidget(QWidget):
         self._theme_btn.setToolTip("Switch light/dark theme (Ctrl+T)")
         self._theme_btn.setProperty("class", "flat")
         self._theme_btn.clicked.connect(lambda: self.theme_toggle_requested.emit())
+        self._theme_btn.setVisible(self._theme_toggle)
         row2.addWidget(self._theme_btn)
 
         layout.addLayout(row2)
@@ -235,7 +240,7 @@ class SessionInfoWidget(QWidget):
         l'hash Argon2 e MainWindow lo ricalcolava subito dopo — due hash
         sul main thread e una sessione orfana in ``_pending_sessions``.
         """
-        password = self._generate_password()
+        password = generate_otp()
         self._password = password
 
         # Show device ID as the main identifier
@@ -250,7 +255,7 @@ class SessionInfoWidget(QWidget):
         """Copy the full device UUID to the clipboard."""
         clipboard = QApplication.clipboard()
         clipboard.setText(self._device_id)
-        self._flash_button(self._copy_id_btn, "Copied!", self._button_style())
+        flash_button(self._copy_id_btn, "Copied!")
         logger.info("Device UUID copied: %s", self._device_id)
 
     @Slot()
@@ -258,26 +263,5 @@ class SessionInfoWidget(QWidget):
         """Copy password to the clipboard."""
         clipboard = QApplication.clipboard()
         clipboard.setText(self._password)
-        self._flash_button(self._copy_pwd_btn, "Copied!", self._button_style())
+        flash_button(self._copy_pwd_btn, "Copied!")
         logger.info("Password copied")
-
-    # ── Helpers ─────────────────────────────────────────────────────
-
-    def _flash_button(self, btn: QPushButton, text: str, restore_style: str) -> None:
-        """Briefly change button text, then restore after 1.5 s."""
-        original = btn.text()
-        btn.setText(text)
-        btn.setEnabled(False)
-        QTimer.singleShot(1500, lambda: self._restore_btn(btn, original, restore_style))
-
-    def _restore_btn(self, btn: QPushButton, text: str, style: str) -> None:
-        btn.setText(text)
-        btn.setEnabled(True)
-
-    @staticmethod
-    def _generate_password() -> str:
-        """Generate a random 8-character alphanumeric password."""
-        import secrets
-
-        alphabet = string.ascii_uppercase + string.digits
-        return "".join(secrets.choice(alphabet) for _ in range(8))

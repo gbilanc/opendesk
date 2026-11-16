@@ -1,29 +1,35 @@
 # Schema Codebase
 
 > Generato automaticamente dall'estensione `codebase-mapper`.
+>
+> ⚠️ **Snapshot, non documentazione viva.** Il grafo mermaid e la tabella
+> "Oggetti" riflettono la generazione originale e non sono stati rigenerati.
+> La sezione **Panoramica** e **Funzionalità per modulo** sono state riallineate
+> a mano al 2026-11-16.
 
 ## Panoramica
 
-- **File sorgente**: 83
-- **Righe totali**: 26.003
-- **Linguaggi**: python (83)
+- **File sorgente**: 88 (`opendesk/` 51, `tests/` 20, `tools/` 12, `packaging/` 3, root 1)
+- **Righe totali**: 26.996
+- **Linguaggi**: python (88)
 - **Moduli**: 11
 
 ## Funzionalità per modulo
 
-| Modulo | Percorso | File | Simboli | Entry point |
-|---|---|---|---|---|
-| tests | `tests` | 25 | 284 | main, drain, write_msg, read_msg, run_host |
-| core | `opendesk/core` | 16 | 336 | main, on_error, on_eos, run_full_benchmark, auto_tune_encoder |
-| ui | `opendesk/ui` | 14 | 289 | - |
-| utils | `opendesk/utils` | 5 | 15 | parse_log_level, setup_logging, current_platform, platform_name, is_wayland |
-| opendesk-client | `(root)` | 4 | 26 | detect_platform, run_cmd, install_system_deps_windows, install_system_deps_linux, install_system_deps_darwin |
-| opendesk | `opendesk` | 4 | 88 | load_stylesheet, toggle_theme, get_current_theme, main_release, install_system_deps |
-| crypto | `opendesk/crypto` | 4 | 43 | hash_password, verify_password, needs_rehash, generate_session_id, generate_otp |
-| network | `opendesk/network` | 4 | 86 | - |
-| services | `opendesk/services` | 4 | 91 | - |
-| packaging | `packaging` | 2 | 1 | main |
-| tools | `tools` | 1 | 2 | find_opendesk_host_process, main |
+| Modulo | Percorso | File | Righe |
+|---|---|---|---|
+| core | `opendesk/core` | 16 | 8.045 |
+| ui | `opendesk/ui` | 9 | 5.319 |
+| ui/widgets | `opendesk/ui/widgets` | 6 | 458 |
+| network | `opendesk/network` | 4 | 2.873 |
+| services | `opendesk/services` | 4 | 1.915 |
+| crypto | `opendesk/crypto` | 4 | 718 |
+| utils | `opendesk/utils` | 5 | 433 |
+| opendesk (root) | `opendesk` | 5 | 2.143 |
+| tests | `tests` | 20 | 3.662 |
+| tools/diagnostics | `tools/diagnostics` | 10 | 1.179 |
+| tools | `tools` | 2 | 185 |
+| packaging | `packaging` | 3 | 66 |
 
 ## Oggetti (classi, interfacce, entità)
 
@@ -86,9 +92,6 @@
 | E2EEncryption | class | `opendesk/crypto/e2ee.py` | 115 |
 | HostService | class | `opendesk/host_app.py` | 63 |
 | HostWindow | class | `opendesk/host_app.py` | 563 |
-| ExternalEndpoint | class | `opendesk/network/nat_traversal.py` | 18 |
-| TURNServer | class | `opendesk/network/nat_traversal.py` | 27 |
-| STUNProtocol | class | `opendesk/network/nat_traversal.py` | 88 |
 | MessageType | class | `opendesk/network/protocol.py` | 40 |
 | Message | class | `opendesk/network/protocol.py` | 116 |
 | RelayRole | class | `opendesk/network/relay_client.py` | 53 |
@@ -113,7 +116,6 @@
 | FileBrowserDock | class | `opendesk/ui/file_transfer_ui.py` | 641 |
 | MainWindow | class | `opendesk/ui/main_window.py` | 50 |
 | MonitorSelector | class | `opendesk/ui/monitor_selector.py` | 30 |
-| MonitorSwitcherWidget | class | `opendesk/ui/monitor_selector.py` | 147 |
 | SessionInfoWidget | class | `opendesk/ui/session_info.py` | 29 |
 | SettingsDialog | class | `opendesk/ui/settings_dialog.py` | 44 |
 | CameraOverlay | class | `opendesk/ui/viewer.py` | 79 |
@@ -1198,18 +1200,6 @@ flowchart TD
 - `file_transfer` — method @180: `def file_transfer(self) -> FileTransferManager:`
 
 **opendesk/network/__init__.py** (python, 2 righe)
-
-
-**opendesk/network/nat_traversal.py** (python, 145 righe)
-
-- `ExternalEndpoint` — class @18: `class ExternalEndpoint:`
-- `TURNServer` — class @27: `class TURNServer:`
-- `STUNProtocol` — class @88: `class STUNProtocol(asyncio.DatagramProtocol):`
-- `__init__` — method @91: `def __init__(self, request: bytes, timeout: float) -> None:`
-- `connection_made` — method @96: `def connection_made(self, transport: asyncio.DatagramTransport) -> None:`
-- `datagram_received` — method @100: `def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:`
-- `error_received` — method @138: `def error_received(self, exc: Exception) -> None:`
-- `connection_lost` — method @142: `def connection_lost(self, exc: Exception | None) -> None:`
 
 **opendesk/network/protocol.py** (python, 557 righe)
 

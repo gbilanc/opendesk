@@ -11,7 +11,6 @@ import logging
 
 from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtWidgets import (
-    QComboBox,
     QDialog,
     QHBoxLayout,
     QLabel,
@@ -54,35 +53,17 @@ class MonitorSelector(QDialog):
         layout.setContentsMargins(20, 20, 20, 20)
 
         title = QLabel("Remote Monitors")
-        title.setStyleSheet("font-size: 16px; font-weight: 600; color: #0f172a;")
+        title.setObjectName("DialogTitle")
         layout.addWidget(title)
 
         subtitle = QLabel(f"{len(self._monitors)} monitor(s) detected on the remote computer.")
-        subtitle.setStyleSheet("font-size: 13px; color: #64748b;")
+        subtitle.setObjectName("DialogSubtitle")
         subtitle.setWordWrap(True)
         layout.addWidget(subtitle)
 
         # Monitor list
         self._list = QListWidget()
-        self._list.setStyleSheet("""
-            QListWidget {
-                border: 1px solid #e2e8f0;
-                border-radius: 8px;
-                padding: 4px;
-            }
-            QListWidget::item {
-                padding: 12px;
-                border-radius: 6px;
-                margin: 2px 0;
-            }
-            QListWidget::item:hover {
-                background: #f1f5f9;
-            }
-            QListWidget::item:selected {
-                background: #dbeafe;
-                color: #0f172a;
-            }
-        """)
+        self._list.setObjectName("MonitorList")
         self._list.currentRowChanged.connect(self._on_row_changed)
 
         for i, mon in enumerate(self._monitors):
@@ -100,30 +81,12 @@ class MonitorSelector(QDialog):
         btn_layout.addStretch()
 
         self._cancel_btn = QPushButton("Cancel")
+        self._cancel_btn.setProperty("class", "secondary")
         self._cancel_btn.clicked.connect(self.reject)
-        self._cancel_btn.setStyleSheet("""
-            QPushButton {
-                padding: 8px 20px;
-                border: 1px solid #e2e8f0;
-                border-radius: 8px;
-                background: #ffffff;
-            }
-            QPushButton:hover { background: #f8fafc; }
-        """)
         btn_layout.addWidget(self._cancel_btn)
 
         self._select_btn = QPushButton("Show Monitor")
-        self._select_btn.setStyleSheet("""
-            QPushButton {
-                padding: 8px 20px;
-                border: none;
-                border-radius: 8px;
-                background: #2563eb;
-                color: white;
-                font-weight: 600;
-            }
-            QPushButton:hover { background: #1d4ed8; }
-        """)
+        self._select_btn.setProperty("class", "primary")
         self._select_btn.clicked.connect(self._on_select)
         btn_layout.addWidget(self._select_btn)
 
@@ -142,52 +105,3 @@ class MonitorSelector(QDialog):
     def _on_select(self) -> None:
         self.monitor_selected.emit(self._selected_index)
         self.accept()
-
-
-class MonitorSwitcherWidget(QWidget):
-    """Compact monitor switcher for the toolbar."""
-
-    monitor_changed = Signal(int)
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 8, 0)
-        layout.setSpacing(4)
-
-        label = QLabel("Monitor:")
-        label.setStyleSheet("font-size: 12px; color: #64748b; font-weight: 500;")
-        layout.addWidget(label)
-
-        self._combo = QComboBox()
-        self._combo.setMinimumWidth(120)
-        self._combo.setStyleSheet("""
-            QComboBox {
-                padding: 4px 8px;
-                border: 1px solid #e2e8f0;
-                border-radius: 6px;
-                font-size: 12px;
-                min-height: 24px;
-            }
-        """)
-        self._combo.currentIndexChanged.connect(self._on_combo_changed)
-        layout.addWidget(self._combo)
-
-    def set_monitors(self, monitors: list[MonitorInfo]) -> None:
-        """Populate the combo with monitor names."""
-        self._combo.blockSignals(True)
-        self._combo.clear()
-        for i, mon in enumerate(monitors):
-            label = f"{mon.name} ({mon.width}×{mon.height})"
-            self._combo.addItem(label, i)
-        self._combo.blockSignals(False)
-
-    def set_current(self, index: int) -> None:
-        """Set the currently selected monitor."""
-        if 0 <= index < self._combo.count():
-            self._combo.setCurrentIndex(index)
-
-    @Slot(int)
-    def _on_combo_changed(self, index: int) -> None:
-        if index >= 0:
-            self.monitor_changed.emit(self._combo.itemData(index))
