@@ -39,7 +39,6 @@ class EmptyStateWidget(QFrame):
         parent=None,
     ) -> None:
         super().__init__(parent)
-        self.setStyleSheet("EmptyStateWidget { background: transparent; }")
 
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -47,24 +46,20 @@ class EmptyStateWidget(QFrame):
 
         # ── Icon ──
         self._icon = QLabel(icon or "")
-        self._icon.setStyleSheet("font-size: 42px; background: transparent;")
+        self._icon.setObjectName("EmptyStateIcon")
         self._icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self._icon)
 
         # ── Title ──
         self._title = QLabel(title)
-        self._title.setStyleSheet(
-            "font-size: 16px; font-weight: 600; color: #0f172a; background: transparent;"
-        )
+        self._title.setObjectName("EmptyStateTitle")
         self._title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._title.setWordWrap(True)
         layout.addWidget(self._title)
 
         # ── Description ──
         self._description = QLabel(description)
-        self._description.setStyleSheet(
-            "font-size: 13px; color: #64748b; background: transparent;"
-        )
+        self._description.setObjectName("EmptyStateDescription")
         self._description.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._description.setWordWrap(True)
         layout.addWidget(self._description)

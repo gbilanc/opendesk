@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QPainter, QPen
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QWidget
 
@@ -24,10 +24,13 @@ class HealthStatusWidget(QFrame):
     Cliccando mostra i dettagli via tooltip.
     """
 
+    clicked = Signal()
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setFixedSize(22, 22)
         self.setToolTip("Click per dettagli piattaforma")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._issues: list[HealthIssue] = []
         self._max_severity: HealthSeverity | None = None
         self._refresh()
@@ -83,6 +86,7 @@ class HealthStatusWidget(QFrame):
     def mousePressEvent(self, event) -> None:  # noqa: N802
         """Click per refreshare immediatamente il controllo."""
         self._refresh()
+        self.clicked.emit()
         super().mousePressEvent(event)
 
 
@@ -95,20 +99,9 @@ class HealthSummaryDialog(QFrame):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setObjectName("HealthSummaryDialog")
         self.setWindowFlags(Qt.WindowType.Popup)
         self.setFrameShape(QFrame.Shape.StyledPanel)
-        self.setStyleSheet("""
-            HealthSummaryDialog {
-                background-color: #1e293b;
-                border: 1px solid #334155;
-                border-radius: 8px;
-                padding: 12px;
-            }
-            QLabel {
-                color: #e2e8f0;
-                font-size: 12px;
-            }
-        """)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(12, 8, 12, 8)
 

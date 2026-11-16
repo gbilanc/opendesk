@@ -9,9 +9,10 @@ HUD overlay with FPS, quality, and latency information.
 from __future__ import annotations
 
 import logging
+import queue
+import threading
 import time
 from collections import deque
-from collections.abc import Callable
 from typing import cast
 
 import numpy as np
@@ -42,6 +43,7 @@ from PySide6.QtGui import (
     Qt as QtKey,
 )
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QGraphicsPixmapItem,
     QGraphicsScene,
@@ -73,6 +75,60 @@ _RECORD_INTERVAL_MS = 100  # 10 fps di registrazione (sufficiente, costo basso)
 _CAMERA_OVERLAY_WIDTH = 240
 _CAMERA_OVERLAY_HEIGHT = 180
 _CAMERA_OVERLAY_MARGIN = 12
+
+
+# ---------------------------------------------------------------------------
+# RecordingWorker — encode/mux fuori dal thread GUI
+# ---------------------------------------------------------------------------
+
+
+class _RecordingWorker:
+    """Scrive i frame su un thread dedicato, in ordine.
+
+    L'encode H.264 e il muxing sono costosi: eseguirli nel timer Qt a 10 fps
+    blocca la UI. La coda è limitata: se il disco non tiene il passo i frame
+    vengono scartati invece di accumulare memoria.
+    """
+
+    def __init__(self, recorder: ScreenRecorder) -> None:
+        self._recorder = recorder
+        self._queue: queue.Queue[QImage | None] = queue.Queue(maxsize=8)
+        self._thread = threading.Thread(
+            target=self._run, name="ScreenRecorder", daemon=True
+        )
+        self._thread.start()
+
+    def submit(self, image: QImage) -> None:
+        """Accoda un frame (copia) senza bloccare il chiamante."""
+        try:
+            self._queue.put_nowait(image)
+        except queue.Full:
+            logger.debug("Registrazione: coda piena, frame scartato")
+
+    def _run(self) -> None:
+        while True:
+            image = self._queue.get()
+            if image is None:
+                return
+            width, height = image.width(), image.height()
+            try:
+                raw = np.frombuffer(image.constBits(), dtype=np.uint8)
+                frame = raw.reshape(height, image.bytesPerLine())[:, : width * 3].reshape(
+                    height, width, 3
+                )
+                self._recorder.write_frame(frame)
+            except (ValueError, BufferError) as e:
+                logger.debug("Registrazione: frame non convertibile: %s", e)
+            except Exception:
+                logger.exception("Registrazione: errore scrittura frame")
+
+    def stop(self) -> None:
+        """Smaltisce la coda e termina il thread."""
+        try:
+            self._queue.put(None, timeout=2)
+        except queue.Full:
+            logger.warning("Registrazione: coda piena, stop senza flush completo")
+        self._thread.join(timeout=5)
 
 
 # ---------------------------------------------------------------------------
@@ -994,6 +1050,14 @@ class ViewerToolbar(QToolBar):
         self._chat_act.setEnabled(active)
         self._files_act.setEnabled(active)
 
+    def is_sharp_text_enabled(self) -> bool:
+        """Return whether sharp text mode is currently checked."""
+        return self._sharp_act.isChecked()
+
+    def set_sharp_text_checked(self, enabled: bool) -> None:
+        """Sync sharp text toggle state without emitting the signal."""
+        self._sharp_act.setChecked(enabled)
+
     def _on_sharp_toggled(self, checked: bool) -> None:
         """Forward sharp toggle to the signal."""
         self.sharp_toggled.emit(checked)
@@ -1019,24 +1083,19 @@ class ViewerWindow(QMainWindow):
     frame_timeout = Signal()
     chat_requested = Signal()
     files_requested = Signal()
+    mouse_event = Signal(int, int, int, bool, bool)  # x, y, button, pressed, absolute
+    key_event = Signal(str, bool)  # key, pressed
+    caps_lock_sync = Signal(bool)  # Caps Lock state after a local toggle
+    mic_toggled = Signal(bool)
+    camera_toggled = Signal(bool)
+    disconnect_requested = Signal()
 
-    def __init__(
-        self,
-        on_mouse_event: Callable | None = None,
-        on_key_event: Callable | None = None,
-        on_caps_sync: Callable | None = None,
-        on_disconnect: Callable | None = None,
-        on_mic_toggle: Callable | None = None,
-        on_camera_toggle: Callable | None = None,
-        parent: QWidget | None = None,
-    ) -> None:
+    def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle(self.WINDOW_TITLE)
         self.setMinimumSize(self.MIN_WIDTH, self.MIN_HEIGHT)
         self.resize(1280, 720)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
-
-        self._on_disconnect_cb = on_disconnect
 
         # ── Central viewer ──
         self._viewer = RemoteViewer(self)
@@ -1044,27 +1103,28 @@ class ViewerWindow(QMainWindow):
 
         # ── Toolbar ──
         self._toolbar = ViewerToolbar(self)
-        self._toolbar.fullscreen_requested.connect(self._toggle_fullscreen)
+        self._toolbar.fullscreen_requested.connect(self.toggle_fullscreen)
         self._toolbar.zoom_in_requested.connect(self._viewer.zoom_in)
         self._toolbar.zoom_out_requested.connect(self._viewer.zoom_out)
         self._toolbar.fit_requested.connect(self._viewer.zoom_to_fit)
         self._toolbar.sharp_toggled.connect(self._viewer.set_sharp_text)
-        self._toolbar.mic_toggled.connect(self._on_mic_toggled)
-        self._toolbar.camera_toggled.connect(self._on_camera_toggled)
+        self._toolbar.mic_toggled.connect(self.mic_toggled)
+        self._toolbar.camera_toggled.connect(self.camera_toggled)
         self._toolbar.ctrl_alt_del_requested.connect(self._on_ctrl_alt_del)
-        self._toolbar.disconnect_requested.connect(self._on_disconnect_clicked)
+        self._toolbar.disconnect_requested.connect(self.disconnect_requested)
         self._toolbar.chat_requested.connect(self.chat_requested)
         self._toolbar.files_requested.connect(self.files_requested)
         self._toolbar.record_toggled.connect(self._on_record_toggled)
 
         # ── Registrazione sessione (opt-in) ──
         self._recorder: ScreenRecorder | None = None
+        self._rec_worker: _RecordingWorker | None = None
         self._rec_timer = QTimer(self)
         self._rec_timer.setInterval(_RECORD_INTERVAL_MS)
         self._rec_timer.timeout.connect(self._write_recording_frame)
         self.addToolBar(self._toolbar)
         # Sync viewer with the toolbar default (sharp text on)
-        self._viewer.set_sharp_text(self._toolbar._sharp_act.isChecked())
+        self._viewer.set_sharp_text(self._toolbar.is_sharp_text_enabled())
 
         # ── Status bar ──
         self._status = QStatusBar(self)
@@ -1072,18 +1132,16 @@ class ViewerWindow(QMainWindow):
         self._status.addWidget(self._status_label)
         self.setStatusBar(self._status)
 
-        # Connect external callbacks
-        self._on_mic_toggle_cb = on_mic_toggle
-        self._on_camera_toggle_cb = on_camera_toggle
-
-        # ── Connect signals → callbacks ──
-        if on_mouse_event:
-            self._viewer.remote_mouse_event.connect(on_mouse_event)
-        if on_key_event:
-            self._viewer.remote_key_event.connect(on_key_event)
-        if on_caps_sync:
-            self._viewer.caps_lock_sync.connect(on_caps_sync)
+        # ── Viewer events → own signals ──
+        self._viewer.remote_mouse_event.connect(self.mouse_event)
+        self._viewer.remote_key_event.connect(self.key_event)
+        self._viewer.caps_lock_sync.connect(self.caps_lock_sync)
         self._viewer.frame_timeout.connect(self._on_frame_timeout)
+
+        # Finalizza il file di registrazione se l'app si chiude durante la cattura
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self.stop_recording)
 
     # ── public API ──────────────────────────────────────────────────
 
@@ -1126,7 +1184,7 @@ class ViewerWindow(QMainWindow):
 
     def set_sharp_text(self, enabled: bool) -> None:
         """Toggle sharp text mode in the viewer."""
-        self._toolbar._sharp_act.setChecked(enabled)
+        self._toolbar.set_sharp_text_checked(enabled)
         self._viewer.set_sharp_text(enabled)
 
     def set_mic_checked(self, checked: bool) -> None:
@@ -1139,7 +1197,7 @@ class ViewerWindow(QMainWindow):
 
     # ── slots ───────────────────────────────────────────────────────
 
-    def _toggle_fullscreen(self) -> None:
+    def toggle_fullscreen(self) -> None:
         """Toggle fullscreen on this window."""
         if self.isFullScreen():
             self.showNormal()
@@ -1149,16 +1207,6 @@ class ViewerWindow(QMainWindow):
             self.showFullScreen()
             self._toolbar.hide()
             self._status.hide()
-
-    def _on_mic_toggled(self, checked: bool) -> None:
-        """Forward mic toggle to external callback."""
-        if self._on_mic_toggle_cb:
-            self._on_mic_toggle_cb(checked)
-
-    def _on_camera_toggled(self, checked: bool) -> None:
-        """Forward camera toggle to external callback."""
-        if self._on_camera_toggle_cb:
-            self._on_camera_toggle_cb(checked)
 
     # ── registrazione ───────────────────────────────────────────────
 
@@ -1176,11 +1224,15 @@ class ViewerWindow(QMainWindow):
                 height=image.height(),
                 fps=1000 // _RECORD_INTERVAL_MS,
             )
+            self._rec_worker = _RecordingWorker(self._recorder)
             self._rec_timer.start()
             self._status_label.setText(f"Recording → {path}")
             logger.info("Registrazione avviata: %s", path)
         else:
             self._rec_timer.stop()
+            if self._rec_worker is not None:
+                self._rec_worker.stop()
+                self._rec_worker = None
             if self._recorder is not None:
                 status = self._recorder.stop()
                 self._status_label.setText(
@@ -1192,23 +1244,14 @@ class ViewerWindow(QMainWindow):
             self._toolbar.set_recording(False)
 
     def _write_recording_frame(self) -> None:
-        """Copia il frame compositato corrente nel file di registrazione."""
-        if self._recorder is None:
+        """Accoda il frame compositato corrente al worker di registrazione."""
+        if self._rec_worker is None:
             return
         image = self._viewer.current_frame_image()
         if image is None:
             return
-        width, height = image.width(), image.height()
-        try:
-            raw = np.frombuffer(image.constBits(), dtype=np.uint8)
-            frame = raw.reshape(height, image.bytesPerLine())[:, : width * 3].reshape(
-                height, width, 3
-            )
-        except (ValueError, BufferError) as e:
-            logger.debug("Registrazione: frame non convertibile: %s", e)
-            return
-        if not self._recorder.write_frame(frame):
-            logger.debug("Registrazione: frame scartato")
+        # ``copy()``: il worker legge il buffer da un altro thread.
+        self._rec_worker.submit(image.copy())
 
     def _on_ctrl_alt_del(self) -> None:
         """Send Ctrl+Alt+Del to the remote peer."""
@@ -1224,14 +1267,14 @@ class ViewerWindow(QMainWindow):
             ]:
                 self._viewer.remote_key_event.emit(key, pressed)
 
-    def _on_disconnect_clicked(self) -> None:
-        """User clicked disconnect."""
-        if self._on_disconnect_cb:
-            self._on_disconnect_cb()
+    @Slot()
+    def stop_recording(self) -> None:
+        """Ferma e finalizza la registrazione, se attiva."""
+        if self._recorder is not None:
+            self._on_record_toggled(False)
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        """If user closes the window, trigger disconnect."""
-        if self._on_disconnect_cb:
-            self._on_disconnect_cb()
-        self.hide()
-        event.ignore()
+        """If user closes the window, request a disconnect."""
+        self.stop_recording()
+        self.disconnect_requested.emit()
+        event.accept()

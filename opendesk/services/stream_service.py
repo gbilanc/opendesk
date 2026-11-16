@@ -407,7 +407,7 @@ class StreamService(QObject):
             # Avvia cattura audio se abilitata (non blocca la pipeline in caso di errore)
             if self._audio_enabled:
                 try:
-                    self._start_audio_capture()
+                    self.start_audio_capture()
                 except Exception as e:
                     logger.warning("Failed to start audio capture: %s", e)
                     self._audio_enabled = False
@@ -415,7 +415,7 @@ class StreamService(QObject):
             # Avvia cattura webcam se abilitata (non blocca la pipeline in caso di errore)
             if self._camera_enabled:
                 try:
-                    self._start_camera_capture()
+                    self.start_camera_capture()
                 except Exception as e:
                     logger.warning("Failed to start camera capture: %s", e)
                     self._camera_enabled = False
@@ -444,8 +444,8 @@ class StreamService(QObject):
         thread di background dedicato.
         """
         self._bw_timer.stop()
-        self._stop_audio_capture()
-        self._stop_camera_capture()
+        self.stop_audio_capture()
+        self.stop_camera_capture()
         # Ferma il worker di input PRIMA di rilasciare il backend.
         if self._input_worker is not None:
             self._input_worker.stop()
@@ -479,7 +479,7 @@ class StreamService(QObject):
 
     # ── audio capture (host side) ─────────────────────────────────────
 
-    def _start_audio_capture(self) -> None:
+    def start_audio_capture(self) -> None:
         """Avvia la cattura del microfono in un thread separato."""
         manager = self.audio_manager  # lazy instantiation
         if manager.is_capturing:
@@ -489,7 +489,7 @@ class StreamService(QObject):
         # start_capture può lanciare eccezioni (es. codec Opus non disponibile)
         manager.start_capture(self._relay.send_message)
 
-    def _stop_audio_capture(self) -> None:
+    def stop_audio_capture(self) -> None:
         """Ferma la cattura del microfono."""
         try:
             if self._audio_manager is not None:
@@ -507,7 +507,7 @@ class StreamService(QObject):
 
     # ── camera capture (host side) ─────────────────────────────────────
 
-    def _start_camera_capture(self) -> None:
+    def start_camera_capture(self) -> None:
         """Avvia la cattura della webcam in un thread separato."""
         manager = self.camera_manager  # lazy instantiation
         if manager.is_capturing:
@@ -515,7 +515,7 @@ class StreamService(QObject):
             return
         manager.start_capture(self._relay.send_message)
 
-    def _stop_camera_capture(self) -> None:
+    def stop_camera_capture(self) -> None:
         """Ferma la cattura della webcam."""
         try:
             if self._camera_manager is not None:

@@ -8,6 +8,7 @@ import logging
 import time
 
 from PySide6.QtCore import Qt, Signal, Slot
+from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
@@ -92,21 +93,29 @@ class ChatPanel(QDialog):
             cursor.movePosition(cursor.MoveOperation.Down, cursor.MoveMode.KeepAnchor, 3)
             cursor.removeSelectedText()
 
+        # Colori dal palette attivo: seguono tema chiaro/scuro.
+        pal = self.palette()
+        accent = pal.color(QPalette.ColorRole.Link).name()
+        muted = pal.color(QPalette.ColorRole.PlaceholderText).name()
+        sender_color = accent if is_remote else pal.color(QPalette.ColorRole.Highlight).name()
+
         # Style differently for local vs remote
         if is_remote:
             html = (
                 f'<div style="margin-bottom: 6px;">'
-                f'<span style="color: #2563eb; font-weight: 600;">{sender}</span> '
-                f'<span style="color: #94a3b8; font-size: 11px;">{timestamp}</span><br>'
-                f'<span style="color: #0f172a;">{self._escape(text)}</span>'
+                f'<span style="color: {sender_color}; font-weight: 600;">'
+                f"{self._escape(sender)}</span> "
+                f'<span style="color: {muted}; font-size: 11px;">{timestamp}</span><br>'
+                f"<span>{self._escape(text)}</span>"
                 f"</div>"
             )
         else:
             html = (
                 f'<div style="margin-bottom: 6px; text-align: right;">'
-                f'<span style="color: #64748b; font-size: 11px;">{timestamp}</span> '
-                f'<span style="color: #059669; font-weight: 600;">{sender}</span><br>'
-                f'<span style="color: #0f172a;">{self._escape(text)}</span>'
+                f'<span style="color: {muted}; font-size: 11px;">{timestamp}</span> '
+                f'<span style="color: {sender_color}; font-weight: 600;">'
+                f"{self._escape(sender)}</span><br>"
+                f"<span>{self._escape(text)}</span>"
                 f"</div>"
             )
 

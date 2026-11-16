@@ -513,3 +513,43 @@ QPushButton[class="pill"]:hover {
     background: #e2e8f0;
     color: #0f172a;
 }
+
+/* ── Toast notifications ── */
+ToastNotification {
+    border-radius: 8px;
+    border: 1px solid transparent;
+}
+ToastNotification[toastType="success"] { background-color: #d1fae5; border-color: #a7f3d0; }
+ToastNotification[toastType="error"]   { background-color: #fee2e2; border-color: #fecaca; }
+ToastNotification[toastType="warning"] { background-color: #fef3c7; border-color: #fde68a; }
+ToastNotification[toastType="info"]    { background-color: #dbeafe; border-color: #bfdbfe; }
+QLabel#ToastIcon { font-size: 16px; background: transparent; }
+QLabel#ToastMessage { font-size: 13px; font-weight: 500; background: transparent; }
+ToastNotification[toastType="success"] QLabel#ToastMessage { color: #065f46; }
+ToastNotification[toastType="error"] QLabel#ToastMessage   { color: #991b1b; }
+ToastNotification[toastType="warning"] QLabel#ToastMessage { color: #92400e; }
+ToastNotification[toastType="info"] QLabel#ToastMessage    { color: #1e40af; }
+
+/* ── Empty state ── */
+EmptyStateWidget { background: transparent; }
+QLabel#EmptyStateIcon { font-size: 42px; background: transparent; }
+QLabel#EmptyStateTitle {
+    font-size: 16px;
+    font-weight: 600;
+    color: #0f172a;
+    background: transparent;
+}
+QLabel#EmptyStateDescription {
+    font-size: 13px;
+    color: #64748b;
+    background: transparent;
+}
+
+/* ── Health summary popup ── */
+HealthSummaryDialog {
+    background-color: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    padding: 12px;
+}
+HealthSummaryDialog QLabel { color: #0f172a; font-size: 12px; }

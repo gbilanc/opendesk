@@ -4,8 +4,15 @@ from __future__ import annotations
 
 from enum import Enum
 
-from PySide6.QtCore import Property, QEasingCurve, QPropertyAnimation, QTimer
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QSizePolicy, QWidget
+from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QTimer
+from PySide6.QtWidgets import (
+    QFrame,
+    QGraphicsOpacityEffect,
+    QHBoxLayout,
+    QLabel,
+    QSizePolicy,
+    QWidget,
+)
 
 
 class ToastNotification(QFrame):
@@ -18,15 +25,13 @@ class ToastNotification(QFrame):
     """
 
     class Type(Enum):
-        SUCCESS = ("✅", "#d1fae5", "#065f46")
-        ERROR = ("❌", "#fee2e2", "#991b1b")
-        WARNING = ("⚠️", "#fef3c7", "#92400e")
-        INFO = ("ℹ️", "#dbeafe", "#1e40af")
+        SUCCESS = "✅"
+        ERROR = "❌"
+        WARNING = "⚠️"
+        INFO = "ℹ️"
 
-        def __init__(self, icon: str, bg: str, fg: str) -> None:
+        def __init__(self, icon: str) -> None:
             self.icon = icon
-            self.bg = bg
-            self.fg = fg
 
     def __init__(
         self,
@@ -37,33 +42,27 @@ class ToastNotification(QFrame):
     ) -> None:
         super().__init__(parent)
         self._duration_ms = duration_ms
-        self._opacity = 0.0
 
         self.setFixedHeight(44)
         self.setMinimumWidth(260)
         self.setMaximumWidth(420)
         self.setSizePolicy(QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Fixed)
 
-        self.setStyleSheet(
-            f"ToastNotification {{"
-            f"  background-color: {toast_type.bg};"
-            f"  border: 1px solid {toast_type.bg};"
-            f"  border-radius: 8px;"
-            f"}}"
-        )
+        # Stile da QSS (opendesk.qss / dark.qss) via objectName + property,
+        # così il toast segue il tema attivo.
+        self.setObjectName("ToastNotification")
+        self.setProperty("toastType", toast_type.name.lower())
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(14, 10, 14, 10)
         layout.setSpacing(10)
 
         icon_lbl = QLabel(toast_type.icon)
-        icon_lbl.setStyleSheet("font-size: 16px; background: transparent;")
+        icon_lbl.setObjectName("ToastIcon")
         layout.addWidget(icon_lbl)
 
         msg_lbl = QLabel(message)
-        msg_lbl.setStyleSheet(
-            f"color: {toast_type.fg}; font-size: 13px; font-weight: 500; background: transparent;"
-        )
+        msg_lbl.setObjectName("ToastMessage")
         msg_lbl.setWordWrap(True)
         layout.addWidget(msg_lbl, 1)
 
@@ -72,7 +71,13 @@ class ToastNotification(QFrame):
         self._position()
 
         # ── Fade in/out animations ──
-        self._anim_in = QPropertyAnimation(self, b"windowOpacity")
+        # ``windowOpacity`` funziona solo sulle finestre top-level: per un
+        # widget figlio serve un QGraphicsOpacityEffect.
+        self._opacity_effect = QGraphicsOpacityEffect(self)
+        self._opacity_effect.setOpacity(0.0)
+        self.setGraphicsEffect(self._opacity_effect)
+
+        self._anim_in = QPropertyAnimation(self._opacity_effect, b"opacity")
         self._anim_in.setDuration(250)
         self._anim_in.setStartValue(0.0)
         self._anim_in.setEndValue(1.0)
@@ -82,23 +87,12 @@ class ToastNotification(QFrame):
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._fade_out)
 
-        self._anim_out = QPropertyAnimation(self, b"windowOpacity")
+        self._anim_out = QPropertyAnimation(self._opacity_effect, b"opacity")
         self._anim_out.setDuration(250)
         self._anim_out.setStartValue(1.0)
         self._anim_out.setEndValue(0.0)
         self._anim_out.setEasingCurve(QEasingCurve.Type.InCubic)
         self._anim_out.finished.connect(self.deleteLater)
-
-    # ── windowOpacity property for animation ────────────────────────
-
-    def get_window_opacity(self) -> float:
-        return self._opacity
-
-    def set_window_opacity(self, value: float) -> None:
-        self._opacity = value
-        self.setWindowOpacity(value)
-
-    windowOpacity = Property(float, get_window_opacity, set_window_opacity)  # type: ignore[assignment]  # noqa: N815
 
     # ── public API ──────────────────────────────────────────────────
 

@@ -877,7 +877,7 @@ class HostWindow(QMainWindow):
         if hasattr(self, "_health_widget"):
             from PySide6.QtWidgets import QMessageBox
 
-            def show_health(event):
+            def show_health() -> None:
                 cfg = get_platform_config()
                 issues = cfg.check_health()
                 msg = f"<b>Piattaforma: {cfg.display_name}</b><br><br>"
@@ -896,7 +896,7 @@ class HostWindow(QMainWindow):
                         msg += "<br>"
                 QMessageBox.information(self, "Stato piattaforma", msg)
 
-            self._health_widget.mousePressEvent = show_health  # type: ignore[assignment]
+            self._health_widget.clicked.connect(show_health)
         svc = self._service
         svc.status_changed.connect(self._on_status_changed)
         svc.device_info_changed.connect(self._on_device_info_changed)

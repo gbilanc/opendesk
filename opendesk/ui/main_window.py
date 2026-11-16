@@ -117,9 +117,9 @@ class MainWindow(QMainWindow):
         self._file_transfer_send_fn = None  # set after connection
 
         # Poll the file-transfer updates queue from the background thread
+        # (only while a session is active — see ``_set_connected``)
         self._ft_update_timer = QTimer(self)
         self._ft_update_timer.timeout.connect(self._poll_file_transfer_updates)
-        self._ft_update_timer.start(200)
 
         # Clipboard sync (instantiated but only started when enabled in settings)
         self._clipboard_sync = ClipboardSync(self)
@@ -307,7 +307,7 @@ class MainWindow(QMainWindow):
     def _on_exit_fullscreen_in_viewer(self) -> None:
         """Exit fullscreen in the viewer window if it's active."""
         if self._viewer_window and self._viewer_window.isFullScreen():
-            self._viewer_window._toggle_fullscreen()
+            self._viewer_window.toggle_fullscreen()
 
     # ── Platform health ────────────────────────────────────────────
 
@@ -372,7 +372,7 @@ class MainWindow(QMainWindow):
 
         self._health_widget = HealthStatusWidget(self)
         self._health_widget.setToolTip("Stato piattaforma — click per dettagli")
-        self._health_widget.mousePressEvent = lambda e: self._show_health_details()  # type: ignore[assignment]
+        self._health_widget.clicked.connect(self._show_health_details)
         status.addPermanentWidget(self._health_widget)
 
         self._session_status = SessionStatusWidget()
@@ -615,10 +615,10 @@ class MainWindow(QMainWindow):
         # Only stop our own streaming if we're hosting (not when we're a
         # client viewing a remote desktop — the remote host's stream is
         # not ours to stop).
-        if self._connection.role == RelayRole.CLIENT:
-            self._status_text.setText("⚠ No video frames — connection may be stalled")
-        else:
-            self._status_text.setText("⚠ No video frames — connection may be stalled")
+        self._status_text.setText("⚠ No video frames — connection may be stalled")
+        # Only stop our own streaming if we're hosting: when we're a client
+        # viewing a remote desktop, the remote host's stream is not ours.
+        if self._connection.role != RelayRole.CLIENT:
             self._stop_streaming()
 
     @Slot(str)
@@ -761,17 +761,15 @@ class MainWindow(QMainWindow):
     def _show_viewer_window(self, peer_name: str = "") -> None:
         """Create and show the remote viewer window."""
         if self._viewer_window is None:
-            self._viewer_window = ViewerWindow(
-                on_mouse_event=self._on_remote_mouse_event,
-                on_key_event=self._on_remote_key_event,
-                on_caps_sync=self._on_remote_caps_sync,
-                on_disconnect=self._on_disconnect,
-                on_mic_toggle=self._on_toggle_mic,
-                on_camera_toggle=self._on_toggle_camera,
-                # No parent: keeps the viewer open (and independent) when the
-                # main window is minimised or restored.
-                parent=None,
-            )
+            # No parent: keeps the viewer open (and independent) when the
+            # main window is minimised or restored.
+            self._viewer_window = ViewerWindow(parent=None)
+            self._viewer_window.mouse_event.connect(self._on_remote_mouse_event)
+            self._viewer_window.key_event.connect(self._on_remote_key_event)
+            self._viewer_window.caps_lock_sync.connect(self._on_remote_caps_sync)
+            self._viewer_window.disconnect_requested.connect(self._on_disconnect)
+            self._viewer_window.mic_toggled.connect(self._on_toggle_mic)
+            self._viewer_window.camera_toggled.connect(self._on_toggle_camera)
             self._viewer_window.frame_timeout.connect(self._on_frame_timeout)
             self._viewer_window.chat_requested.connect(self._on_chat_toggled)
             self._viewer_window.files_requested.connect(self._show_file_transfer_dock)
@@ -804,6 +802,7 @@ class MainWindow(QMainWindow):
         """
         logger.info("Host streaming: auth succeeded, client connected")
         self._connected = True
+        self._ft_update_timer.start(200)
         self.act_disconnect.setEnabled(True)
         self._session_status.set_status(
             "Streaming to client",
@@ -824,11 +823,11 @@ class MainWindow(QMainWindow):
         """Toggle microphone streaming on/off."""
         self._stream.audio_enabled = checked
         if checked:
-            self._stream._start_audio_capture()
+            self._stream.start_audio_capture()
             self._mic_indicator.setText("Mic On")
             self._set_status_state(self._mic_indicator, True)
         else:
-            self._stream._stop_audio_capture()
+            self._stream.stop_audio_capture()
             self._mic_indicator.setText("Mic Off")
             self._set_status_state(self._mic_indicator, False)
         self._mic_indicator.setVisible(True)
@@ -844,11 +843,11 @@ class MainWindow(QMainWindow):
         self._stream.camera_enabled = checked
         # Update indicator
         if checked:
-            self._stream._start_camera_capture()
+            self._stream.start_camera_capture()
             self._camera_indicator.setText("Cam On")
             self._set_status_state(self._camera_indicator, True)
         else:
-            self._stream._stop_camera_capture()
+            self._stream.stop_camera_capture()
             self._camera_indicator.setText("Cam Off")
             self._set_status_state(self._camera_indicator, False)
 
@@ -980,7 +979,7 @@ class MainWindow(QMainWindow):
     def _on_toggle_fullscreen(self) -> None:
         """Toggle fullscreen mode on the viewer window."""
         if self._viewer_window:
-            self._viewer_window._toggle_fullscreen()
+            self._viewer_window.toggle_fullscreen()
 
     @Slot()
     def _on_fit_view(self) -> None:
@@ -1221,6 +1220,12 @@ class MainWindow(QMainWindow):
             Pass ``False`` for file-transfer-only connections.
         """
         self._connected = connected
+
+        # Poll file-transfer UI updates only while a session is active
+        if connected:
+            self._ft_update_timer.start(200)
+        else:
+            self._ft_update_timer.stop()
 
         # Enable/disable actions
         self.act_disconnect.setEnabled(connected)
