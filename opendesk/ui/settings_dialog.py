@@ -63,8 +63,15 @@ class SettingsDialog(QDialog):
 
         self._plat_cfg = get_platform_config()
 
+        # Device della webcam richiesto: la combo può non contenerlo finché
+        # l'enumerazione asincrona non è finita.
+        self._camera_device_wanted = cast(int, self._settings.value("camera/device", 0, type=int))
+
         self._setup_ui()
         self._load_settings()
+        # Enumerazione webcam dopo aver mostrato la finestra: cv2 impiega
+        # ~10 s e bloccherebbe l'apertura del dialog.
+        self._populate_camera_devices()
 
     # ── UI setup ────────────────────────────────────────────────────
 
@@ -346,7 +353,6 @@ class SettingsDialog(QDialog):
 
         self._camera_device_combo = QComboBox()
         self._camera_device_combo.addItem("Default camera", 0)
-        self._populate_camera_devices()
         camera_form.addRow("Device:", self._camera_device_combo)
 
         self._camera_quality_combo = QComboBox()
@@ -524,7 +530,7 @@ class SettingsDialog(QDialog):
         self._enable_camera.setChecked(
             cast(bool, self._settings.value("camera/enabled", False, type=bool))
         )
-        camera_device = cast(int, self._settings.value("camera/device", 0, type=int))
+        camera_device = self._camera_device_wanted
         cam_idx = self._camera_device_combo.findData(camera_device)
         if cam_idx >= 0:
             self._camera_device_combo.setCurrentIndex(cam_idx)
@@ -547,19 +553,33 @@ class SettingsDialog(QDialog):
             self._unattended_list.addItem(peer_id)
 
     def _populate_camera_devices(self) -> None:
-        """Populate the camera device combo with detected cameras."""
-        try:
-            from opendesk.core.camera_manager import list_cameras
+        """Enumera le webcam su un thread separato.
 
-            cameras = list_cameras()
-            # Keep default entry at index 0
-            for i, cam in enumerate(cameras):
+        ``list_cameras`` apre ogni device con ``cv2.VideoCapture`` in modo
+        sincrono: su Windows sono diversi secondi, e l'apertura del dialog
+        resta bloccata con la finestra già visibile (hang_watchdog: UI
+        ferma >8 s). La combo viene popolata quando il thread ha finito.
+        """
+        from opendesk.core.camera_manager import list_cameras
+        from opendesk.utils.async_task import run_async
+
+        run_async(
+            list_cameras,
+            self._on_cameras_found,
+            parent=self,
+            on_error=lambda msg: logger.debug("Could not enumerate cameras: %s", msg),
+        )
+
+    def _on_cameras_found(self, cameras: list[dict]) -> None:
+        """Popola la combo dei device e ripristina la selezione salvata."""
+        for cam in cameras:
+            if self._camera_device_combo.findData(cam["index"]) < 0:
                 label = f"{cam['name']} (dev {cam['index']})"
-                existing = self._camera_device_combo.findData(cam["index"])
-                if existing < 0:
-                    self._camera_device_combo.addItem(label, cam["index"])
-        except Exception as e:
-            logger.debug("Could not enumerate cameras: %s", e)
+                self._camera_device_combo.addItem(label, cam["index"])
+        wanted = self._camera_device_wanted
+        idx = self._camera_device_combo.findData(wanted)
+        if idx >= 0:
+            self._camera_device_combo.setCurrentIndex(idx)
 
     def _populate_trusted_devices(self) -> None:
         """Populate the list of pre-authorized devices."""
