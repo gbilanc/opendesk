@@ -307,13 +307,23 @@ class PlatformConfig:
             "xtst (x11-utils / libxtst-dev)",
         ]
 
-        # Capture: MSS via X11 (always works on X11)
+        # Capture: MSS via X11 (sempre disponibile; su Linux mss usa
+        # XShmGetImage con fallback a XGetImage, quindi già memoria
+        # condivisa = una sola copia lato client X).
         self.capture_method = CaptureMethod.MSS
         self.capture_methods_available = [CaptureMethod.MSS]
 
-        # If pipewire is also available (unlikely on pure X11, but possible),
-        # offer it as an alternative
-        if _check_pipewire_element():
+        # Screencast via portal (funziona anche su X11): è l'unico path che
+        # consente l'encoding dentro l'helper PipeWire, cioè zero-copy
+        # GPU→encoder (stesso codice di Wayland).  Resta selezionabile
+        # dall'utente (``video/capture_method``), non è il default: il
+        # portal chiede il permesso di condivisione a ogni sessione, mentre
+        # MSS su X11 non chiede nulla.
+        self.has_pipewire = _check_pipewire_element()
+        self.has_portal = self.has_pipewire and _check_portal_available()
+        if self.has_portal:
+            self.capture_methods_available += [CaptureMethod.PORTAL, CaptureMethod.PIPEWIRE]
+        elif self.has_pipewire:
             self.capture_methods_available.append(CaptureMethod.PIPEWIRE)
 
         self.input_backend_name = "X11InputBackend (python-xlib + XTest)"

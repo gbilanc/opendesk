@@ -112,6 +112,17 @@ class SettingsDialog(QDialog):
         self._adaptive_fps.setChecked(True)
         video_layout.addRow("", self._adaptive_fps)
 
+        # Encoding dentro l'helper PipeWire (solo screencast portal): il
+        # frame non torna in CPU.  Disattivato se l'encoder HW/SW richiesto
+        # non è disponibile (fallback automatico al path tile + encoder).
+        self._preencoded = QCheckBox("Encode in the capture helper (zero-copy, portal only)")
+        self._preencoded.setToolTip(
+            "Wayland/X11 screencast only: H.264 is encoded by the GStreamer helper "
+            "(VA-API when available), so raw frames never reach the CPU. "
+            "Falls back automatically to tile diffs if no encoder is available."
+        )
+        video_layout.addRow("", self._preencoded)
+
         # ── Pixel format ──
         self._pixel_format = QComboBox()
         self._pixel_format.addItem("Full color (yuv444p — sharp text, more bandwidth)", "yuv444p")
@@ -457,6 +468,9 @@ class SettingsDialog(QDialog):
         self._adaptive_fps.setChecked(
             cast(bool, self._settings.value("video/adaptive_fps", True, type=bool))
         )
+        self._preencoded.setChecked(
+            cast(bool, self._settings.value("video/preencoded_capture", False, type=bool))
+        )
 
         codec = cast(str, self._settings.value("video/codec", "", type=str))
         codec_idx = self._codec_combo.findData(codec)
@@ -758,6 +772,7 @@ class SettingsDialog(QDialog):
         )
         self._settings.setValue("video/max_fps", self._fps_spin.value())
         self._settings.setValue("video/adaptive_fps", self._adaptive_fps.isChecked())
+        self._settings.setValue("video/preencoded_capture", self._preencoded.isChecked())
         self._settings.setValue(
             "video/codec",
             self._codec_combo.currentData(),

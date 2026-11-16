@@ -162,6 +162,9 @@ class PipeWireCapture:
         self._header_ready: bool | None = None
         self._start_ts: float = 0.0
         self._pipewire_selected: bool = False  # true after first attempt
+        # Buffer frame (bytearray preallocato) e offset di riempimento.
+        self._frame_buf: bytearray | bytes = b""
+        self._frame_fill: int = 0
 
     # ── availability ────────────────────────────────────────────────
 
@@ -299,28 +302,27 @@ class PipeWireCapture:
             self.release()
             return None
 
-        # Lazy init frame buffer
-        if not hasattr(self, "_frame_buf"):
-            self._frame_buf = b""
-
+        # Buffer preallocato + ``readinto``: su una pipe il kernel consegna
+        # al massimo ~64 KB per ``read()``, quindi un frame 1080p arriva in
+        # ~100 pezzi e ogni ``bytes += chunk`` ricopia tutto l'accumulato
+        # (≈300 MB di memcpy per frame, 70 ms misurati su 6.2 MB/frame).
+        # Con ``readinto`` si scrive direttamente all'offset giusto: una
+        # sola allocazione per frame, nessuna copia di accumulo.
         frame_size = self._resolved_w * self._resolved_h * 3
-        needed = frame_size - len(self._frame_buf)
+        if len(self._frame_buf) != frame_size:
+            self._frame_buf = bytearray(frame_size)
+            self._frame_fill = 0
         try:
-            chunk = self._helper_process.stdout.read(needed)
+            n = self._helper_process.stdout.readinto(memoryview(self._frame_buf)[self._frame_fill :])
         except BlockingIOError:
             return None  # no data yet
-
-        if chunk:
-            self._frame_buf += chunk
-
-        if len(self._frame_buf) < frame_size:
+        if n:
+            self._frame_fill += n
+        if self._frame_fill < frame_size:
             return None  # still accumulating
+        self._frame_fill = 0
 
-        # Complete frame received
-        data = self._frame_buf[:frame_size]
-        self._frame_buf = self._frame_buf[frame_size:]  # keep overflow
-
-        rgb = np.frombuffer(data, dtype=np.uint8).reshape(
+        rgb = np.frombuffer(self._frame_buf, dtype=np.uint8).reshape(
             self._resolved_h,
             self._resolved_w,
             3,
@@ -479,6 +481,7 @@ class PipeWireCapture:
         self._pipewire_selected = False
         self._header_buf = b""
         self._frame_buf = b""
+        self._frame_fill = 0
         if self._helper_process:
             try:
                 self._helper_process.terminate()
@@ -522,12 +525,24 @@ class ScreenCapture:
     - **macOS** → MSS (via CoreGraphics)
     """
 
-    def __init__(self, method: CaptureMethod | None = None) -> None:
+    def __init__(
+        self,
+        method: CaptureMethod | None = None,
+        preencoded: bool = False,
+        preencoded_encoder: str = "auto",
+    ) -> None:
         self._method: CaptureMethod
         if method and method != CaptureMethod.AUTO:
             self._method = method
         else:
             self._method = get_platform_config().capture_method
+        # True = chiedi al backend di consegnare H.264 già codificato
+        # (Wayland: encoding dentro l'helper PipeWire → il frame non torna
+        # in CPU).  Viene disattivato automaticamente se il backend non lo
+        # supporta o se fallisce, tornando al path frame+encoder locale.
+        self._preencoded = preencoded
+        self._preencoded_encoder = preencoded_encoder
+        self._preencoded_relog = False
         self._lock = Lock()
         self._sct: Any = None
         self._pw: PipeWireCapture | None = None
@@ -570,13 +585,77 @@ class ScreenCapture:
     def capture_method(self) -> CaptureMethod:
         return self._method
 
+    @property
+    def preencoded(self) -> bool:
+        """True se il backend sta consegnando pacchetti H.264 pre-codificati."""
+        return self._preencoded
+
+    def _disable_preencoded(self, reason: str) -> None:
+        """Disattiva la modalità pre-encoded e degrada al path frame+encoder."""
+        if not self._preencoded_relog:
+            logger.warning("Pre-encoded capture disattivata: %s", reason)
+            self._preencoded_relog = True
+        self._preencoded = False
+
+    def capture_packet(self, monitor_index: int = 0) -> Any | None:
+        """Cattura un pacchetto H.264 già codificato (modalità pre-encoded).
+
+        Ritorna un ``EncodedPacket`` o ``None`` quando non c'è un pacchetto
+        pronto (schermo fermo).  Se la modalità non è supportata o il
+        backend fallisce, disattiva ``preencoded`` e ritorna ``None``: il
+        chiamante prosegue con ``capture_one()``.
+        """
+        if not self._preencoded:
+            return None
+        if self._method != CaptureMethod.PORTAL:
+            self._disable_preencoded(f"backend {self._method.name} non lo supporta")
+            return None
+        try:
+            wsc = self._get_portal()
+        except Exception as e:
+            self._disable_preencoded(f"portal non disponibile ({e})")
+            return None
+
+        packet = wsc.capture_packet_sync()
+        if packet is None:
+            if not wsc.helper_alive:
+                self._disable_preencoded("helper PipeWire terminato")
+                self._release_portal()
+            return None
+        data, is_key = packet
+        from opendesk.core.video_codec import EncodedPacket
+
+        return EncodedPacket(
+            data=data,
+            pts=int(time.time() * 1000),
+            is_keyframe=is_key,
+            width=wsc.width,
+            height=wsc.height,
+        )
+
     # ── monitors ────────────────────────────────────────────────────
 
     def monitors(self) -> list[MonitorInfo]:
         if self._method == CaptureMethod.PIPEWIRE:
             return self._get_pw().monitors()
         if self._method == CaptureMethod.PORTAL:
-            # PORTAL captures full desktop — single virtual monitor
+            # Se la sessione portal è già attiva, la verità è la geometria
+            # dello stream: ``pipewiresrc`` può consegnare una risoluzione
+            # diversa da quella enumerata da mss (XWayland), e una region
+            # sbagliata disallinea dirty-region e cursore lato client.
+            portal = self._portal
+            if portal is not None and getattr(portal, "width", 0) > 0:
+                return [
+                    MonitorInfo(
+                        index=0,
+                        name="Wayland Desktop",
+                        left=0,
+                        top=0,
+                        width=portal.width,
+                        height=portal.height,
+                        is_primary=True,
+                    )
+                ]
             pw = self._get_pw()
             return (
                 pw.monitors()
@@ -758,7 +837,11 @@ class ScreenCapture:
                     return None
             return None
 
-        rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
+        # dxcam consegna già un ndarray uint8 contiguo: la conversione
+        # forzata costava una copia full-frame (~6 MB a 1080p) per frame.
+        # Si converte solo se il backend cambia forma/dtype.
+        if rgb.dtype != np.uint8 or not rgb.flags["C_CONTIGUOUS"]:
+            rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
         rgb = draw_cursor_on_frame(rgb, region)
         state = _cursor_state()
         self._last_cursor_gpos = state[0] if state is not None else None
@@ -786,7 +869,8 @@ class ScreenCapture:
                 # Nessun nuovo frame: breve sleep per non bruciare CPU/GPU.
                 time.sleep(0.005)
             else:
-                rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
+                if rgb.dtype != np.uint8 or not rgb.flags["C_CONTIGUOUS"]:
+                    rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
                 prev = self._prev_frames.get(monitor_index)
                 diff = frame_diff_ratio(rgb, prev, threshold=12)
                 self._prev_frames[monitor_index] = rgb
@@ -827,7 +911,8 @@ class ScreenCapture:
             mon = sct.monitors[monitor_index + 1]
             raw = sct.grab(mon)
             buf = np.frombuffer(raw.rgb, dtype=np.uint8).reshape(raw.height, raw.width, 3)
-            frame = np.ascontiguousarray(buf[:, :, :3])
+            # Copia necessaria: mss riusa il proprio buffer al grab successivo.
+            frame = buf[:, :, :3].copy()
             try:
                 frame = draw_cursor_on_frame(
                     frame, (mon["left"], mon["top"], mon["width"], mon["height"])
@@ -924,7 +1009,7 @@ class ScreenCapture:
 
         from opendesk.core.wayland_capture import WaylandScreenCast
 
-        wsc = WaylandScreenCast()
+        wsc = WaylandScreenCast(encoded=self._preencoded, encoder=self._preencoded_encoder)
         if not wsc.is_available():
             raise RuntimeError("WaylandScreenCast not available")
 
@@ -1267,11 +1352,14 @@ def draw_cursor_on_frame(rgb: np.ndarray, region: tuple[int, int, int, int]) -> 
         Il frame (stesso oggetto) con il cursore disegnato, se visibile
         e dentro il monitor; altrimenti invariato.
     """
-    if not rgb.flags.writeable:
-        rgb = rgb.copy()
+    # Lo stato del cursore si legge PRIMA di copiare: su Linux/macOS non
+    # c'è cursore da compositare e la copia del frame (necessaria solo per
+    # scrivere su un array read-only come quelli di mss) era sprecata.
     state = _cursor_state()
     if state is None:
         return rgb
+    if not rgb.flags.writeable:
+        rgb = rgb.copy()
     (gx, gy), hcursor = state
     left, top, width, height = region
     fx, fy = gx - left, gy - top

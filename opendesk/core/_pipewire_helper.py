@@ -16,6 +16,12 @@ Usage
     # Output: raw RGB24 frames (width * height * 3 bytes each),
     # preceded by a 4-byte little-endian width and height header
     # on the first frame only.
+
+    # Modalità codificata (--encode): il frame non lascia mai la GPU per
+    # arrivare in CPU come raw.  L'encoder (VA-API/HW quando disponibile)
+    # lavora sul DMA-BUF di PipeWire e sullo stdout passano solo pacchetti
+    # H.264 già compressi, con framing ``<u32 len><u8 flags><payload>``.
+    python3 _pipewire_helper.py --node-id 70 --encode auto
 """
 
 from __future__ import annotations
@@ -33,6 +39,27 @@ gi.require_version("GstApp", "1.0")
 from gi.repository import Gst  # noqa: E402
 
 Gst.init(sys.argv)  # noqa: E402
+
+# Magic del header in modalità codificata, seguito da <III: mode, width, height>.
+# In modalità raw il header resta il vecchio <II: width, height> (compatibile).
+_ENCODED_MAGIC = b"ODPK"
+_ENCODED_MODE = 1
+
+# Encoder H.264 preferiti, in ordine: HW (VA-API) → SW.
+_ENCODERS: dict[str, str] = {
+    "vah264enc": "key-int-max=60 rate-control=cbr target-usage=7",
+    "vaapih264enc": "keyframe-period=60",
+    "x264enc": "tune=zerolatency speed-preset=ultrafast key-int-max=60",
+}
+
+
+def _pick_encoder(requested: str) -> tuple[str, str] | None:
+    """Ritorna (elemento, opzioni) del primo encoder H.264 disponibile."""
+    candidates = [requested] if requested and requested != "auto" else list(_ENCODERS)
+    for name in candidates:
+        if Gst.ElementFactory.find(name) is not None:
+            return name, _ENCODERS.get(name, "")
+    return None
 
 
 def main() -> None:
@@ -53,6 +80,13 @@ def main() -> None:
         default=0,
         help="PipeWire node ID from portal Start() response (preferred)",
     )
+    parser.add_argument(
+        "--encode",
+        nargs="?",
+        const="auto",
+        default=None,
+        help="Codifica H.264 nell'helper (zero-copy GPU→encoder): 'auto' o nome elemento GStreamer",
+    )
     args = parser.parse_args()
 
     # Build pipeline
@@ -65,10 +99,27 @@ def main() -> None:
     elif args.fd and args.fd > 0:
         pipewire_extra = f" fd={args.fd}"
 
-    pipeline_str = f"pipewiresrc{pipewire_extra} ! videoconvert ! video/x-raw,format=RGB"
-    if args.width and args.height:
-        pipeline_str += f",width={args.width},height={args.height}"
-    pipeline_str += " ! appsink name=sink max-buffers=1 drop=true"
+    encoder: tuple[str, str] | None = None
+    if args.encode is not None:
+        encoder = _pick_encoder(args.encode)
+        if encoder is None:
+            print("ERROR: nessun encoder H.264 GStreamer disponibile", file=sys.stderr)
+            sys.exit(1)
+
+    if encoder is not None:
+        enc_name, enc_opts = encoder
+        print(f"INFO: encoding with {enc_name}", file=sys.stderr)
+        pipeline_str = (
+            f"pipewiresrc{pipewire_extra} ! videoconvert ! {enc_name}"
+            + (f" {enc_opts}" if enc_opts else "")
+            + " ! h264parse ! video/x-h264,stream-format=byte-stream,alignment=au"
+            " ! appsink name=sink max-buffers=1 drop=true sync=false"
+        )
+    else:
+        pipeline_str = f"pipewiresrc{pipewire_extra} ! videoconvert ! video/x-raw,format=RGB"
+        if args.width and args.height:
+            pipeline_str += f",width={args.width},height={args.height}"
+        pipeline_str += " ! appsink name=sink max-buffers=1 drop=true"
 
     pipeline = Gst.parse_launch(pipeline_str)
     sink = pipeline.get_by_name("sink")
@@ -129,11 +180,26 @@ def main() -> None:
         if not (success and success2):
             continue
 
-        # Extract raw RGB data
         result, map_info = buf.map(Gst.MapFlags.READ)
         if not result:
             continue
 
+        if encoder is not None:
+            # Modalità codificata: payload = access unit H.264 già compressa.
+            payload = bytes(map_info.data)
+            buf.unmap(map_info)
+            if not sent_header:
+                sys.stdout.buffer.write(
+                    _ENCODED_MAGIC + struct.pack("<III", _ENCODED_MODE, width, height)
+                )
+                sent_header = True
+            is_key = not buf.has_flags(Gst.BufferFlags.DELTA_UNIT)
+            sys.stdout.buffer.write(struct.pack("<IB", len(payload), 1 if is_key else 0))
+            sys.stdout.buffer.write(payload)
+            sys.stdout.buffer.flush()
+            continue
+
+        # Extract raw RGB data
         data = map_info.data  # bytes
         buf_size = len(data)
         expected_size = width * height * 3

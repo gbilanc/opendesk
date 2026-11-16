@@ -340,6 +340,15 @@ class StreamService(QObject):
         # FPS adattivo (schermo fermo → ~2 fps, keepalive tiene il flusso)
         adaptive_fps = cast(bool, self._settings.value("video/adaptive_fps", True, type=bool))
 
+        # Encoding dentro l'helper PipeWire (Wayland): H.264 già pronto,
+        # niente frame raw in CPU.  Disattivato di default, si attiva solo
+        # dove il backend lo supporta (fallback automatico se manca
+        # l'encoder GStreamer).
+        preencoded = cast(bool, self._settings.value("video/preencoded_capture", False, type=bool))
+        preencoded_encoder = cast(
+            str, self._settings.value("video/preencoded_encoder", "auto", type=str)
+        )
+
         return PipelineConfig(
             fps=fps,
             quality=quality,
@@ -351,6 +360,8 @@ class StreamService(QObject):
             pixel_format=pixel_format,
             encoder_preset=encoder_preset,
             adaptive_fps=adaptive_fps,
+            preencoded=preencoded,
+            preencoded_encoder=preencoded_encoder,
         )
 
     def start_streaming(self) -> None:

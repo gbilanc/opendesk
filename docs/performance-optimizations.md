@@ -115,6 +115,168 @@ direttamente con `np.frombuffer(buf).reshape(...)[:] = rgb_data`.
 | Priorità | Posizione | Nota |
 |---|---|---|
 | 🟠 | `ui/main_window.py`, `host_app.py` | La sessione iniziale all'avvio è ancora creata in modo sincrono (prima che la finestra sia mostrata): impatto ~47 ms, non percepito. |
-| 🟡 | `core/video_codec.py` `VideoDecoder.decode` | `frames[-1].to_rgb().to_ndarray()` crea un `VideoFrame` intermedio; `to_ndarray(format="rgb24")` risparmierebbe una conversione. |
+| 🟡 | `core/video_codec.py` `VideoDecoder.decode` | ~~`to_rgb().to_ndarray()` costa una conversione in più~~ → **misurato: non significativo** (0.53 vs 0.51 ms @720p, output identico). Nessun cambio. |
 | 🟡 | `core/screen_capture.py` `compute_dirty_region` | `np.argwhere` alloca un array per pixel cambiato; `cv2.boundingRect` sarebbe più efficiente (funzione attualmente non usata in hot-path). |
 | 🔵 | `ui/viewer.py` | ~~Il ring buffer copia ancora il frame~~ → **applicato nel Round 2 (#11)** |
+
+## Round 3 — verso lo zero-copy (buffer GPU)
+
+Obiettivo: non copiare il frame in RAM se il backend lo ha già in memoria
+GPU (DMA-BUF su PipeWire, texture D3D11 su DXGI).  Round 3 step 1 =
+baseline misurata, step 2+ = refactor (vedi piano).
+
+### Harness di misura
+
+`tools/measure_capture_encode.py` misura per stadio **wall time e CPU time**
+(`time.process_time`, tutti i thread), separando l'attesa bloccante su
+pipe/portal dal costo reale:
+
+```bash
+.venv/bin/python tools/measure_capture_encode.py --backend PORTAL --frames 30 --json out.json
+.venv/bin/python tools/measure_capture_encode.py --backend MSS/MSS/... --no-encode
+```
+
+Per l'host Windows il riferimento resta `tools/measure_cpu.py`
+(CPU% per thread di `opendesk-host`, scenario idle e attività).
+
+### Baseline misurata (Linux/Wayland, 1366x768, x86_64, nessun encoder HW)
+
+Schermo quasi statico, backend PORTAL (`wayland_capture.WaylandScreenCast`):
+
+| Stadio | wall mediana | CPU mediana |
+|---|---|---|
+| capture (pipe→numpy+copy) | 47.2 ms | **3.4 ms** |
+| diff + tile-detect (`_changed_mask` + `cv2.integral`) | 5.3 ms | **5.3 ms** |
+| JPEG tile cambiati (0 tile in idle) | 0.0 ms | 0.0 ms |
+| H.264 full frame (x264 veryfast, CRF 23) | 11.5 ms | **14.3 ms** |
+
+Il wall time della cattura è quasi tutto **attesa** sulla pipe GStreamer
+(fonte ~4-15 fps a schermo fermo, read bloccante): il costo CPU reale è la
+copia del frame (3.1 MB) — è esattamente quella che il round 3 vuole
+eliminare con encode-on-GPU lato helper.
+
+### 15. `core/screen_capture.py` — PipeWire: buffer preallocato + `readinto`
+
+`PipeWireCapture.capture_one` accumulava il frame con `bytes += chunk`: su
+una pipe il kernel consegna al massimo ~64 KB per `read`, quindi un frame
+1080p arrivava in ~100 pezzi e ogni concatenazione ricopiava tutto
+l'accumulato (~23× il frame in memcpy; misurato: 14 letture/frame,
+chunk medi 60 KB).  Ora `readinto(memoryview(buf)[offset:])` scrive
+direttamente all'offset giusto: una allocazione, zero copie di accumulo.
+Impatto misurato sul path PORTAL: trascurabile (il costo era il read
+bloccante), ma il path PIPEWIRE diretto ne beneficia.
+
+### Finding del Round 3
+
+| Priorità | Posizione | Nota |
+|---|---|---|
+| 🟠 | `core/screen_capture.py` `_changed_mask` | `cv2.absdiff` + 2× `cv2.max`: 7.5 ms/frame @1366x768 (single-thread OpenCV). Un diff su **scala di grigi** con gray del frame precedente in cache costa 0.78 ms (10× meno), ma cambia la sensibilità dei tile: va validato su casi reali prima di applicarlo. |
+| 🟡 | `core/wayland_capture.py` `capture_frame_sync` | `read(frame_size)` bloccante: latenza = periodo della sorgente e nessun controllo di frame drop (si accoda). Con encode nell'helper (step 2) il problema sparisce. |
+| 🟡 | `core/screen_capture.py` `monitors()` PORTAL | ~~Riporta la geometria da `mss` mentre il flusso reale è diverso~~ → **corretto (Round 3 #16)** |
+
+### 16. `core/screen_capture.py` — geometria PORTAL coerente
+
+`monitors()` in modalità PORTAL restituiva la geometria enumerata da mss
+(XWayland, es. 1920x1080) mentre `pipewiresrc` consegnava 1366x768: la
+`region` dei frame era incoerente con i pixel (dirty-region, cursore e
+scaling lato client sbagliati).  Se la sessione portal è attiva ora si
+riporta la geometria reale dello stream.
+
+### 17. `core/screen_capture.py` — copie rimosse su Windows/X11
+
+- `_capture_dxgi` / `_loop_dxgi`: `np.ascontiguousarray(...)` incondizionato
+  su ogni frame (copia full-frame ~6 MB @1080p) → ora si converte solo se
+  dtype o contiguità non sono già quelli giusti (dxcam è già uint8 C-contiguo).
+- `_capture_mss`: `ScreenShot.rgb` di mss è già un `bytes` **nuovo** per ogni
+  grab, quindi `np.frombuffer` non aliasa nulla: la conversione forzata era
+  una copia inutile.  Rimosso anche il `.copy()` (residuo del Round 2).
+- `draw_cursor_on_frame`: la copia “per rendere scrivibile” avveniva **prima**
+  di sapere se c'è un cursore da disegnare → su Linux/macOS (dove
+  `_cursor_state()` è sempre `None`) copiava il frame intero a ogni frame per
+  nulla.  Ora lo stato del cursore si legge prima.
+
+## Round 3 — step 2: encoding dentro l'helper PipeWire
+
+Modalità **pre-encoded** (opzionale, `QSettings video/preencoded_capture`,
+default **off**): il frame non lascia la GPU, l'H.264 lo produce
+l'encoder dentro l'helper GStreamer e sullo stdout passano solo pacchetti
+compressi (KB invece di 3-6 MB/frame).
+
+Implementazione:
+
+| File | Ruolo |
+|---|---|
+| `core/_pipewire_helper.py` | `--encode [auto\|elemento]`: pipeline `pipewiresrc ! videoconvert ! vah264enc\|vaapih264enc\|x264enc ! h264parse ! appsink`.  Header `ODPK`+`<III mode,w,h>`, poi record `<u32 len><u8 flags>` (bit0 = keyframe) |
+| `core/wayland_capture.py` | `WaylandScreenCast(encoded=True)`, `capture_packet_sync()`, `helper_alive`; `_read_exact()` con `select` + `readinto` |
+| `core/screen_capture.py` | `ScreenCapture(preencoded=True)` + `capture_packet()`; su qualsiasi errore disattiva la modalità (`_disable_preencoded`) |
+| `services/pipeline.py` | `PipelineConfig.preencoded`: `CaptureWorker` mette `EncodedPacket` in coda, `EncoderWorker` li inoltra **senza** encoder PyAV né tile-diff |
+| `services/stream_service.py` | legge `video/preencoded_capture` |
+
+Fallback garantito: se l'helper non parte (es. manca un encoder H.264
+GStreamer, vedi `gstreamer1.0-plugins-ugly` / VA-API), `setup()` fallisce,
+`preencoded` si spegne e la pipeline riparte con frame + encoder locale /
+tile JPEG, senza interruzioni dello stream (verificato end-to-end).
+
+Test: `tests/test_preencoded_capture.py` (5 casi: framing, EOF, length
+assurda, `helper_alive`, passthrough `EncodedPacket`).
+
+**Non ancora validato su hardware con encoder**: questo container non ha
+né `x264enc` né VA-API, quindi il happy-path (pacchetti H.264 reali
+dall'helper) va provato su una macchina con `gstreamer1.0-plugins-ugly`
+o driver VA-API.
+
+## Round 3 — step 3: X11
+
+- Su Linux `mss` usa già `XShmGetImage` (memoria condivisa, fallback a
+  `XGetImage`): nessun cambio necessario al backend X11.
+- `platform_config._detect_linux_x11` ora offre **PORTAL** e **PIPEWIRE**
+  oltre a MSS: su X11 è possibile scegliere lo stesso path screencast di
+  Wayland (quindi anche il pre-encoded zero-copy).  Default resta **MSS**:
+  il portal chiede il permesso di condivisione a ogni sessione, MSS no.
+
+## Round 3 — step 5: encoder HW end-to-end dietro flag
+
+L'encoder HW vive **dentro l'helper** GStreamer, non in PyAV: `--encode auto`
+prova in ordine `vah264enc` → `vaapih264enc` → `x264enc`, quindi su una
+macchina con VA-API il frame passa DMA-BUF → encoder HW senza mai toccare
+la RAM.  Il setting `video/preencoded_encoder` (default `auto`) permette di
+forzare un elemento specifico.
+
+Non implementato (e non necessario per lo scopo): il path PyAV con
+`hw_frames_ctx`/D3D11 in-process.  Motivi: PyAV supporta le hwframes solo
+parzialmente, va gestita la composizione del cursore prima dell'upload e
+serve un host Windows per validarlo — contro un helper GStreamer che fa la
+stessa cosa con 3 righe di pipeline.
+
+## Round 3 — step 6: lato client
+
+Verificato che non resta nulla di significativo da togliere senza riscrivere
+il rendering su texture GPU (Qt RHI/OpenGL):
+
+- `display_frame()` wrappa il numpy nel `QImage` senza copia (Round 2 #11);
+- i tile compongono il `QPixmap` con blit di regione (Round 2 #12);
+- `to_rgb().to_ndarray()` del decoder: misurato 0.53 ms vs 0.51 ms — non vale
+  il cambio.
+
+Il salto successivo sarebbe decodifica HW + rendering su texture (niente
+upload CPU→GPU per frame), ma è un refactor del viewer non coperto dagli
+test attuali e non giustificato dai numeri attuali (0.5 ms/frame).
+
+## Round 3 — step 7: gate e rollout
+
+| Impostazione | Default | Effetto |
+|---|---|---|
+| `video/capture_method` (già esistente) | AUTO | Forza MSS / DXGI / PORTAL / PIPEWIRE |
+| `video/preencoded_capture` | **False** | Encoding H.264 nell'helper (zero-copy, solo screencast portal) |
+| `video/preencoded_encoder` | `auto` | Elemento GStreamer (`auto`, `vah264enc`, `x264enc`, …) |
+
+UI: checkbox nel tab Video delle impostazioni.  Rollback: qualunque errore
+(helper assente, encoder mancante, portal rifiutato, helper terminato)
+disattiva la modalità e la pipeline continua col path frame + encoder locale
+— verificato end-to-end con `StreamingPipeline` su una macchina senza
+encoder H.264 GStreamer (stream attivo: 1 keyframe + 20 tile in 12 s).
+
+Test: `tests/test_preencoded_capture.py` + suite completa
+(`174 passed, 12 failed` = i 12 fail ambientali noti).
+
+

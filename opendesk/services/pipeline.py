@@ -23,7 +23,13 @@ import cv2
 import numpy as np
 
 from opendesk.core.screen_capture import ScreenCapture, _changed_mask
-from opendesk.core.video_codec import _QUALITY_CRF, EncoderConfig, QualityLevel, VideoEncoder
+from opendesk.core.video_codec import (
+    _QUALITY_CRF,
+    EncodedPacket,
+    EncoderConfig,
+    QualityLevel,
+    VideoEncoder,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +96,14 @@ class PipelineConfig:
     pixel_format: str = "yuv420p"  # "yuv420p" or "yuv444p"
     encoder_preset: str = ""  # empty = auto by quality level
     adaptive_fps: bool = True  # riduce l'fps di cattura a schermo fermo
+    # True = il backend consegna H.264 già codificato (encoding dentro
+    # l'helper PipeWire, zero-copy GPU→encoder): niente tile-diff né
+    # encoder PyAV in-process.  Viene disattivato a runtime se il backend
+    # non lo supporta (vedi ``ScreenCapture.preencoded``).
+    preencoded: bool = False
+    # Encoder GStreamer usato dall'helper in modalità pre-encoded
+    # ("auto" = VA-API se disponibile, altrimenti x264enc).
+    preencoded_encoder: str = "auto"
 
 
 # FPS minimo di cattura a schermo fermo.  L'encoder invia comunque il
@@ -136,7 +150,10 @@ class CaptureWorker(threading.Thread):
     def run(self) -> None:
         logger.info("CaptureWorker started")
         try:
-            self._capture = ScreenCapture()
+            self._capture = ScreenCapture(
+                preencoded=self._config.preencoded,
+                preencoded_encoder=self._config.preencoded_encoder,
+            )
         except Exception as e:
             msg = f"ScreenCapture init failed: {e}"
             logger.error("CaptureWorker: %s", msg)
@@ -155,6 +172,29 @@ class CaptureWorker(threading.Thread):
             t0 = time.perf_counter()
 
             try:
+                if self._config.preencoded:
+                    # Encoding già fatto dal backend: il pacchetto va dritto
+                    # al network worker, il frame non entra mai in questa
+                    # macchina (né diff, né tile, né encoder PyAV).
+                    pkt = self._capture.capture_packet(self._config.monitor_index)
+                    if pkt is None:
+                        if not self._capture.preencoded:
+                            self._config.preencoded = False
+                            logger.warning(
+                                "Pre-encoded capture non disponibile — "
+                                "torno a frame + encoder locale"
+                            )
+                            continue  # il prossimo giro usa capture_one()
+                        time.sleep(0.01)  # schermo fermo: nessun pacchetto
+                        continue
+                    consec_errors = 0
+                    frame_idx += 1
+                    try:
+                        self._frame_queue.put((pkt, pkt.timestamp), block=True, timeout=0.1)
+                    except queue.Full:
+                        logger.debug("CaptureWorker: frame queue full, dropping packet")
+                    continue
+
                 frame = self._capture.capture_one(self._config.monitor_index)
                 if frame is None:
                     # PipeWire ancora in fase di startup
@@ -340,6 +380,18 @@ class EncoderWorker(threading.Thread):
 
             if data is None:
                 break
+
+            if isinstance(data, EncodedPacket):
+                # Pre-encoded dal backend: nessun lavoro di encoding qui.
+                self._frame_count += 1
+                self._last_packet_mono = time.monotonic()
+                if self._queue_packet(data, keyframe=data.is_keyframe) and (
+                    self._on_send_full_keyframe
+                ):
+                    self._on_send_full_keyframe(
+                        data.data, data.width, data.height, data.pts, data.is_keyframe
+                    )
+                continue
 
             # Ricrea l'encoder (CRF cambiato da boost/restore) solo quando
             # il throttle lo consente

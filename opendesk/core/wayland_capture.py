@@ -40,6 +40,32 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def _read_exact(stream, n: int, timeout: float = 30.0) -> bytes | None:
+    """Legge esattamente *n* byte dallo stream (bloccante, con select).
+
+    ``None`` = EOF o timeout scaduto.
+    """
+    buf = bytearray(n)
+    view = memoryview(buf)
+    got = 0
+    deadline = time.monotonic() + timeout
+    while got < n:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        r, _, _ = select.select([stream], [], [], min(remaining, 1.0))
+        if not r:
+            continue  # nessun dato: il flusso può essere momentaneamente fermo
+        try:
+            chunk = stream.readinto(view[got:])
+        except BlockingIOError:
+            continue
+        if not chunk:
+            return None  # EOF
+        got += chunk
+    return bytes(buf)
+
+
 @dataclass
 class WaylandCaptureSession:
     """Active D-Bus screencast session state."""
@@ -64,7 +90,7 @@ class WaylandScreenCast:
     4. Read frames from PipeWire stream
     """
 
-    def __init__(self) -> None:
+    def __init__(self, encoded: bool = False, encoder: str = "auto") -> None:
         self._session: WaylandCaptureSession | None = None
         self._bus: Any = None
         self._request_token: int = 0
@@ -73,6 +99,12 @@ class WaylandScreenCast:
         self._helper_process: subprocess.Popen | None = None
         self._helper_width: int = 0
         self._helper_height: int = 0
+        # True = l'helper codifica H.264 e sullo stdout passano pacchetti,
+        # non frame raw RGB (zero-copy: il frame non torna in CPU).
+        self._encoded = encoded
+        # Encoder GStreamer per la modalità encoded: "auto" = primo
+        # disponibile fra VA-API (HW) e x264enc (SW).
+        self._encoder = encoder
 
     # ── availability ────────────────────────────────────────────────
 
@@ -154,6 +186,41 @@ class WaylandScreenCast:
         except Exception as e:
             logger.warning("Wayland frame capture failed: %s", e)
             return None
+
+    @property
+    def encoded(self) -> bool:
+        """True se lo stream è H.264 pre-codificato dall'helper."""
+        return self._encoded
+
+    @property
+    def helper_alive(self) -> bool:
+        """True se il subprocess helper GStreamer è ancora in esecuzione."""
+        proc = self._helper_process
+        return proc is not None and proc.poll() is None
+
+    def capture_packet_sync(self) -> tuple[bytes, bool] | None:
+        """Legge il prossimo pacchetto H.264 dal helper (modalità encoded).
+
+        Ritorna ``(payload, is_keyframe)`` oppure ``None`` a fine stream.
+        Framing: ``<u32 len LE><u8 flags>`` + payload (flags bit0 = keyframe).
+        """
+        if not self._encoded or self._helper_process is None:
+            return None
+        stdout = self._helper_process.stdout
+        if stdout is None:
+            return None
+
+        header = _read_exact(stdout, 5, timeout=2.0)
+        if header is None:
+            return None
+        (size,) = struct.unpack("<I", header[:4])
+        if size <= 0 or size > 32 * 1024 * 1024:
+            logger.warning("Wayland: packet size non valido (%d)", size)
+            return None
+        payload = _read_exact(stdout, size)
+        if payload is None:
+            return None
+        return payload, bool(header[4] & 1)
 
     def capture_frame_sync(self) -> np.ndarray | None:
         """Synchronous variant for use in non-async contexts.
@@ -479,23 +546,28 @@ class WaylandScreenCast:
         logger.info("Launching PipeWire helper: %s with node=%d", helper, node_id)
 
         # Use pipewiresrc path=<node_id> to connect to the portal stream
+        helper_args = [
+            system_python,
+            str(helper),
+            "--node-id",
+            str(node_id),
+            "--fps",
+            "30",
+        ]
+        if self._encoded:
+            helper_args += ["--encode", self._encoder]
         self._helper_process = subprocess.Popen(
-            [
-                system_python,
-                str(helper),
-                "--node-id",
-                str(node_id),
-                "--fps",
-                "30",
-            ],
+            helper_args,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
 
-        # Read header: 8 bytes → width, height (uint32 LE)
+        # Read header: <II width,height> in raw mode, "ODPK"<III mode,w,h>
+        # in encoded mode.
+        header_len = 16 if self._encoded else 8
         header = b""
         deadline = time.monotonic() + 30.0
-        while len(header) < 8 and time.monotonic() < deadline:
+        while len(header) < header_len and time.monotonic() < deadline:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
@@ -509,12 +581,12 @@ class WaylandScreenCast:
                 min(remaining, 1.0),
             )
             if r:
-                chunk = stdout.read(8 - len(header))
+                chunk = stdout.read(header_len - len(header))
                 if not chunk:
                     break
                 header += chunk
 
-        if len(header) < 8:
+        if len(header) < header_len:
             # Capture stderr before stopping the process
             err_output = ""
             if self._helper_process and self._helper_process.stderr:
@@ -530,11 +602,18 @@ class WaylandScreenCast:
                 "Check that xdg-desktop-portal and GStreamer pipewire plugin are installed."
             )
 
-        self._helper_width, self._helper_height = struct.unpack("<II", header)
+        if self._encoded:
+            if header[:4] != b"ODPK":
+                self._stop_helper()
+                raise RuntimeError(f"PipeWire helper: header encoded non valido ({header[:4]!r})")
+            _mode, self._helper_width, self._helper_height = struct.unpack("<III", header[4:16])
+        else:
+            self._helper_width, self._helper_height = struct.unpack("<II", header)
         logger.info(
-            "PipeWire helper stream: %dx%d",
+            "PipeWire helper stream: %dx%d%s",
             self._helper_width,
             self._helper_height,
+            " (encoded H.264)" if self._encoded else "",
         )
 
     async def _read_pipewire_frame(self) -> np.ndarray | None:
