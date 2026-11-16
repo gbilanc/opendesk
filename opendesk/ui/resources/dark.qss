@@ -583,6 +583,18 @@ QListView#transferList {
     border: none;
     background: transparent;
 }
+QLabel#transferEmpty {
+    color: #64748b;
+    font-size: 12px;
+    font-style: italic;
+    background: transparent;
+}
+QLabel#transferSummary {
+    color: #94a3b8;
+    font-size: 11px;
+    font-weight: 600;
+    padding-right: 10px;
+}
 QStatusBar#fileStatusBar {
     background: #1e293b;
     border-top: 1px solid #334155;

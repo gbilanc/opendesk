@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import queue
 import threading
 import time
@@ -636,13 +637,30 @@ class FileTransferManager:
     # ── directory listing ─────────────────────────────────────────────
 
     @staticmethod
+    def _resolve_list_path(path: str | Path) -> Path:
+        """Risolve il path da listare.
+
+        Stringa vuota (o ``"/"``) = radice del peer: il client non può sapere
+        come sia fatta la root sull'altro sistema operativo, quindi chiede
+        "la radice" con ``""``.  Su Windows la radice è il drive di sistema
+        (``C:\\``), su POSIX è ``/``.
+        """
+        raw = str(path).strip()
+        if os.name == "nt":
+            if raw in ("", ".", "/", "\\"):
+                return Path(os.environ.get("SystemDrive", "C:") + os.sep)
+        elif raw in ("", "."):
+            return Path(os.sep)
+        return Path(raw)
+
+    @staticmethod
     def list_directory(path: str | Path) -> tuple[list[dict], str]:
         """List the contents of a local directory.
 
         Parameters
         ----------
         path : str or Path
-            Directory path to list.
+            Directory path to list. Empty string means the peer's home.
 
         Returns
         -------
@@ -650,7 +668,7 @@ class FileTransferManager:
         - entries is a list of dicts with keys: name, is_dir, size, mtime
         - error is an empty string on success, or an error message
         """
-        path = Path(path)
+        path = FileTransferManager._resolve_list_path(path)
         if not path.exists():
             return [], f"Path does not exist: {path}"
         if not path.is_dir():
@@ -686,11 +704,12 @@ class FileTransferManager:
     def handle_list_request(self, msg: Message) -> Message:
         """Handle an incoming FILE_LIST_REQUEST.
 
-        Returns a FILE_LIST_RESPONSE message with the directory listing.
+        Returns a FILE_LIST_RESPONSE message with the directory listing and
+        the *resolved* path (il client ci naviga sopra).
         """
-        path = msg.payload.get("path", "/")
+        path = self._resolve_list_path(msg.payload.get("path", ""))
         entries, error = self.list_directory(path)
-        return Message.file_list_response(path, entries, error=error)
+        return Message.file_list_response(str(path), entries, error=error)
 
     def request_remote_listing(
         self,

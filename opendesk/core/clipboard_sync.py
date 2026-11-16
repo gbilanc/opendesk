@@ -65,9 +65,6 @@ class ClipboardSync(QObject):
         self._backoff_ms: int = _POLL_INTERVAL_MS
         self._last_slow_poll: float = 0.0
 
-        # Track async tasks to avoid untracked fire-and-forget leaks
-        self._pending_tasks: set = set()
-
         # Local clipboard (Qt's built-in clipboard)
         self._clipboard: QClipboard = QGuiApplication.clipboard()
 
@@ -86,8 +83,10 @@ class ClipboardSync(QObject):
 
         Parameters
         ----------
-        send_fn : async callable
-            Function to send a Message to the remote peer.
+        send_fn : callable
+            Funzione **sincrona** che invia un Message al peer (thread-safe,
+            es. ``RelayClient.send_message``).  Viene invocata dal main
+            thread Qt, quindi non deve essere una coroutine.
         """
         self._enabled = True
         self._send_fn = send_fn
@@ -99,11 +98,6 @@ class ClipboardSync(QObject):
         """Disable clipboard syncing."""
         self._enabled = False
         self._timer.stop()
-        # Cancel pending tasks
-        for task in self._pending_tasks:
-            if not task.done():
-                task.cancel()
-        self._pending_tasks.clear()
         self.sync_toggled.emit(False)
         logger.info("Clipboard sync stopped")
 
@@ -194,9 +188,6 @@ class ClipboardSync(QObject):
         if not self._enabled or self._send_fn is None:
             return
 
-        # Clean up completed tasks
-        self._pending_tasks = {t for t in self._pending_tasks if not t.done()}
-
         t0 = time.perf_counter()
         mime: QMimeData | None = self._clipboard.mimeData()
         poll_ms = (time.perf_counter() - t0) * 1000
@@ -215,10 +206,10 @@ class ClipboardSync(QObject):
             text = mime.text()
             if text and text != self._last_text:
                 self._last_text = text
-                import asyncio
-
-                task = asyncio.ensure_future(self._send_fn(Message.clipboard_text(text)))
-                self._pending_tasks.add(task)
+                try:
+                    self._send_fn(Message.clipboard_text(text))
+                except Exception as e:
+                    logger.warning("Clipboard text send error: %s", e)
                 logger.debug("Clipboard text synced: %d chars", len(text))
 
         # Check image (less frequently - skip every other poll)
@@ -248,8 +239,8 @@ class ClipboardSync(QObject):
                     MessageType.CLIPBOARD_IMAGE,
                     {"data": img_data},
                 )
-                import asyncio
-
-                task = asyncio.ensure_future(self._send_fn(msg))
-                self._pending_tasks.add(task)
+                try:
+                    self._send_fn(msg)
+                except Exception as e:
+                    logger.warning("Clipboard image send error: %s", e)
                 logger.debug("Clipboard image synced: %d bytes", len(img_data))

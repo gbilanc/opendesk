@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 )
 
 from opendesk import __version__
+from opendesk.core.clipboard_sync import ClipboardSync
 from opendesk.core.device_registry import DeviceRegistry
 from opendesk.core.file_transfer import FILE_MESSAGE_TYPES, FileTransferManager
 from opendesk.core.platform_config import HealthSeverity, get_platform_config
@@ -141,6 +142,10 @@ class HostService(QObject):
         self._ft_poll_timer.timeout.connect(self._poll_file_transfer)
         self._ft_poll_active_polls = 0
         self._ft_poll_timer.start(_FT_POLL_IDLE_INTERVAL)
+
+        # ── Clipboard sync (host ↔ client) ──
+        # Attivo solo mentre un client è autenticato: vedi _on_host_auth_result.
+        self._clipboard_sync = ClipboardSync(self)
 
         # ── Device registry (pre-authorization) ──
         self._device_registry = DeviceRegistry()
@@ -392,6 +397,7 @@ class HostService(QObject):
     def _on_host_disconnected(self) -> None:
         logger.info("Host disconnected from relay")
         self._peer_connected = False
+        self._clipboard_sync.stop()
         # Senza sessione relay send_frame non ha destinazione: la pipeline
         # continuerebbe a catturare/encodare a vuoto (CPU alta da idle).
         self._stop_streaming()
@@ -406,6 +412,7 @@ class HostService(QObject):
         logger.info("Remote peer disconnected")
         self._peer_connected = False
         self._peer_device_id = ""
+        self._clipboard_sync.stop()
         self._stop_streaming()
         self.peer_disconnected.emit()
         self.status_changed.emit("Remote client disconnected — waiting for connections...")
@@ -415,6 +422,10 @@ class HostService(QObject):
         if success:
             self._peer_connected = True
             self._start_streaming()
+            # Clipboard bidirezionale: poll della clipboard locale e invio al
+            # client; i messaggi CLIPBOARD_* in arrivo vengono applicati in
+            # _dispatch_relay_message.
+            self._clipboard_sync.start(self._relay.send_message)
             self.peer_connected.emit(self._peer_device_id or "Remote")
             self.status_changed.emit("Remote peer authenticated — streaming...")
         else:
@@ -531,9 +542,12 @@ class HostService(QObject):
         elif t in (MessageType.CAMERA_FRAME, MessageType.CAMERA_START):
             # Siamo host: la webcam remota non viene mostrata (nessun viewer)
             pass
-        elif t in (MessageType.CLIPBOARD_TEXT, MessageType.CLIPBOARD_IMAGE):
-            # Clipboard sync non implementato in questa versione
-            pass
+        elif t in (
+            MessageType.CLIPBOARD_TEXT,
+            MessageType.CLIPBOARD_IMAGE,
+            MessageType.CLIPBOARD_SYNC,
+        ):
+            self._clipboard_sync.receive_from_remote(msg)
 
     # ── helpers ─────────────────────────────────────────────────────────
 
@@ -1006,7 +1020,7 @@ class HostWindow(QMainWindow):
             dock.set_connected(True)
             dock.set_status("Connected — file transfer ready")
             self._service.file_transfer.request_remote_listing(
-                "/",
+                "",
                 self._service.relay.send_message,
             )
 

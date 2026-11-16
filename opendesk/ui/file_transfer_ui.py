@@ -11,6 +11,7 @@ Provides:
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -31,11 +32,13 @@ from PySide6.QtGui import (
     QFont,
     QKeySequence,
     QPainter,
+    QPalette,
     QPen,
     QShortcut,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QDialog,
     QFileSystemModel,
     QFrame,
@@ -47,6 +50,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSplitter,
     QStatusBar,
+    QStyle,
     QStyledItemDelegate,
     QStyleOptionViewItem,
     QTreeView,
@@ -63,16 +67,13 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════
 
 _MAX_VISIBLE_ITEMS = 20
-_ITEM_HEIGHT = 64
+_ITEM_HEIGHT = 72
 _PROGRESS_BAR_HEIGHT = 6
 
-_ICON_FOLDER = "📁"
-_ICON_FILE = "📄"
-_ICON_IMAGE = "🖼️"
-_ICON_VIDEO = "🎬"
-_ICON_CODE = "💻"
-_ICON_ARCHIVE = "📦"
-_ICON_PARENT = "🔙"
+# Velocità stimata (media esponenziale) e ETA
+_SPEED_SAMPLE_MIN_DT = 0.15  # s — sotto questa soglia il campione è troppo rumoroso
+_SPEED_SMOOTHING = 0.3  # peso del campione nuovo nella media
+
 
 # ═══════════════════════════════════════════════════════════════════
 # Remote file system model
@@ -80,79 +81,48 @@ _ICON_PARENT = "🔙"
 
 
 class RemoteFileSystemModel(QAbstractItemModel):
-    """Tree model for remote filesystem contents.
+    """Modello della directory remota corrente (una sola cartella per volta).
 
-    Data is populated from ``FILE_LIST_RESPONSE`` messages received
-    from the remote peer.
+    Il pannello mostra sempre il contenuto dell'ultima directory richiesta:
+    la navigazione avviene cambiando ``set_directory_contents()``, non
+    espandendo nodi.  Così non serve ricostruire/agganciare un albero (e i
+    path remoti di un altro OS — es. ``C:\\Users\\mario`` — non vanno
+    interpretati localmente).
     """
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self._root: dict = {
-            "name": "/",
-            "is_dir": True,
-            "path": "/",
-            "children": [],
-        }
-        self._path_map: dict[str, dict] = {"/": self._root}
+        self._current_path: str = ""
+        self._nodes: list[dict] = []
 
     # ── QAbstractItemModel interface ────────────────────────────────
 
     def rowCount(  # noqa: N802
         self, parent: QModelIndex | QPersistentModelIndex = QModelIndex()
     ) -> int:  # noqa: N802
-        if not parent.isValid():
-            return len(self._root.get("children") or [])
-        node = parent.internalPointer() if parent.internalPointer() else self._root
-        if not isinstance(node, dict):
+        if parent.isValid():
             return 0
-        children = node.get("children")
-        return 0 if children is None else len(children)
+        return len(self._nodes)
 
     def columnCount(  # noqa: N802
         self, parent: QModelIndex | QPersistentModelIndex = QModelIndex()
     ) -> int:  # noqa: N802
-        return 4  # name, size, type, modified
+        return 0 if parent.isValid() else 4  # name, size, type, modified
 
     def index(
         self, row: int, column: int, parent: QModelIndex | QPersistentModelIndex = QModelIndex()
     ) -> QModelIndex:
-        if not self.hasIndex(row, column, parent):
+        if parent.isValid() or not (0 <= row < len(self._nodes)) or not (0 <= column < 4):
             return QModelIndex()
-
-        parent_node = parent.internalPointer() if parent.isValid() else self._root
-        if not isinstance(parent_node, dict):
-            return QModelIndex()
-        children = parent_node.get("children") or []
-        if row < 0 or row >= len(children):
-            return QModelIndex()
-        return self.createIndex(row, column, children[row])
+        return self.createIndex(row, column, self._nodes[row])
 
     def parent(self, index: QModelIndex | QPersistentModelIndex = QModelIndex()) -> QModelIndex:  # type: ignore[override]
-        if not index.isValid():
-            return QModelIndex()
-        node = index.internalPointer()
-        if node is None or not isinstance(node, dict):
-            return QModelIndex()
+        return QModelIndex()  # modello piatto
 
-        # Find parent by scanning
-        parent_path = self._find_parent_path(node)
-        if parent_path is None or parent_path == "/":
-            return QModelIndex()
-
-        parent_node = self._path_map.get(parent_path)
-        if parent_node is None:
-            return QModelIndex()
-
-        # Find row of parent
-        grandparent_path = self._find_parent_path(parent_node)
-        grandparent = self._path_map.get(grandparent_path or "/", self._root)
-        grandparent_children = grandparent.get("children") or []
-        try:
-            row = grandparent_children.index(parent_node)
-        except ValueError:
-            return QModelIndex()
-        return self.createIndex(row, 0, parent_node)
+    def hasChildren(  # noqa: N802
+        self, parent: QModelIndex | QPersistentModelIndex = QModelIndex()
+    ) -> bool:  # noqa: N802
+        return not parent.isValid() and bool(self._nodes)
 
     def data(
         self, index: QModelIndex | QPersistentModelIndex, role: int = Qt.ItemDataRole.DisplayRole
@@ -221,96 +191,40 @@ class RemoteFileSystemModel(QAbstractItemModel):
     # ── public API ──────────────────────────────────────────────────
 
     def set_directory_contents(self, path: str, entries: list[dict]) -> None:
-        """Replace the contents of a directory with new entries."""
-        node = self._path_map.get(path)
-        if node is None:
-            # Create intermediate nodes if needed
-            path_obj = Path(path)
-            parent_path = str(path_obj.parent)
-            if parent_path not in self._path_map:
-                # Walk up to find existing ancestor
-                parts = path_obj.parts
-                current = "/"
-                for part in parts:
-                    if not part or part == "/":
-                        continue
-                    candidate = str(Path(current) / part) if current != "/" else f"/{part}"
-                    if candidate not in self._path_map:
-                        break
-                    current = candidate
-
-            self._ensure_path(path)
-            node = self._path_map.get(path)
-            if node is None:
-                return
-
-        # Begin reset on parent
-        parent_index = self._find_index_for_path(path)
-        if parent_index.isValid():
-            self.beginRemoveRows(parent_index, 0, max(0, len(node.get("children") or []) - 1))
-        else:
-            self.beginRemoveRows(
-                QModelIndex(),
-                0,
-                max(0, len(self._root.get("children") or []) - 1),
-            )
-
-        old_children = node.get("children") or []
-        for child in old_children:
-            child_path = child.get("path", "")
-            if child_path in self._path_map:
-                del self._path_map[child_path]
-
-        node["children"] = []
-        if parent_index.isValid():
-            self.endRemoveRows()
-        else:
-            self.endRemoveRows()
-
-        # Add new entries
-        children: list[dict] = []
+        """Sostituisce il contenuto mostrato con ``entries`` di ``path``."""
+        base = path.rstrip("/\\")  # path POSIX o Windows
+        nodes: list[dict] = []
         for entry in entries:
-            name = entry.get("name", "")
-            is_dir = entry.get("is_dir", False)
-            child_path = path.rstrip("/") + "/" + name
-            child_node: dict = {
-                "name": name,
-                "is_dir": is_dir,
-                "size": entry.get("size", 0),
-                "mtime": entry.get("mtime", 0.0),
-                "path": child_path,
-                "children": [] if is_dir else None,
-            }
-            children.append(child_node)
-            if is_dir:
-                self._path_map[child_path] = child_node
+            name = str(entry.get("name", ""))
+            if not name:
+                continue
+            nodes.append(
+                {
+                    "name": name,
+                    "is_dir": bool(entry.get("is_dir", False)),
+                    "size": entry.get("size", 0),
+                    "mtime": entry.get("mtime", 0.0),
+                    "path": f"{base}/{name}" if base else f"/{name}",
+                }
+            )
+        # Directory prima, poi file, entrambi in ordine alfabetico
+        nodes.sort(key=lambda n: (not n["is_dir"], n["name"].lower()))
 
-        # Sort: directories first, then files alphabetically
-        children.sort(key=lambda c: (not c["is_dir"], c["name"].lower()))
-
-        if parent_index.isValid():
-            self.beginInsertRows(parent_index, 0, len(children) - 1)
-        else:
-            self.beginInsertRows(QModelIndex(), 0, len(children) - 1)
-
-        node["children"] = children
-
-        if parent_index.isValid():
-            self.endInsertRows()
-        else:
-            self.endInsertRows()
+        self.beginResetModel()
+        self._current_path = path
+        self._nodes = nodes
+        self.endResetModel()
 
     def clear(self) -> None:
-        """Clear all remote data."""
+        """Svuota la lista (disconnessione)."""
         self.beginResetModel()
-        self._root = {
-            "name": "/",
-            "is_dir": True,
-            "path": "/",
-            "children": [],
-        }
-        self._path_map = {"/": self._root}
+        self._current_path = ""
+        self._nodes = []
         self.endResetModel()
+
+    @property
+    def current_path(self) -> str:
+        return self._current_path
 
     def node_at(self, index: QModelIndex) -> dict | None:
         """Get the node dict for a given index."""
@@ -328,81 +242,15 @@ class RemoteFileSystemModel(QAbstractItemModel):
 
     # ── internal ────────────────────────────────────────────────────
 
-    def _ensure_path(self, path: str) -> dict:
-        """Ensure a path exists in the tree, creating intermediates."""
-        if path in self._path_map:
-            return self._path_map[path]
-
-        if path == "/" or not path:
-            return self._root
-
-        path_obj = Path(path)
-        parent_path = str(path_obj.parent)
-        parent = self._ensure_path(parent_path)
-
-        name = path_obj.name
-        child = {
-            "name": name,
-            "is_dir": True,
-            "path": path,
-            "size": 0,
-            "mtime": 0.0,
-            "children": [],
-        }
-        parent.setdefault("children", []).append(child)
-        self._path_map[path] = child
-        return child
-
-    def _find_index_for_path(self, path: str) -> QModelIndex:
-        """Find the QModelIndex for a given path."""
-        if path == "/" or not path:
-            return QModelIndex()
-
-        parts = Path(path).parts
-        current = "/"
-        parent = QModelIndex()
-
-        for part in parts:
-            if not part or part == "/":
-                continue
-            child_path = f"{current.rstrip('/')}/{part}" if current != "/" else f"/{part}"
-            node = self._path_map.get(child_path)
-            if node is None:
-                return QModelIndex()
-            # Find row
-            parent_node = parent.internalPointer() if parent.isValid() else self._root
-            parent_children = parent_node.get("children") or []
-            try:
-                row = parent_children.index(node)
-            except ValueError:
-                return QModelIndex()
-            parent = self.createIndex(row, 0, node)
-            current = child_path
-
-        return parent
-
-    def _find_parent_path(self, node: dict) -> str | None:
-        """Find the parent path for a node."""
-        node_path = node.get("path", "")
-        if not node_path or node_path == "/":
-            return None
-        return str(Path(node_path).parent)
-
     @staticmethod
-    def _icon_for_node(node: dict) -> str:
-        if node.get("is_dir"):
-            return _ICON_FOLDER
-        name = node.get("name", "").lower()
-        ext = Path(name).suffix.lower()
-        if ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg"):
-            return _ICON_IMAGE
-        if ext in (".mp4", ".avi", ".mkv", ".mov", ".webm"):
-            return _ICON_VIDEO
-        if ext in (".py", ".js", ".ts", ".java", ".cpp", ".c", ".rs", ".go"):
-            return _ICON_CODE
-        if ext in (".zip", ".tar", ".gz", ".bz2", ".7z", ".rar"):
-            return _ICON_ARCHIVE
-        return _ICON_FILE
+    def _icon_for_node(node: dict):
+        """Icona dal tema di sistema (niente emoji: non tutti i font le hanno)."""
+        pm = (
+            QStyle.StandardPixmap.SP_DirIcon
+            if node.get("is_dir")
+            else QStyle.StandardPixmap.SP_FileIcon
+        )
+        return QApplication.style().standardIcon(pm)
 
     @staticmethod
     def _format_size(size: int) -> str:
@@ -428,6 +276,8 @@ class TransferListModel(QAbstractListModel):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._jobs: list[TransferJob] = []
+        # job_id -> (timestamp, bytes, velocità B/s stimata)
+        self._samples: dict[str, tuple[float, int, float]] = {}
 
     # ── QAbstractListModel interface ────────────────────────────────
 
@@ -460,8 +310,19 @@ class TransferListModel(QAbstractListModel):
             return job.direction
         if role == Qt.ItemDataRole.UserRole + 6:
             return job.error
+        if role == Qt.ItemDataRole.UserRole + 7:
+            return self._samples.get(job.id, (0.0, 0, 0.0))[2]
+        if role == Qt.ItemDataRole.UserRole + 8:
+            speed = self._samples.get(job.id, (0.0, 0, 0.0))[2]
+            if job.state != TransferState.IN_PROGRESS or speed <= 0:
+                return -1.0
+            remaining = max(0, job.file_info.size - job.bytes_transferred)
+            return remaining / speed
         if role == Qt.ItemDataRole.ToolTipRole:
-            return f"{job.file_info.name} — {job.state.name}"
+            tip = f"{job.file_info.name} — {job.state.name.replace('_', ' ').title()}"
+            if job.error:
+                tip += f"\n{job.error}"
+            return tip
         return None
 
     def flags(self, index: QModelIndex | QPersistentModelIndex) -> Qt.ItemFlag:
@@ -473,6 +334,7 @@ class TransferListModel(QAbstractListModel):
 
     def upsert(self, job: TransferJob) -> None:
         """Add a new job or update an existing one (by ID)."""
+        self._update_speed_sample(job)
         for i, existing in enumerate(self._jobs):
             if existing.id == job.id:
                 self._jobs[i] = job
@@ -490,6 +352,7 @@ class TransferListModel(QAbstractListModel):
         """Remove a job by ID."""
         for i, job in enumerate(self._jobs):
             if job.id == job_id:
+                self._samples.pop(job_id, None)
                 self.beginRemoveRows(QModelIndex(), i, i)
                 self._jobs.pop(i)
                 self.endRemoveRows()
@@ -508,6 +371,7 @@ class TransferListModel(QAbstractListModel):
         completed_states = {TransferState.COMPLETED, TransferState.FAILED, TransferState.CANCELLED}
         to_remove = [i for i, j in enumerate(self._jobs) if j.state in completed_states]
         for i in reversed(to_remove):
+            self._samples.pop(self._jobs[i].id, None)
             self.beginRemoveRows(QModelIndex(), i, i)
             self._jobs.pop(i)
             self.endRemoveRows()
@@ -524,6 +388,35 @@ class TransferListModel(QAbstractListModel):
     def active_count(self) -> int:
         return sum(1 for j in self._jobs if j.state == TransferState.IN_PROGRESS)
 
+    @property
+    def completed_count(self) -> int:
+        """Job in stato terminale, candidati a ``clear_completed``."""
+        return sum(
+            1
+            for j in self._jobs
+            if j.state in (TransferState.COMPLETED, TransferState.FAILED, TransferState.CANCELLED)
+        )
+
+    def _update_speed_sample(self, job: TransferJob) -> None:
+        """Aggiorna la stima di velocità (media esponenziale) per il job."""
+        if job.state != TransferState.IN_PROGRESS:
+            return
+        now = time.monotonic()
+        prev = self._samples.get(job.id)
+        if prev is None:
+            self._samples[job.id] = (now, job.bytes_transferred, 0.0)
+            return
+        dt = now - prev[0]
+        if dt < _SPEED_SAMPLE_MIN_DT:
+            return
+        instant = max(0.0, (job.bytes_transferred - prev[1]) / dt)
+        speed = (
+            instant
+            if prev[2] <= 0
+            else prev[2] * (1 - _SPEED_SMOOTHING) + instant * _SPEED_SMOOTHING
+        )
+        self._samples[job.id] = (now, job.bytes_transferred, speed)
+
 
 # ═══════════════════════════════════════════════════════════════════
 # Transfer delegate — custom rendering with progress bar
@@ -531,24 +424,45 @@ class TransferListModel(QAbstractListModel):
 
 
 class TransferDelegate(QStyledItemDelegate):
-    """Delegate che disegna ogni transfer con nome, stato e barra progresso."""
+    """Rendering di un transfer: nome, badge di stato, metadati, barra progresso.
 
-    # Palette
-    _BG_PROGRESS = "#e2e8f0"
-    _FG_PROGRESS = "#2563eb"
-    _FG_PROGRESS_DONE = "#22c55e"
-    _FG_PROGRESS_ERROR = "#ef4444"
-    _TEXT_NAME = "#0f172a"
-    _TEXT_MUTED = "#94a3b8"
-    _TEXT_STATE = {
-        TransferState.PENDING: "#f59e0b",
-        TransferState.IN_PROGRESS: "#2563eb",
-        TransferState.COMPLETED: "#22c55e",
-        TransferState.FAILED: "#ef4444",
-        TransferState.CANCELLED: "#94a3b8",
-        TransferState.PAUSED: "#f59e0b",
-        TransferState.ACCEPTED: "#2563eb",
+    I colori vengono presi da ``QPalette`` (non da costanti hardcoded) così la
+    lista resta leggibile sia nel tema chiaro sia in quello scuro.
+    """
+
+    _STATE_LABELS: dict[TransferState, str] = {
+        TransferState.PENDING: "Queued",
+        TransferState.ACCEPTED: "Accepted",
+        TransferState.IN_PROGRESS: "Transferring",
+        TransferState.PAUSED: "Paused",
+        TransferState.COMPLETED: "Completed",
+        TransferState.FAILED: "Failed",
+        TransferState.CANCELLED: "Cancelled",
     }
+
+    # Colori semantici, variante chiara e scura
+    _STATE_COLORS_LIGHT: dict[TransferState, str] = {
+        TransferState.PENDING: "#b45309",
+        TransferState.ACCEPTED: "#1d4ed8",
+        TransferState.IN_PROGRESS: "#1d4ed8",
+        TransferState.PAUSED: "#b45309",
+        TransferState.COMPLETED: "#15803d",
+        TransferState.FAILED: "#b91c1c",
+        TransferState.CANCELLED: "#475569",
+    }
+    _STATE_COLORS_DARK: dict[TransferState, str] = {
+        TransferState.PENDING: "#fbbf24",
+        TransferState.ACCEPTED: "#60a5fa",
+        TransferState.IN_PROGRESS: "#60a5fa",
+        TransferState.PAUSED: "#fbbf24",
+        TransferState.COMPLETED: "#4ade80",
+        TransferState.FAILED: "#f87171",
+        TransferState.CANCELLED: "#94a3b8",
+    }
+
+    def _state_color(self, state: TransferState, dark: bool) -> QColor:
+        table = self._STATE_COLORS_DARK if dark else self._STATE_COLORS_LIGHT
+        return QColor(table.get(state, "#64748b"))
 
     def paint(
         self,
@@ -559,91 +473,130 @@ class TransferDelegate(QStyledItemDelegate):
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        rect = option.rect
-        # Background — use QStyle.StateFlag.State_Selected (Qt6 API)
-        from PySide6.QtWidgets import QStyle
-
+        pal = option.palette
+        # NB: la lista ha ``background: transparent`` in QSS, quindi il role
+        # Base e' trasparente (alpha 0) e dipingerebbe nero: usiamo Window,
+        # che e' il colore del pannello che ospita la lista.
+        base = pal.color(QPalette.ColorRole.Window)
+        dark = base.lightness() < 128
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
-        painter.fillRect(rect, QColor("#f8fafc") if selected else QColor("#ffffff"))
-        # Bottom border
-        painter.setPen(QPen(QColor("#f1f5f9"), 1))
+        text_color = pal.color(
+            QPalette.ColorRole.HighlightedText if selected else QPalette.ColorRole.Text
+        )
+        muted_color = pal.color(QPalette.ColorRole.PlaceholderText)
+        if not muted_color.isValid() or muted_color == text_color:
+            muted_color = pal.color(QPalette.ColorRole.Mid)
+
+        rect = option.rect
+        painter.fillRect(rect, pal.color(QPalette.ColorRole.Highlight) if selected else base)
+        separator = pal.color(QPalette.ColorRole.Mid)
+        separator.setAlpha(50)
+        painter.setPen(QPen(separator, 1))
         painter.drawLine(rect.bottomLeft(), rect.bottomRight())
 
-        content = rect.adjusted(12, 6, -12, -6)
+        content = rect.adjusted(14, 8, -14, -8)
 
-        # ── Row 1: File name (left) + State badge (right) ──
-        name = index.data(Qt.ItemDataRole.DisplayRole) or ""
+        name = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
         state: TransferState = index.data(Qt.ItemDataRole.UserRole + 1)
         direction: TransferDirection = index.data(Qt.ItemDataRole.UserRole + 5)
+        total = index.data(Qt.ItemDataRole.UserRole + 3) or 0
+        done = index.data(Qt.ItemDataRole.UserRole + 4) or 0
+        progress = float(index.data(Qt.ItemDataRole.UserRole + 2) or 0.0)
+        error = index.data(Qt.ItemDataRole.UserRole + 6) or ""
+        speed = float(index.data(Qt.ItemDataRole.UserRole + 7) or 0.0)
+        eta = index.data(Qt.ItemDataRole.UserRole + 8)
 
-        # Direction icon
-        dir_icon = "↑" if direction == TransferDirection.SEND else "↓"
+        state_color = self._state_color(state, dark)
 
-        # Name
-        painter.setPen(QColor(self._TEXT_NAME))
-        font_name = QFont("Segoe UI", 12, QFont.Weight.DemiBold)
-        painter.setFont(font_name)
-        name_rect = QRect(content.left(), content.top(), content.width() - 80, 20)
+        # ── Badge di stato (destra) ──
+        badge_font = QFont(option.font)
+        badge_font.setPointSizeF(max(8.0, option.font.pointSizeF() - 1.0))
+        badge_font.setWeight(QFont.Weight.DemiBold)
+        painter.setFont(badge_font)
+        fm = painter.fontMetrics()
+        label = self._STATE_LABELS.get(state, state.name.replace("_", " ").title())
+        pill_w = fm.horizontalAdvance(label) + 20
+        pill_h = fm.height() + 6
+        pill_rect = QRect(content.right() - pill_w, content.top(), pill_w, pill_h)
+        pill_bg = QColor(state_color)
+        pill_bg.setAlpha(40)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(pill_bg))
+        painter.drawRoundedRect(pill_rect, pill_h / 2, pill_h / 2)
+        painter.setPen(state_color)
+        painter.drawText(pill_rect, Qt.AlignmentFlag.AlignCenter, label)
+
+        # ── Nome file (sinistra, eliso al centro) ──
+        name_font = QFont(option.font)
+        name_font.setWeight(QFont.Weight.DemiBold)
+        painter.setFont(name_font)
+        painter.setPen(text_color)
+        fm = painter.fontMetrics()
+        arrow = "\u2191" if direction == TransferDirection.SEND else "\u2193"
+        name_rect = QRect(
+            content.left(), content.top(), max(0, pill_rect.left() - content.left() - 12), pill_h
+        )
         painter.drawText(
             name_rect,
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            f"{dir_icon}  {name}",
+            fm.elidedText(f"{arrow}  {name}", Qt.TextElideMode.ElideMiddle, name_rect.width()),
         )
 
-        # State
-        state_color = self._TEXT_STATE.get(state, "#94a3b8")
-        state_label = state.name.replace("_", " ").title()
-        painter.setPen(QColor(state_color))
-        font_state = QFont("Segoe UI", 10, QFont.Weight.Medium)
-        painter.setFont(font_state)
-        state_rect = QRect(content.right() - 80, content.top(), 80, 20)
+        # ── Riga metadati: percentuale · byte · velocità · ETA (o errore) ──
+        meta_font = QFont(option.font)
+        meta_font.setPointSizeF(max(8.0, option.font.pointSizeF() - 1.0))
+        painter.setFont(meta_font)
+        meta_rect = QRect(
+            content.left(),
+            content.top() + pill_h + 4,
+            content.width(),
+            int(meta_font.pointSizeF()) + 12,
+        )
+        if state == TransferState.FAILED and error:
+            painter.setPen(state_color)
+            meta = f"\u2715  {error}"
+        else:
+            painter.setPen(muted_color)
+            parts = [
+                f"{int(progress * 100)}%",
+                f"{self._fmt_size(done)} / {self._fmt_size(total)}",
+            ]
+            if speed > 0 and state == TransferState.IN_PROGRESS:
+                parts.append(f"{self._fmt_size(int(speed))}/s")
+            if eta is not None and eta >= 0 and state == TransferState.IN_PROGRESS:
+                parts.append(f"ETA {self._fmt_eta(eta)}")
+            meta = "   ·   ".join(parts)
         painter.drawText(
-            state_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, state_label
+            meta_rect,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            painter.fontMetrics().elidedText(meta, Qt.TextElideMode.ElideRight, meta_rect.width()),
         )
 
-        # ── Row 2: Size info (left) + Progress bar (right) ──
-        size_total = index.data(Qt.ItemDataRole.UserRole + 3) or 0
-        bytes_done = index.data(Qt.ItemDataRole.UserRole + 4) or 0
-        progress = index.data(Qt.ItemDataRole.UserRole + 2) or 0.0
-
-        size_text = self._format_size(bytes_done) + " / " + self._format_size(size_total)
-        painter.setPen(QColor(self._TEXT_MUTED))
-        font_size = QFont("Segoe UI", 10)
-        painter.setFont(font_size)
-        size_rect = QRect(content.left(), content.top() + 22, content.width() - 6, 16)
-        painter.drawText(
-            size_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, size_text
-        )
-
-        # Progress bar
-        bar_top = content.top() + 42
-        bar_rect = QRect(content.left(), bar_top, content.width(), _PROGRESS_BAR_HEIGHT)
-        painter.setBrush(QBrush(QColor(self._BG_PROGRESS)))
+        # ── Barra di progresso ──
+        bar_top = content.bottom() - _PROGRESS_BAR_HEIGHT
+        bar_rect = QRect(content.left(), bar_top - 4, content.width(), _PROGRESS_BAR_HEIGHT)
+        track = QColor(muted_color)
+        track.setAlpha(60)
         painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(track))
         painter.drawRoundedRect(bar_rect, 3, 3)
 
-        fill_w = int(bar_rect.width() * min(1.0, progress))
+        fill_w = int(bar_rect.width() * min(1.0, max(0.0, progress)))
         if fill_w > 0:
-            fill_color = (
-                self._FG_PROGRESS_DONE
-                if state == TransferState.COMPLETED
-                else (
-                    self._FG_PROGRESS_ERROR if state == TransferState.FAILED else self._FG_PROGRESS
-                )
+            painter.setBrush(QBrush(state_color))
+            painter.drawRoundedRect(
+                QRect(bar_rect.left(), bar_rect.top(), fill_w, bar_rect.height()), 3, 3
             )
-            painter.setBrush(QBrush(QColor(fill_color)))
-            fill_rect = QRect(bar_rect.left(), bar_rect.top(), fill_w, bar_rect.height())
-            painter.drawRoundedRect(fill_rect, 3, 3)
 
         painter.restore()
 
     def sizeHint(  # noqa: N802
         self, option: QStyleOptionViewItem, index: QModelIndex | QPersistentModelIndex
     ) -> QSize:  # noqa: N802
-        return QSize(300, _ITEM_HEIGHT)
+        return QSize(320, _ITEM_HEIGHT)
 
     @staticmethod
-    def _format_size(size: int) -> str:
+    def _fmt_size(size: int) -> str:
         if size < 1024:
             return f"{size} B"
         elif size < 1024 * 1024:
@@ -651,6 +604,15 @@ class TransferDelegate(QStyledItemDelegate):
         elif size < 1024 * 1024 * 1024:
             return f"{size / (1024 * 1024):.1f} MB"
         return f"{size / (1024 * 1024 * 1024):.2f} GB"
+
+    @staticmethod
+    def _fmt_eta(seconds: float) -> str:
+        s = int(max(0, seconds))
+        if s < 60:
+            return f"{s}s"
+        if s < 3600:
+            return f"{s // 60}m {s % 60:02d}s"
+        return f"{s // 3600}h {(s % 3600) // 60:02d}m"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -752,6 +714,11 @@ class FileBrowserDock(QDialog):
         # Selection info with inline clear button
         self._selection_info = QLabel("")
         self._selection_info.setProperty("class", "accent")
+
+        # Riepilogo trasferimenti (attivi / percentuale complessiva)
+        self._transfer_summary = QLabel("")
+        self._transfer_summary.setObjectName("transferSummary")
+        self._status_bar.addPermanentWidget(self._transfer_summary)
         self._status_bar.addPermanentWidget(self._selection_info)
 
         self._clear_sel_btn = QPushButton("✕")
@@ -787,15 +754,19 @@ class FileBrowserDock(QDialog):
         layout.addStretch()
 
         # Refresh remote button
-        self._refresh_btn = QPushButton("🔄 Refresh")
+        self._refresh_btn = QPushButton("\u27f3 Refresh")
         self._refresh_btn.setMinimumHeight(32)
         self._refresh_btn.setProperty("class", "secondary")
         layout.addWidget(self._refresh_btn)
 
         # Clear completed
-        self._clear_btn = QPushButton("✕ Clear")
+        self._clear_btn = QPushButton("Clear completed")
         self._clear_btn.setMinimumHeight(32)
         self._clear_btn.setProperty("class", "secondary")
+        self._clear_btn.setEnabled(False)
+        self._clear_btn.setToolTip(
+            "Remove completed, failed and cancelled transfers from the list"
+        )
         layout.addWidget(self._clear_btn)
 
         return toolbar
@@ -825,17 +796,28 @@ class FileBrowserDock(QDialog):
         header_layout.addWidget(path_bar, 1)
 
         # Home button
-        home_btn = QPushButton("🏠")
+        home_btn = QPushButton("\u2302")
         home_btn.setFixedSize(28, 28)
         home_btn.setObjectName("fileHomeBtn")
+        home_btn.setToolTip("Go to home folder" if is_local else "Go to remote root")
         header_layout.addWidget(home_btn)
+
+        # Up button
+        up_btn = QPushButton("\u2191")
+        up_btn.setFixedSize(28, 28)
+        up_btn.setObjectName("fileHomeBtn")
+        up_btn.setToolTip("Up one level")
+        header_layout.addWidget(up_btn)
 
         if is_local:
             self._local_path_bar = path_bar
             self._local_home_btn = home_btn
+            self._local_up_btn = up_btn
+            path_bar.setText(self._local_root)
         else:
             self._remote_path_bar = path_bar
             self._remote_home_btn = home_btn
+            self._remote_up_btn = up_btn
             path_bar.setPlaceholderText("/")
 
         layout.addWidget(header)
@@ -889,8 +871,9 @@ class FileBrowserDock(QDialog):
         layout.setContentsMargins(8, 6, 8, 6)
         layout.setSpacing(4)
 
-        header = QLabel("Active Transfers")
+        header = QLabel("Active transfers")
         header.setObjectName("filePaneTitle")
+        self._transfers_header = header
         layout.addWidget(header)
 
         self._transfer_list = QListView()
@@ -901,9 +884,18 @@ class FileBrowserDock(QDialog):
         self._transfer_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._transfer_list.setFrameShape(QFrame.Shape.NoFrame)
         self._transfer_list.setMinimumHeight(80)
-        self._transfer_list.setMaximumHeight(150)
+        self._transfer_list.setMaximumHeight(260)
         self._transfer_list.setObjectName("transferList")
+        self._transfer_list.setVisible(False)
         layout.addWidget(self._transfer_list, 1)
+
+        # Empty state — mostrato al posto della lista quando non c'e' nulla
+        self._transfers_empty = QLabel("No active transfers")
+        self._transfers_empty.setObjectName("transferEmpty")
+        self._transfers_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._transfers_empty.setMinimumHeight(80)
+        self._transfers_empty.setMaximumHeight(260)
+        layout.addWidget(self._transfers_empty, 1)
 
         return section
 
@@ -930,6 +922,8 @@ class FileBrowserDock(QDialog):
         # Home buttons
         self._local_home_btn.clicked.connect(self._go_local_home)
         self._remote_home_btn.clicked.connect(self._go_remote_home)
+        self._local_up_btn.clicked.connect(self._go_local_up)
+        self._remote_up_btn.clicked.connect(self._go_remote_up)
 
         # Action buttons
         self._upload_btn.clicked.connect(self._on_upload_clicked)
@@ -937,6 +931,11 @@ class FileBrowserDock(QDialog):
         self._refresh_btn.clicked.connect(self._on_refresh_clicked)
         self._clear_btn.clicked.connect(self._clear_completed)
         self._clear_sel_btn.clicked.connect(self._clear_selection)
+
+        # Transfer list state (header count, empty state, "Clear" abilitato)
+        self._transfer_model.countChanged.connect(self._update_transfers_ui)
+        self._transfer_model.dataChanged.connect(self._update_transfer_summary)
+        self._update_transfers_ui()
 
     # ── local filesystem handlers ───────────────────────────────────
 
@@ -963,11 +962,23 @@ class FileBrowserDock(QDialog):
     @Slot()
     def _go_local_home(self) -> None:
         """Navigate local tree to home directory."""
-        home = str(Path.home())
-        self._local_path_bar.setText(home)
-        index = self._local_model.index(home)
-        self._local_tree.setRootIndex(index)
-        self._local_root = home
+        self._navigate_local_to(Path.home())
+
+    @Slot()
+    def _go_local_up(self) -> None:
+        """Navigate the local pane one level up."""
+        self._navigate_local_to(Path(self._local_root).parent)
+
+    def _navigate_local_to(self, path: str | Path) -> None:
+        """Point the local pane at ``path`` (se e' una directory esistente)."""
+        target = Path(path)
+        if not target.is_dir():
+            return
+        p = str(target)
+        self._local_path_bar.setText(p)
+        self._local_tree.setRootIndex(self._local_model.index(p))
+        self._local_root = p
+        self.navigate_local.emit(p)
 
     @Slot()
     def _on_local_selection_changed(self) -> None:
@@ -993,16 +1004,23 @@ class FileBrowserDock(QDialog):
 
     @Slot()
     def _on_remote_path_entered(self) -> None:
-        """Navigate remote path bar."""
-        path = self._remote_path_bar.text().strip()
-        if not path.startswith("/"):
-            path = "/" + path
-        self._navigate_remote_to(path)
+        """Navigate remote path bar (vuoto = radice del peer, path nativi accettati)."""
+        self._navigate_remote_to(self._remote_path_bar.text().strip())
 
     @Slot()
     def _go_remote_home(self) -> None:
-        """Navigate remote to root."""
-        self._navigate_remote_to("/")
+        """Navigate remote to its root ("" = radice del peer: C:\\ o /)."""
+        self._navigate_remote_to("")
+
+    @Slot()
+    def _go_remote_up(self) -> None:
+        """Navigate the remote pane one level up (path POSIX o Windows)."""
+        current = (self._remote_path or "").rstrip("/\\")
+        # gia' alla radice: "" (POSIX) oppure "C:" (Windows)
+        if not current or (len(current) <= 2 and current.endswith(":")):
+            return
+        sep = "/" if "/" in current else "\\"
+        self._navigate_remote_to(current.rsplit(sep, 1)[0] or "/")
 
     @Slot()
     def _on_remote_selection_changed(self) -> None:
@@ -1092,8 +1110,10 @@ class FileBrowserDock(QDialog):
         if error:
             self._status_label.setText(f"⚠ Remote listing error: {error}")
             return
+        self._remote_path = path
+        self._remote_path_bar.setText(path)
         self._remote_model.set_directory_contents(path, entries)
-        self._status_label.setText(f"Remote: {path} ({len(entries)} items)")
+        self._status_label.setText(f"Remote: {path}  \u00b7  {len(entries)} items")
 
     def set_status(self, message: str) -> None:
         """Set the status bar message."""
@@ -1107,12 +1127,44 @@ class FileBrowserDock(QDialog):
         self._remote_home_btn.setEnabled(connected)
         if not connected:
             self._remote_model.clear()
+            self._remote_path = ""
             self._remote_path_bar.setText("")
             self._status_label.setText("Disconnected — remote browsing unavailable")
         else:
-            self._navigate_remote_to("/")
+            self._navigate_remote_to("")
 
     # ── internal ────────────────────────────────────────────────────
+
+    def _update_transfers_ui(self) -> None:
+        """Aggiorna header, empty state e pulsante "Clear" della lista transfer."""
+        count = self._transfer_model.rowCount()
+        active = self._transfer_model.active_count
+        header = "Active transfers"
+        if active:
+            header += f"  ·  {active} running"
+        elif count:
+            header += f"  ·  {count}"
+        self._transfers_header.setText(header)
+
+        self._transfer_list.setVisible(count > 0)
+        self._transfers_empty.setVisible(count == 0)
+        self._clear_btn.setEnabled(self._transfer_model.completed_count > 0)
+        self._update_transfer_summary()
+
+    def _update_transfer_summary(self) -> None:
+        """Riepilogo compatto nella status bar: attivi e avanzamento complessivo."""
+        jobs = [
+            job
+            for i in range(self._transfer_model.rowCount())
+            if (job := self._transfer_model.job_at(i)) is not None
+        ]
+        running = [j for j in jobs if j.state == TransferState.IN_PROGRESS]
+        if not running:
+            self._transfer_summary.setText("")
+            return
+        total = sum(j.file_info.size for j in running) or 1
+        done = sum(j.bytes_transferred for j in running)
+        self._transfer_summary.setText(f"{len(running)} active  ·  {int(100 * done / total)}%")
 
     def _update_action_buttons(self) -> None:
         """Enable/disable upload/download buttons based on selections."""

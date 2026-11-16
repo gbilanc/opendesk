@@ -541,7 +541,7 @@ class MainWindow(QMainWindow):
 
             # Request initial remote file listing
             if self._file_transfer_send_fn is not None:
-                self._file_transfer.request_remote_listing("/", self._file_transfer_send_fn)
+                self._file_transfer.request_remote_listing("", self._file_transfer_send_fn)
         else:
             logger.warning("Client authentication failed: %s", message)
             self._status_text.setText("Client authentication failed")
@@ -583,7 +583,7 @@ class MainWindow(QMainWindow):
 
             # Request initial remote file listing
             if self._file_transfer_send_fn is not None:
-                self._file_transfer.request_remote_listing("/", self._file_transfer_send_fn)
+                self._file_transfer.request_remote_listing("", self._file_transfer_send_fn)
 
             # If file-transfer-only, open the file transfer dock now
             if self._file_transfer_mode:
@@ -1208,7 +1208,7 @@ class MainWindow(QMainWindow):
         if self._file_transfer_send_fn:
             dock.set_connected(True)
             dock.set_status("Connected — browsing remote files...")
-            self._file_transfer.request_remote_listing("/", self._file_transfer_send_fn)
+            self._file_transfer.request_remote_listing("", self._file_transfer_send_fn)
 
     def _set_connected(self, connected: bool, show_viewer: bool = True) -> None:
         """Update all UI state to reflect connection status.
