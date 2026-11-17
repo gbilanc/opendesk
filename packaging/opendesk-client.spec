@@ -104,7 +104,7 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleName": "OpenDesk",
             "CFBundleDisplayName": "OpenDesk",
-            "CFBundleShortVersionString": "2.1.0",
+            "CFBundleShortVersionString": "3.2.0",
             "NSHighResolutionCapable": True,
         },
     )
