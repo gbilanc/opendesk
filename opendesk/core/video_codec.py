@@ -126,6 +126,18 @@ _QUALITY_BITRATE: dict[QualityLevel, int] = {
     QualityLevel.LOSSLESS: 20_000_000,
 }
 
+# Preset libx264/libx265 di default per livello di qualità (usato quando
+# l'utente non ha scelto un preset esplicito).  Preset più lenti =
+# compressione migliore a parità di CRF; il boost da CPU idle scende
+# ulteriormente lungo la scala (vedi pipeline._PRESET_LADDER).
+_QUALITY_PRESET: dict[QualityLevel, str] = {
+    QualityLevel.LOW: "veryfast",
+    QualityLevel.MEDIUM: "veryfast",
+    QualityLevel.HIGH: "superfast",
+    QualityLevel.SHARP: "superfast",
+    QualityLevel.LOSSLESS: "superfast",
+}
+
 
 @dataclass
 class EncoderConfig:
@@ -430,13 +442,11 @@ class VideoEncoder:
             # Per remote desktop il preset `superfast` è il compromesso CPU/qualità:
             # `medium` costa ~2-3× CPU a parità di CRF con beneficio impercettibile
             # su contenuto desktop (RCA 2026-11-14, CPU host vs AnyDesk).
+            # Un preset assente in config significa "auto": lo sceglie la
+            # mappa per livello di qualità (prima veniva sempre forzato
+            # veryfast dal chiamante e la mappa non entrava mai in gioco).
             quality = self._config.quality
-            if quality in (QualityLevel.LOSSLESS, QualityLevel.SHARP):
-                opts["preset"] = opts.get("preset", "superfast")
-            elif quality == QualityLevel.HIGH:
-                opts["preset"] = opts.get("preset", "superfast")
-            else:
-                opts["preset"] = opts.get("preset", "veryfast")
+            opts["preset"] = opts.get("preset") or _QUALITY_PRESET.get(quality, "veryfast")
 
             # Threads limitati per gli encoder software: libx264 auto-threads
             # usa tutti i core e sottrae CPU al resto (cattura, UI, rete).

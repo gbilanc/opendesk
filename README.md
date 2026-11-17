@@ -8,7 +8,7 @@
 
 Multi-platform remote desktop application (TeamViewer / AnyDesk-like).
 
-[![Version](https://img.shields.io/badge/version-3.2.0-blue)](https://github.com/gbilanc/opendesk-client/releases)
+[![Version](https://img.shields.io/badge/version-3.3.0-blue)](https://github.com/gbilanc/opendesk-client/releases)
 [![Python](https://img.shields.io/badge/python-3.12%2B-blue)](https://github.com/gbilanc/opendesk-client)
 [![License](https://img.shields.io/badge/license-MIT-green)](https://github.com/gbilanc/opendesk-client/blob/main/LICENSE)
 [![CI](https://github.com/gbilanc/opendesk-client/actions/workflows/ci.yml/badge.svg)](https://github.com/gbilanc/opendesk-client/actions/workflows/ci.yml)
@@ -205,6 +205,17 @@ with hardware acceleration support.
 
 CRF (Constant Rate Factor) is the default rate control mode, providing
 consistent visual quality by dynamically allocating bits where needed.
+
+### Adaptive quality from idle host CPU
+
+When the host screen is static **and** the host CPU is idle, the next
+keyframe is encoded with lower CRF, a slower preset and (for software
+encoders) more threads and `yuv444p`, so text looks sharper in the client.
+Budgets are adaptive: two tiers (screen idle ≥ ~0.5 s with CPU < 60%,
+then ≥ ~5 s with CPU < 30%), a rate-limited boost keyframe, and automatic
+downgrade if the slow preset saturates the encoder.  A manually selected
+preset is never overridden.  Toggle in **Tools → Settings → Video →
+“Use idle host CPU to improve image quality”**.
 
 ### Codec support
 

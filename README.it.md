@@ -8,7 +8,7 @@
 
 Applicazione di desktop remoto multipiattaforma (simile a TeamViewer / AnyDesk).
 
-[![Versione](https://img.shields.io/badge/versione-3.2.0-blue)](https://github.com/gbilanc/opendesk-client/releases)
+[![Versione](https://img.shields.io/badge/versione-3.3.0-blue)](https://github.com/gbilanc/opendesk-client/releases)
 [![Python](https://img.shields.io/badge/python-3.12%2B-blue)](https://github.com/gbilanc/opendesk-client)
 [![Licenza](https://img.shields.io/badge/licenza-MIT-green)](https://github.com/gbilanc/opendesk-client/blob/main/LICENSE)
 [![CI](https://github.com/gbilanc/opendesk-client/actions/workflows/ci.yml/badge.svg)](https://github.com/gbilanc/opendesk-client/actions/workflows/ci.yml)
@@ -223,6 +223,18 @@ supporto all'accelerazione hardware.
 CRF (Constant Rate Factor) è la modalità di controllo di rate predefinita:
 garantisce una qualità visiva costante allocando dinamicamente i bit dove
 servono.
+
+### Qualità adattiva dalla CPU idle dell'host
+
+Quando lo schermo dell'host è fermo **e** la CPU dell'host è inattiva, il
+keyframe successivo viene codificato con CRF più basso, preset più lento e
+(per gli encoder software) più thread e `yuv444p`: il testo risulta più
+nitido nel client.  Il meccanismo usa due tier (schermo fermo ≥ ~0.5 s con
+CPU < 60%, poi ≥ ~5 s con CPU < 30%), un keyframe di boost limitato nel
+tempo e un downgrade automatico se il preset lento satura l'encoder.  Un
+preset scelto manualmente non viene mai sovrascritto.  Si controlla in
+**Strumenti → Impostazioni → Video → “Use idle host CPU to improve image
+quality”**.
 
 ### Codec supportati
 

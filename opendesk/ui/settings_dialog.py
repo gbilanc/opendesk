@@ -112,6 +112,18 @@ class SettingsDialog(QDialog):
         self._adaptive_fps.setChecked(True)
         video_layout.addRow("", self._adaptive_fps)
 
+        # Boost qualità sulle pause: a schermo fermo il costo di un keyframe
+        # "bello" è irrilevante, quindi si reinveste il margine CPU in
+        # CRF/preset migliori (e yuv444p) invece di sprecarlo.
+        self._idle_quality_boost = QCheckBox("Use idle host CPU to improve image quality")
+        self._idle_quality_boost.setChecked(True)
+        self._idle_quality_boost.setToolTip(
+            "When the screen is static and the host CPU is idle, the next keyframe "
+            "is encoded with lower CRF and a slower preset (sharper text). "
+            "Ignored when a manual encoder preset is selected."
+        )
+        video_layout.addRow("", self._idle_quality_boost)
+
         # Encoding dentro l'helper PipeWire (solo screencast portal): il
         # frame non torna in CPU.  Disattivato se l'encoder HW/SW richiesto
         # non è disponibile (fallback automatico al path tile + encoder).
@@ -468,6 +480,9 @@ class SettingsDialog(QDialog):
         self._adaptive_fps.setChecked(
             cast(bool, self._settings.value("video/adaptive_fps", True, type=bool))
         )
+        self._idle_quality_boost.setChecked(
+            cast(bool, self._settings.value("video/idle_quality_boost", True, type=bool))
+        )
         self._preencoded.setChecked(
             cast(bool, self._settings.value("video/preencoded_capture", False, type=bool))
         )
@@ -772,6 +787,9 @@ class SettingsDialog(QDialog):
         )
         self._settings.setValue("video/max_fps", self._fps_spin.value())
         self._settings.setValue("video/adaptive_fps", self._adaptive_fps.isChecked())
+        self._settings.setValue(
+            "video/idle_quality_boost", self._idle_quality_boost.isChecked()
+        )
         self._settings.setValue("video/preencoded_capture", self._preencoded.isChecked())
         self._settings.setValue(
             "video/codec",

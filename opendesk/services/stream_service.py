@@ -321,7 +321,10 @@ class StreamService(QObject):
         crf = _QUALITY_CRF.get(quality)
 
         # Pixel format: default dal PlatformConfig, poi da impostazioni
-        pixel_format = cast(str, self._settings.value("video/pixel_format", "", type=str))
+        pixel_format_setting = cast(
+            str, self._settings.value("video/pixel_format", "", type=str)
+        )
+        pixel_format = pixel_format_setting
         if not pixel_format:
             pixel_format = cfg.default_pixel_format
         if pixel_format not in ("yuv420p", "yuv444p"):
@@ -339,6 +342,12 @@ class StreamService(QObject):
 
         # FPS adattivo (schermo fermo → ~2 fps, keepalive tiene il flusso)
         adaptive_fps = cast(bool, self._settings.value("video/adaptive_fps", True, type=bool))
+
+        # Boost qualità sfruttando la CPU idle dell'host (CRF/preset migliori
+        # sui keyframe a schermo fermo).  Vedi pipeline.EncoderWorker.
+        idle_quality_boost = cast(
+            bool, self._settings.value("video/idle_quality_boost", True, type=bool)
+        )
 
         # Encoding dentro l'helper PipeWire (Wayland): H.264 già pronto,
         # niente frame raw in CPU.  Disattivato di default, si attiva solo
@@ -360,6 +369,8 @@ class StreamService(QObject):
             pixel_format=pixel_format,
             encoder_preset=encoder_preset,
             adaptive_fps=adaptive_fps,
+            idle_quality_boost=idle_quality_boost,
+            pixel_format_auto=not pixel_format_setting,
             preencoded=preencoded,
             preencoded_encoder=preencoded_encoder,
         )

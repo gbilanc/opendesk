@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import queue
 import threading
 import time
@@ -25,11 +26,13 @@ import numpy as np
 from opendesk.core.screen_capture import ScreenCapture, _changed_mask
 from opendesk.core.video_codec import (
     _QUALITY_CRF,
+    _QUALITY_PRESET,
     EncodedPacket,
     EncoderConfig,
     QualityLevel,
     VideoEncoder,
 )
+from opendesk.utils.platform import cpu_load_percent
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,55 @@ _REBUILD_MIN_INTERVAL = 2.0  # s
 # una change_ratio che oscilla attorno a 0.05 rifà l'encoder ogni 2-6 s
 # (10+ rebuild/minuto: pressione GIL + CPU; RCA 2026-11-14).
 _QUALITY_FLIP_HYSTERESIS_S = 5.0
+
+# ── Boost qualità sfruttando la CPU idle dell'host ─────────────────
+# Tier crescenti applicati quando lo schermo è fermo E la CPU è libera:
+# il costo di un keyframe "bello" è irrilevante se nessuno sta usando
+# l'host, quindi si reinveste in CRF/preset invece di sprecare il margine.
+_IDLE_TIER1_FRAMES = 4  # ~2 s a _MIN_IDLE_FPS
+_IDLE_TIER2_FRAMES = 20  # ~10 s a _MIN_IDLE_FPS
+_CPU_FREE_TIER1 = 0.60  # carico host sotto cui parte il boost leggero
+_CPU_FREE_TIER2 = 0.30  # carico host sotto cui parte il boost massimo
+_MIN_BOOST_CRF = 10  # limite di sicurezza (sotto = bitrate ingestibile)
+_MAX_BOOST_KEYFRAME_MS = 500.0  # oltre: il preset lento satura l'encoder
+_TIER_BLOCK_OUT_S = 30.0  # attesa dopo un downgrade per saturazione
+
+# Scala dei preset libx264/libx265 dal più veloce al più lento.  Il boost
+# scende di 1 gradino al Tier 1 e di 3 al Tier 2 (mai oltre l'ultimo).
+_PRESET_LADDER = [
+    "ultrafast",
+    "superfast",
+    "veryfast",
+    "faster",
+    "fast",
+    "medium",
+    "slow",
+    "veryslow",
+]
+_PRESET_TIER_STEP = {1: 1, 2: 3}
+_SW_CODECS = {"h264", "libx264", "hevc", "libx265"}
+
+
+def _choose_quality_tier(idle_frames: int, cpu_load: float | None) -> int:
+    """Sceglie il tier qualità (0=base, 1=boost, 2=boost massimo).
+
+    ``cpu_load`` è normalizzato 0..1; ``None`` (piattaforma senza
+    campionatore) vale come carico sconosciuto: si resta prudenti al
+    Tier 1, mai al 2.
+    """
+    if idle_frames < _IDLE_TIER1_FRAMES:
+        return 0
+    if cpu_load is not None and cpu_load >= _CPU_FREE_TIER1:
+        return 0
+    if idle_frames >= _IDLE_TIER2_FRAMES and cpu_load is not None and cpu_load < _CPU_FREE_TIER2:
+        return 2
+    return 1
+
+
+def _slower_preset(preset: str, tier: int) -> str:
+    """Scende di ``_PRESET_TIER_STEP[tier]`` gradini nella scala preset."""
+    idx = _PRESET_LADDER.index(preset) if preset in _PRESET_LADDER else 2
+    return _PRESET_LADDER[min(idx + _PRESET_TIER_STEP.get(tier, 0), len(_PRESET_LADDER) - 1)]
 # Rete di sicurezza: anche a schermo fermo (idle) invia un keyframe di
 # riallineamento ogni N frame catturati — a ~1 fps idle sono ~5 minuti.
 # Il traffico minimo che tiene vivo il flusso è il keepalive 1×1
@@ -69,6 +121,7 @@ _KEYFRAME_IDLE_INTERVAL = 300
 # interpreta il silenzio come stream morto e martella di richieste
 # keyframe da ~340 KB; il tile costa ~600 B/s e tiene vivo il flusso.
 _IDLE_KEEPALIVE_INTERVAL = 1.0  # s
+_BOOST_KEYFRAME_MIN_INTERVAL = 30.0  # s — max un keyframe boostato in raffica
 # JPEG quality per quality preset (lossy ma ~10× più veloce del PNG).
 _TILE_JPEG_QUALITY: dict[QualityLevel, int] = {
     QualityLevel.LOW: 50,
@@ -96,6 +149,14 @@ class PipelineConfig:
     pixel_format: str = "yuv420p"  # "yuv420p" or "yuv444p"
     encoder_preset: str = ""  # empty = auto by quality level
     adaptive_fps: bool = True  # riduce l'fps di cattura a schermo fermo
+    # Sfrutta la CPU idle dell'host per alzare CRF/preset (e yuv444p) sui
+    # keyframe a schermo fermo.  Disattivabile dalle impostazioni.
+    idle_quality_boost: bool = True
+    # True se il pixel format non è stato scelto esplicitamente dall'utente
+    # (in tal caso il Tier 2 può passare a yuv444p per testo più nitido).
+    pixel_format_auto: bool = True
+    # Override del numero di thread dell'encoder SW ("" = default codec).
+    encoder_threads: str = ""
     # True = il backend consegna H.264 già codificato (encoding dentro
     # l'helper PipeWire, zero-copy GPU→encoder): niente tile-diff né
     # encoder PyAV in-process.  Viene disattivato a runtime se il backend
@@ -329,12 +390,22 @@ class EncoderWorker(threading.Thread):
         # stale e riallinea il decoder del client.
         self._dropped_tiles: int = 0
 
-        # Adaptive quality when screen is idle
+        # Adaptive quality when screen is idle (tier basati su CPU host)
         self._last_change_ratio: float = 1.0  # 0.0 = idle, 1.0 = full change
         self._idle_frames: int = 0
         self._last_quality_flip_mono: float = 0.0
-        self._normal_crf: int | None = None
-        self._is_boosted: bool = False
+        self._quality_tier: int = 0
+        self._tier_block_until_mono: float = 0.0
+        self._last_boost_keyframe_mono: float = 0.0
+
+        # Valori base (pre-boost) catturati alla creazione dell'encoder
+        self._base_crf: int | None = None
+        self._base_preset_setting: str = ""
+        self._base_preset_effective: str = "veryfast"
+        self._base_pixel_format: str = "yuv420p"
+        self._base_threads: str = ""
+        self._software_encoder: bool = False
+        self._boost_bases_captured: bool = False
 
         # Throttle ricreazione encoder: il ping-pong boost/restore CRF può
         # arrivare a ricostruire il contesto PyAV 3-4 volte al secondo,
@@ -408,12 +479,13 @@ class EncoderWorker(threading.Thread):
                     crf = self._config.crf
                     if crf is None:
                         crf = _QUALITY_CRF.get(self._config.quality)
-                    # Build options with optional preset override
-                    enc_opts = (
-                        {"preset": self._config.encoder_preset}
-                        if self._config.encoder_preset
-                        else {"preset": "veryfast"}
-                    )
+                    # Build options: preset/threads solo se espliciti, così
+                    # video_codec applica la mappa preset-per-qualità.
+                    enc_opts: dict[str, str] = {}
+                    if self._config.encoder_preset:
+                        enc_opts["preset"] = self._config.encoder_preset
+                    if self._config.encoder_threads:
+                        enc_opts["threads"] = self._config.encoder_threads
 
                     self._encoder = VideoEncoder(
                         EncoderConfig(
@@ -434,19 +506,28 @@ class EncoderWorker(threading.Thread):
                             self._encoder.codec_name,
                             crf or "(bitrate)",
                         )
+                    # Cattura i valori base per il boost (una sola volta)
+                    if not self._boost_bases_captured:
+                        self._base_crf = crf
+                        self._base_preset_setting = self._config.encoder_preset
+                        self._base_preset_effective = self._config.encoder_preset or (
+                            _QUALITY_PRESET.get(self._config.quality, "veryfast")
+                        )
+                        self._base_pixel_format = self._config.pixel_format
+                        self._base_threads = self._config.encoder_threads
+                        self._software_encoder = (
+                            self._encoder.codec_name in _SW_CODECS
+                        )
+                        self._boost_bases_captured = True
                     # La creazione conta come rebuild per il throttle
                     self._last_rebuild_mono = time.monotonic()
 
-                # ── Adaptive quality: idle counter ──
+                # ── Adaptive quality: idle counter + tier basato su CPU ──
                 if self._last_change_ratio < 0.05:
                     self._idle_frames += 1
                 else:
                     self._idle_frames = 0
-                    if self._is_boosted and (
-                        time.monotonic() - self._last_quality_flip_mono
-                        >= _QUALITY_FLIP_HYSTERESIS_S
-                    ):
-                        self._restore_normal_quality()
+                self._update_quality_tier()
 
                 # ── Decidi se inviare full keyframe o tile ──
                 needs_keyframe = (
@@ -463,10 +544,6 @@ class EncoderWorker(threading.Thread):
                     # Resetta il contatore solo quando il keyframe parte
                     # davvero (altrimenti l'intervallo idle non scatta mai)
                     self._frame_count = 0
-                    # Se in idle da tempo, alza la qualità per questo keyframe
-                    if self._idle_frames >= 10:
-                        self._apply_quality_boost()
-
                     self._do_full_keyframe(data, w, h, pts)
                     # Il frame arriva esclusivamente da qui (frame_queue):
                     # nessun'altra componente lo riutilizza, quindi possiamo
@@ -565,7 +642,22 @@ class EncoderWorker(threading.Thread):
         if self._encoder is None:
             return
         self._encoder.request_keyframe()
+        t0 = time.perf_counter()
         packets = self._encoder.encode(rgb)
+        encode_ms = (time.perf_counter() - t0) * 1000.0
+        # Freno anti-saturazione: un preset lento che impiega troppo per un
+        # keyframe boostato viene declassato e bloccato per un po'.
+        if self._quality_tier > 0 and encode_ms > _MAX_BOOST_KEYFRAME_MS:
+            logger.warning(
+                "Adaptive quality: keyframe boostato %.0fms > %.0fms (tier %d) — "
+                "downgrade e blocco boost per %.0fs",
+                encode_ms,
+                _MAX_BOOST_KEYFRAME_MS,
+                self._quality_tier,
+                _TIER_BLOCK_OUT_S,
+            )
+            self._tier_block_until_mono = time.monotonic() + _TIER_BLOCK_OUT_S
+            self._apply_quality_tier(self._quality_tier - 1)
         for pkt in packets:
             if self._queue_packet(pkt, keyframe=True) and self._on_send_full_keyframe:
                 self._on_send_full_keyframe(pkt.data, w, h, pts, pkt.is_keyframe)
@@ -656,52 +748,81 @@ class EncoderWorker(threading.Thread):
 
     # ── adaptive quality ────────────────────────────────────────────
 
-    def _apply_quality_boost(self) -> None:
-        """Aumenta la qualità (CRF più basso) quando lo schermo è fermo.
+    def _update_quality_tier(self) -> None:
+        """Aggiorna il tier qualità in base a idle schermo e carico CPU host."""
+        if self._encoder is None:
+            return
+        if not self._config.idle_quality_boost:
+            target, cpu = 0, None
+        else:
+            cpu = cpu_load_percent()
+            target = _choose_quality_tier(self._idle_frames, cpu)
+        if target == self._quality_tier:
+            return
+        if target < self._quality_tier:
+            # Ritorno alla qualità base: rispetta l'isteresi anti-oscillazione
+            if (
+                time.monotonic() - self._last_quality_flip_mono
+                < _QUALITY_FLIP_HYSTERESIS_S
+            ):
+                return
+        elif time.monotonic() < self._tier_block_until_mono:
+            return
+        self._apply_quality_tier(target, cpu)
 
-        Rilascia e ricrea l'encoder con un CRF ridotto per il prossimo
-        keyframe.  La banda risparmiata durante l'inattività viene
-        reinvestita in qualità.
+    def _apply_quality_tier(self, tier: int, cpu_load: float | None = None) -> None:
+        """Applica il tier: CRF più basso, preset più lento, più thread.
+
+        Il costo extra è accettabile solo perché il boost parte a schermo
+        fermo, quando l'host non sta facendo altro.  Un preset scelto
+        esplicitamente dall'utente non viene mai modificato.
         """
-        if self._encoder is None or self._is_boosted:
-            return
+        crf = self._base_crf
+        if crf is not None:
+            step = {1: 4, 2: 8}.get(tier, 0)
+            crf = max(_MIN_BOOST_CRF, crf - step)
 
-        crf = self._config.crf
-        if crf is None:
-            crf = _QUALITY_CRF.get(self._config.quality)
-        if crf is None:
-            return
+        preset = self._base_preset_effective
+        if tier and self._software_encoder and not self._base_preset_setting:
+            preset = _slower_preset(self._base_preset_effective, tier)
 
-        # Salva il CRF originale e imposta un CRF più basso (qualità più alta)
-        self._normal_crf = crf
-        boosted = max(10, crf - 4)  # CRF -4 = qualità molto più alta
+        pixel_format = self._base_pixel_format
+        if tier == 2 and self._software_encoder and self._config.pixel_format_auto:
+            # yuv444p: chroma a piena risoluzione, testo più nitido.  Vale
+            # solo su keyframe rari (idle), quindi il costo CPU è irrilevante.
+            pixel_format = "yuv444p"
+
+        threads = self._base_threads
+        if tier == 2 and self._software_encoder:
+            threads = str(max(2, min(4, (os.cpu_count() or 2) - 1)))
+
+        self._config.crf = crf
+        self._config.encoder_preset = preset if tier else self._base_preset_setting
+        self._config.pixel_format = pixel_format
+        self._config.encoder_threads = threads
 
         logger.info(
-            "Adaptive quality: idle=%d frames, boosting CRF %d→%d",
+            "Adaptive quality: tier %d→%d (idle=%d frames, cpu=%s, crf=%s, "
+            "preset=%s, threads=%s, pix_fmt=%s)",
+            self._quality_tier,
+            tier,
             self._idle_frames,
+            f"{cpu_load * 100:.0f}%" if cpu_load is not None else "n/d",
             crf,
-            boosted,
+            preset or "auto",
+            threads or "auto",
+            pixel_format,
         )
-        self._config.crf = boosted
-        self._is_boosted = True
+        self._quality_tier = tier
         self._last_quality_flip_mono = time.monotonic()
         self._try_rebuild_encoder()
 
-    def _restore_normal_quality(self) -> None:
-        """Ripristina il CRF originale quando il movimento riprende."""
-        if not self._is_boosted or self._normal_crf is None:
-            self._is_boosted = False
-            return
-
-        logger.info(
-            "Adaptive quality: motion resumed, restoring CRF %d",
-            self._normal_crf,
-        )
-        self._config.crf = self._normal_crf
-        self._normal_crf = None
-        self._is_boosted = False
-        self._last_quality_flip_mono = time.monotonic()
-        self._try_rebuild_encoder()
+        # Il client vede subito il frame migliore: forza un keyframe, ma
+        # senza raffiche (al massimo uno ogni _BOOST_KEYFRAME_MIN_INTERVAL).
+        now = time.monotonic()
+        if tier > 0 and now - self._last_boost_keyframe_mono >= _BOOST_KEYFRAME_MIN_INTERVAL:
+            self._force_full_keyframe = True
+            self._last_boost_keyframe_mono = now
 
     def _try_rebuild_encoder(self, force: bool = False) -> None:
         """Rilascia l'encoder per ricrearlo (lazy) con il CRF corrente.
