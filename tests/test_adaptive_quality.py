@@ -53,7 +53,7 @@ def test_idle_quality_boost_enabled_by_default() -> None:
 
 def test_cpu_load_uses_load_average(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(platform_utils.sys, "platform", "linux")
-    monkeypatch.setattr(platform_utils.os, "getloadavg", lambda: (1.6, 0.0, 0.0))
+    monkeypatch.setattr(platform_utils.os, "getloadavg", lambda: (1.6, 0.0, 0.0), raising=False)
     monkeypatch.setattr(platform_utils.os, "cpu_count", lambda: 8)
     # Forza un nuovo campione (la cache è di 1 s)
     monkeypatch.setattr(platform_utils, "_cpu_last_sample_mono", 0.0)
@@ -70,5 +70,5 @@ def test_cpu_load_returns_none_when_unavailable(monkeypatch: pytest.MonkeyPatch)
     def _boom() -> tuple[float, float, float]:
         raise OSError("no loadavg")
 
-    monkeypatch.setattr(platform_utils.os, "getloadavg", _boom)
+    monkeypatch.setattr(platform_utils.os, "getloadavg", _boom, raising=False)
     assert platform_utils.cpu_load_percent() is None

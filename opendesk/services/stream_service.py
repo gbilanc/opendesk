@@ -321,9 +321,7 @@ class StreamService(QObject):
         crf = _QUALITY_CRF.get(quality)
 
         # Pixel format: default dal PlatformConfig, poi da impostazioni
-        pixel_format_setting = cast(
-            str, self._settings.value("video/pixel_format", "", type=str)
-        )
+        pixel_format_setting = cast(str, self._settings.value("video/pixel_format", "", type=str))
         pixel_format = pixel_format_setting
         if not pixel_format:
             pixel_format = cfg.default_pixel_format

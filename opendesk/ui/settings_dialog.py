@@ -787,9 +787,7 @@ class SettingsDialog(QDialog):
         )
         self._settings.setValue("video/max_fps", self._fps_spin.value())
         self._settings.setValue("video/adaptive_fps", self._adaptive_fps.isChecked())
-        self._settings.setValue(
-            "video/idle_quality_boost", self._idle_quality_boost.isChecked()
-        )
+        self._settings.setValue("video/idle_quality_boost", self._idle_quality_boost.isChecked())
         self._settings.setValue("video/preencoded_capture", self._preencoded.isChecked())
         self._settings.setValue(
             "video/codec",

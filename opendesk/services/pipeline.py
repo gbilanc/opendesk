@@ -111,6 +111,8 @@ def _slower_preset(preset: str, tier: int) -> str:
     """Scende di ``_PRESET_TIER_STEP[tier]`` gradini nella scala preset."""
     idx = _PRESET_LADDER.index(preset) if preset in _PRESET_LADDER else 2
     return _PRESET_LADDER[min(idx + _PRESET_TIER_STEP.get(tier, 0), len(_PRESET_LADDER) - 1)]
+
+
 # Rete di sicurezza: anche a schermo fermo (idle) invia un keyframe di
 # riallineamento ogni N frame catturati — a ~1 fps idle sono ~5 minuti.
 # Il traffico minimo che tiene vivo il flusso è il keepalive 1×1
@@ -515,9 +517,7 @@ class EncoderWorker(threading.Thread):
                         )
                         self._base_pixel_format = self._config.pixel_format
                         self._base_threads = self._config.encoder_threads
-                        self._software_encoder = (
-                            self._encoder.codec_name in _SW_CODECS
-                        )
+                        self._software_encoder = self._encoder.codec_name in _SW_CODECS
                         self._boost_bases_captured = True
                     # La creazione conta come rebuild per il throttle
                     self._last_rebuild_mono = time.monotonic()
@@ -761,10 +761,7 @@ class EncoderWorker(threading.Thread):
             return
         if target < self._quality_tier:
             # Ritorno alla qualità base: rispetta l'isteresi anti-oscillazione
-            if (
-                time.monotonic() - self._last_quality_flip_mono
-                < _QUALITY_FLIP_HYSTERESIS_S
-            ):
+            if time.monotonic() - self._last_quality_flip_mono < _QUALITY_FLIP_HYSTERESIS_S:
                 return
         elif time.monotonic() < self._tier_block_until_mono:
             return
