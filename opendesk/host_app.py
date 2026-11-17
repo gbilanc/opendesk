@@ -14,10 +14,7 @@ import time
 import traceback
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
-
-if TYPE_CHECKING:
-    from opendesk.ui.file_transfer_ui import FileBrowserDock
+from typing import cast
 
 from PySide6.QtCore import QEvent, QObject, QSettings, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QCloseEvent, QIcon
@@ -88,8 +85,6 @@ class HostService(QObject):
         Messaggio chat ricevuto dal/sul peer remoto.
     chat_open_requested(open: bool)
         Il peer remoto ha aperto/chiuso la chat.
-    file_transfer_started()
-        Un trasferimento file e' iniziato (per mostrare la UI).
     """
 
     status_changed = Signal(str)
@@ -100,7 +95,6 @@ class HostService(QObject):
     streaming_stopped = Signal()
     chat_message_received = Signal(str, bool)
     chat_open_requested = Signal(bool)
-    file_transfer_started = Signal()
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -350,20 +344,16 @@ class HostService(QObject):
     # ── file transfer polling ──────────────────────────────────────────
 
     def _poll_file_transfer(self) -> None:
-        """Polla la coda degli aggiornamenti file transfer (main thread)."""
+        """Drena la coda degli aggiornamenti file transfer (main thread).
+
+        L'host non ha UI di file transfer: gli eventi servono solo a
+        evitare che la coda cresca senza limite.
+        """
         try:
             got_event = False
             while True:
-                event = self._file_transfer.updates.get_nowait()
+                self._file_transfer.updates.get_nowait()
                 got_event = True
-                kind = event[0]
-
-                if kind == "transfer":
-                    self.file_transfer_started.emit()
-                elif kind == "listing":
-                    pass  # handled by FileBrowserDock internally
-                elif kind == "status":
-                    pass
         except queue.Empty:
             pass
         finally:
@@ -373,13 +363,12 @@ class HostService(QObject):
                 self._ft_poll_timer.start(new_interval)
 
     def respond_to_incoming_file(self, job_id: str, accepted: bool) -> None:
-        """Accept or reject a file request after the host user decides."""
+        """Accept or reject a file request without host confirmation."""
         job = self._file_transfer.get_job(job_id)
         if job is None:
             return
         if accepted and self._file_transfer.accept_incoming(job_id):
             self._relay.send_message(Message.file_accept(job_id))
-            self.file_transfer_started.emit()
             return
 
         reason = job.error or "Rejected by local user"
@@ -624,7 +613,6 @@ class HostWindow(QMainWindow):
 
         # ── Sub-windows (lazy) ──
         self._chat_panel: ChatPanel | None = None
-        self._transfer_dock: FileBrowserDock | None = None
 
         # ── Build UI ──
         self._setup_central_widget()
@@ -918,7 +906,6 @@ class HostWindow(QMainWindow):
         svc.peer_disconnected.connect(self._on_peer_disconnected)
         svc.chat_message_received.connect(self._on_chat_message)
         svc.chat_open_requested.connect(self._on_chat_open)
-        svc.file_transfer_started.connect(self._on_file_transfer_event)
 
         # Stato iniziale: la sessione può esistere già prima della finestra.
         if svc.session_id:
@@ -1008,61 +995,6 @@ class HostWindow(QMainWindow):
     @Slot(str)
     def _on_chat_message_sent(self, text: str) -> None:
         self._service.relay.send_message(Message.chat_message(text))
-
-    # ── File transfer handlers ──────────────────────────────────────────
-
-    @Slot()
-    def _on_file_transfer_event(self) -> None:
-        """Mostra il dock file transfer quando il remoto invia un file."""
-        dock = self._ensure_transfer_dock()
-        if not dock.isVisible():
-            dock.show()
-            dock.set_connected(True)
-            dock.set_status("Connected — file transfer ready")
-            self._service.file_transfer.request_remote_listing(
-                "",
-                self._service.relay.send_message,
-            )
-
-    def _ensure_transfer_dock(self) -> FileBrowserDock:
-        """Crea il dock file transfer al primo uso (lazy)."""
-        if self._transfer_dock is None:
-            from opendesk.ui.file_transfer_ui import FileBrowserDock
-
-            dock = FileBrowserDock(self)
-            dock.file_upload_requested.connect(self._on_browser_upload)
-            dock.file_download_requested.connect(self._on_browser_download)
-            dock.remote_listing_requested.connect(self._on_browser_remote_listing)
-            self._transfer_dock = dock
-        return self._transfer_dock
-
-    @Slot(list, str)
-    def _on_browser_upload(self, paths: list[str], remote_dest: str = "/") -> None:
-        if not paths:
-            return
-        self._service.file_transfer.send_files(
-            paths,
-            self._service.relay.send_message,
-            remote_dest_path=remote_dest,
-        )
-
-    @Slot(list, str)
-    def _on_browser_download(self, remote_paths: list[str], local_dest: str = "") -> None:
-        if not remote_paths:
-            return
-        for rpath in remote_paths:
-            self._service.file_transfer.request_download(
-                rpath,
-                self._service.relay.send_message,
-                local_dest=local_dest,
-            )
-
-    @Slot(str)
-    def _on_browser_remote_listing(self, path: str) -> None:
-        self._service.file_transfer.request_remote_listing(
-            path,
-            self._service.relay.send_message,
-        )
 
     # ── Copy ────────────────────────────────────────────────────────────
 
@@ -1174,8 +1106,6 @@ class HostWindow(QMainWindow):
             self._chat_panel.close()
             self._chat_panel.deleteLater()
             self._chat_panel = None
-        if self._transfer_dock:
-            self._transfer_dock.close()
         event.accept()
 
 

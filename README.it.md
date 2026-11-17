@@ -121,7 +121,7 @@ cartella *Esecuzione automatica*; su macOS usare un LaunchAgent.
 - Con `--minimized` parte direttamente nella **system tray** senza finestra
 - Accetta solo connessioni **in ingresso** — nessun pannello dispositivi
 - Quando un client remoto si connette: **streaming schermo**, **input remoto**
-- **Chat** e **File transfer** si attivano automaticamente su richiesta del remoto
+- **Chat** si attiva su richiesta del remoto; **file transfer** (solo dal client) avviene in background, senza conferma né finestra sull'host
 - **Settings** per pre-autorizzazione dispositivi (bypass password), video, rete
 
 ### Cosa NON fa (rispetto a OpenDesk completo)
