@@ -51,6 +51,19 @@ from opendesk.network.protocol import Message, MessageType
 
 logger = logging.getLogger(__name__)
 
+# cv2 è caricato lazy (solo se arrivano tile) ma senza ripetere il lookup
+# dell'import system a ogni tile: il riferimento è cacheato qui.
+_cv2: Any = None
+
+
+def _get_cv2() -> Any:  # noqa: ANN401
+    global _cv2  # noqa: PLW0603
+    if _cv2 is None:
+        import cv2
+
+        _cv2 = cv2
+    return _cv2
+
 # ---------------------------------------------------------------------------
 # Role
 # ---------------------------------------------------------------------------
@@ -170,6 +183,10 @@ class _RelaySession:
 
         # Tile grid compositing (client side)
         self._reference_frame: np.ndarray | None = None
+        # True quando _reference_frame è un alias dell'array consegnato
+        # all'UI (nessuna copia fatta al keyframe): la copia viene rimandata
+        # al primo tile che deve scriverci sopra (copy-on-write).
+        self._reference_is_alias: bool = False
         self._frame_width: int = 0
         self._frame_height: int = 0
         self._last_keyframe_time: float = 0.0
@@ -1250,11 +1267,12 @@ class _RelaySession:
                             )
                             if rgb is not None:
                                 _frame_count += 1
-                                # decode() restituisce un array fresco a ogni
-                                # chiamata: il riferimento (mutato in-place
-                                # dalla composizione tile) richiede una copia,
-                                # ma l'inbox può prendere rgb direttamente.
-                                self._reference_frame = rgb.copy()
+                                # Copy-on-write: niente copia full-frame
+                                # (~6 MB a 1080p) a ogni keyframe.  La copia
+                                # avviene solo se/quando un tile deve
+                                # scrivere sul reference (vedi VIDEO_TILE).
+                                self._reference_frame = rgb
+                                self._reference_is_alias = True
                                 self._frame_width = width
                                 self._frame_height = height
                                 now = time.time()
@@ -1306,8 +1324,7 @@ class _RelaySession:
                     )
                     if data and tw > 0 and th > 0 and self._reference_frame is not None:
                         try:
-                            import cv2
-                            import numpy as np
+                            cv2 = _get_cv2()
 
                             arr = np.frombuffer(data, dtype=np.uint8)
                             tile_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -1321,6 +1338,11 @@ class _RelaySession:
                                 ref_h, ref_w = self._reference_frame.shape[:2]
                                 self._last_video_activity_time = time.time()
                                 if ty + th <= ref_h and tx + tw <= ref_w:
+                                    if self._reference_is_alias:
+                                        # Primo tile dopo il keyframe: stacca
+                                        # il reference dall'array dell'UI.
+                                        self._reference_frame = self._reference_frame.copy()
+                                        self._reference_is_alias = False
                                     self._reference_frame[ty : ty + th, tx : tx + tw] = tile_rgb
                                     # Invia all'UI SOLO la regione del tile:
                                     # niente copia full-frame del reference

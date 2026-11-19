@@ -164,30 +164,25 @@ class Message:
 
     @classmethod
     async def from_reader(cls, reader: Any) -> Message:  # noqa: ANN401
-        """Read and decode a message from an asyncio StreamReader."""
-        header_data = b""
-        while len(header_data) < _HEADER_SIZE:
-            chunk = await reader.read(_HEADER_SIZE - len(header_data))
-            if not chunk:
-                raise ConnectionError("Connection closed while reading header")
-            header_data += chunk
+        """Read and decode a message from an asyncio StreamReader.
+
+        Raises ``asyncio.IncompleteReadError`` if the connection closes
+        mid-message and ``ValueError`` if the declared size exceeds the
+        protocol limit.
+        """
+        header_data = await reader.readexactly(_HEADER_SIZE)
 
         body_len = struct.unpack(_HEADER_FORMAT, header_data)[0]
         if body_len > _MAX_MESSAGE_SIZE:
             raise ValueError(f"Message too large: {body_len} bytes")
 
-        body_buf = bytearray(body_len)
-        bytes_read = 0
-        while bytes_read < body_len:
-            chunk = await reader.read(body_len - bytes_read)
-            if not chunk:
-                raise ConnectionError("Connection closed while reading body")
-            body_buf[bytes_read : bytes_read + len(chunk)] = chunk
-            bytes_read += len(chunk)
-
-        # Reconstruct full wire-format for decode()
-        wire_data = header_data + bytes(body_buf)
-        return cls.decode(wire_data)
+        body = await reader.readexactly(body_len)
+        obj = msgpack.unpackb(body)
+        return cls(
+            type=MessageType(obj["t"]),
+            payload=obj.get("p", {}),
+            encrypted=obj.get("e", False),
+        )
 
     @staticmethod
     def write(writer: Any, msg: Message) -> None:  # noqa: ANN401

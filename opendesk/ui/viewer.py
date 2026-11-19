@@ -300,6 +300,12 @@ class RemoteViewer(QGraphicsView):
         self._frame_buffers: deque[bytearray] = deque(maxlen=3)
         self._buffer_idx: int = 0
 
+        # ── Tile batching: più tile nello stesso giro di event-loop
+        # condividono un'unica QPixmap e un solo setPixmap (un redraw
+        # della scena per frame invece di uno per tile).
+        self._pending_pixmap: QPixmap | None = None
+        self._tile_flush_pending: bool = False
+
         # ── HUD data ──
         self._fps: float = 0.0
         self._bitrate_kbps: float = 0.0
@@ -420,6 +426,9 @@ class RemoteViewer(QGraphicsView):
             if pixmap.isNull():
                 return
 
+            # Un full frame rimpiazza i tile accumulati in attesa di flush
+            self._pending_pixmap = None
+
             # ── Update or create scene pixmap ─────────────────────
             if self._pixmap_item is None:
                 self._pixmap_item = self._scene.addPixmap(pixmap)
@@ -466,18 +475,34 @@ class RemoteViewer(QGraphicsView):
         """
         if self._pixmap_item is None:
             return
-        pixmap = self._pixmap_item.pixmap()
+        # Riusa la pixmap in attesa di flush: i tile dello stesso frame
+        # si accumulano su di essa e producono un solo setPixmap/redraw.
+        pixmap = (
+            self._pending_pixmap
+            if self._pending_pixmap is not None
+            else self._pixmap_item.pixmap()
+        )
         if pixmap.isNull() or x + w > pixmap.width() or y + h > pixmap.height():
             return
         img = QImage(cast(bytes, rgb_data), w, h, w * 3, QImage.Format.Format_RGB888).copy()
         painter = QPainter(pixmap)
         painter.drawImage(x, y, img)
         painter.end()
-        self._pixmap_item.setPixmap(pixmap)
+        self._pending_pixmap = pixmap
+        if not self._tile_flush_pending:
+            self._tile_flush_pending = True
+            QTimer.singleShot(0, self._flush_tiles)
         self._frame_count_since_hud += 1
         self._last_frame_time = time.time()
         if self._connection_active:
             self._frame_timeout_timer.start(_FRAME_TIMEOUT_MS)
+
+    def _flush_tiles(self) -> None:
+        """Applica alla scena la pixmap con i tile accumulati (uno per giro)."""
+        self._tile_flush_pending = False
+        pixmap, self._pending_pixmap = self._pending_pixmap, None
+        if pixmap is not None and self._pixmap_item is not None:
+            self._pixmap_item.setPixmap(pixmap)
 
     def set_connection_active(self, active: bool) -> None:
         """Mark connection state for UI updates."""

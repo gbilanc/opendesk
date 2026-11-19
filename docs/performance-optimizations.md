@@ -184,7 +184,7 @@ riporta la geometria reale dello stream.
 
 ### 17. `core/screen_capture.py` — copie rimosse su Windows/X11
 
-- `_capture_dxgi` / `_loop_dxgi`: `np.ascontiguousarray(...)` incondizionato
+- `_capture_dxgi` (e l'allora `_loop_dxgi`, rimosso nel Round 4): `np.ascontiguousarray(...)` incondizionato
   su ogni frame (copia full-frame ~6 MB @1080p) → ora si converte solo se
   dtype o contiguità non sono già quelli giusti (dxcam è già uint8 C-contiguo).
 - `_capture_mss`: `ScreenShot.rgb` di mss è già un `bytes` **nuovo** per ogni
@@ -278,5 +278,26 @@ encoder H.264 GStreamer (stream attivo: 1 keyframe + 20 tile in 12 s).
 
 Test: `tests/test_preencoded_capture.py` + suite completa
 (`174 passed, 12 failed` = i 12 fail ambientali noti).
+
+## Round 4 — revisione 2026-11-19 (lato client: decode → display)
+
+| # | File | Modifica | Impatto |
+|---|------|----------|---------|
+| 18 | `opendesk/ui/viewer.py` | `display_tile` con **batching**: i tile dello stesso giro di event-loop condividono una QPixmap e un solo `setPixmap` (`_flush_tiles` via `QTimer.singleShot(0, ...)`) | Da N redraw della scena a 1 per frame in scene con molto movimento |
+| 19 | `opendesk/network/relay_client.py` | Reference frame **copy-on-write**: niente `rgb.copy()` (~6 MB @1080p) a ogni keyframe; la copia avviene solo al primo tile che scrive sul reference | Keyframe idle a schermo fermo a costo zero di memcpy |
+| 20 | `opendesk/network/relay_client.py` | `import cv2`/`numpy` nell'handler VIDEO_TILE → `_get_cv2()` con cache a livello modulo | Niente lookup dell'import system per tile; caricamento cv2 resta lazy |
+| 21 | `opendesk/network/protocol.py` | `from_reader` riscritto con `readexactly`, decodifica msgpack diretta dal body | Eliminati i loop di accumulo e la copia `header + body` per messaggio; EOF → `asyncio.IncompleteReadError` (già gestita in `_read_loop`) |
+| 22 | `opendesk/core/screen_capture.py` | Rimosso **dead code**: `capture_loop` + `_loop_dxgi`/`_loop_mss`/`_loop_pipewire`/`_loop_portal`, `PipeWireCapture.capture_loop`, `_compute_fps` e stato orfano (`_prev_frames`, `fps_target`, `adaptive_fps`, …) | ~200 righe in meno; eliminato anche il **doppio diff** (quei loop facevano `frame_diff_ratio` e l'encoder avrebbe rifatto `_changed_mask`) |
+
+### Nota su un'ottimizzazione valutata e scartata
+
+**Double-buffer del `_frame_buf` nel path helper-process** (`screen_capture.py`):
+eliminerebbe la `.copy()` da ~6 MB/frame, ma `_prev_frame` nell'`EncoderWorker`
+può trattenere il frame oltre il frame successivo senza ownership tracking;
+riusare il buffer dopo 2 frame sarebbe una race condition (corruzione video).
+La copia resta: è il prezzo corretto dell'ownership esclusiva.  Rimuoverla
+richiederebbe un buffer pool con refcounting, sproporzionato al guadagno.
+
+Verifica: suite completa `192 passed, 2 skipped`, ruff pulito.
 
 

@@ -13,7 +13,6 @@ import os
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
 from dataclasses import dataclass
 from threading import Lock
 from typing import Any
@@ -409,15 +408,6 @@ class PipeWireCapture:
         )
         return None
 
-    def capture_loop(self, monitor_index: int = 0):
-        """Generator that yields frames from the PipeWire subprocess."""
-        self.start(monitor_index)
-        while True:
-            frame = self.capture_one(monitor_index)
-            if frame is None:
-                break
-            yield frame
-
     def monitors(self) -> list[MonitorInfo]:
         if self._monitors:
             return self._monitors
@@ -549,7 +539,6 @@ class ScreenCapture:
         self._sct: Any = None
         self._pw: PipeWireCapture | None = None
         self._portal: Any = None  # WaylandScreenCast — created lazily
-        self._prev_frames: dict[int, np.ndarray] = {}
         # ── DXGI (Windows) ──
         self._dxgi: object | None = None  # dxcam camera, created lazily
         self._dxgi_monitor = -1
@@ -561,27 +550,7 @@ class ScreenCapture:
         self._last_dxgi_frame_mono: float = 0.0
         # Rate-limit log errori del fallback GDI nel path idle DXGI.
         self._last_idle_err_log: float = 0.0
-        self._fps_target: float = 30.0
-        self._fps_adaptive: bool = True
-        self._min_fps: float = 1.0
-        self._idle_counter: int = 0
         logger.info("Screen capture: %s", self._method.name)
-
-    @property
-    def fps_target(self) -> float:
-        return self._fps_target
-
-    @fps_target.setter
-    def fps_target(self, value: float) -> None:
-        self._fps_target = max(1.0, min(60.0, value))
-
-    @property
-    def adaptive_fps(self) -> bool:
-        return self._fps_adaptive
-
-    @adaptive_fps.setter
-    def adaptive_fps(self, enabled: bool) -> None:
-        self._fps_adaptive = enabled
 
     @property
     def capture_method(self) -> CaptureMethod:
@@ -727,18 +696,6 @@ class ScreenCapture:
                 "On X11, ensure the display is accessible."
             ) from e
 
-    # ── capture loop ────────────────────────────────────────────────
-
-    def capture_loop(self, monitor_index: int = 0) -> Iterator[CapturedFrame]:
-        if self._method == CaptureMethod.PORTAL:
-            yield from self._loop_portal(monitor_index)
-        elif self._method == CaptureMethod.PIPEWIRE:
-            yield from self._loop_pipewire(monitor_index)
-        elif self._method == CaptureMethod.DXGI:
-            yield from self._loop_dxgi(monitor_index)
-        else:
-            yield from self._loop_mss(monitor_index)
-
     # ── lifecycle ───────────────────────────────────────────────────
 
     def release(self) -> None:
@@ -751,7 +708,6 @@ class ScreenCapture:
                 self._pw = None
             if self._portal is not None:
                 self._release_portal()
-            self._prev_frames.clear()
             self._release_dxgi()
 
     def __enter__(self) -> ScreenCapture:
@@ -855,38 +811,6 @@ class ScreenCapture:
             region=region,
         )
 
-    def _loop_dxgi(self, monitor_index: int = 0) -> Iterator[CapturedFrame]:
-        """DXGI capture loop con fps adattivo (stessa policy di _loop_mss)."""
-        sct = self._get_sct()
-        mon = sct.monitors[monitor_index + 1]
-        diff = 1.0
-        while True:
-            t0 = time.perf_counter()
-            cam = self._get_dxgi(monitor_index)
-            if cam is None:
-                yield from self._loop_mss(monitor_index)
-                return
-            rgb = cam.grab()
-            if rgb is None:
-                # Nessun nuovo frame: breve sleep per non bruciare CPU/GPU.
-                time.sleep(0.005)
-            else:
-                if rgb.dtype != np.uint8 or not rgb.flags["C_CONTIGUOUS"]:
-                    rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
-                prev = self._prev_frames.get(monitor_index)
-                diff = frame_diff_ratio(rgb, prev, threshold=12)
-                self._prev_frames[monitor_index] = rgb
-                yield CapturedFrame(
-                    data=rgb,
-                    monitor_index=monitor_index,
-                    timestamp=t0,
-                    region=(mon["left"], mon["top"], mon["width"], mon["height"]),
-                )
-            elapsed = time.perf_counter() - t0
-            sleep_needed = max(0.0, (1.0 / self._compute_fps(diff)) - elapsed)
-            if sleep_needed > 0:
-                time.sleep(sleep_needed)
-
     def _release_dxgi(self) -> None:
         if self._dxgi is not None:
             release = getattr(self._dxgi, "release", None)
@@ -936,64 +860,12 @@ class ScreenCapture:
                 ) from e
             raise
 
-    def _loop_mss(self, monitor_index: int = 0) -> Iterator[CapturedFrame]:
-        sct = self._get_sct()
-        mon = sct.monitors[monitor_index + 1]
-        while True:
-            t0 = time.perf_counter()
-            raw = sct.grab(mon)
-            buf = np.frombuffer(raw.rgb, dtype=np.uint8).reshape(raw.height, raw.width, 3)
-            rgb = buf[:, :, :3].copy()
-            prev = self._prev_frames.get(monitor_index)
-            diff = frame_diff_ratio(rgb, prev, threshold=12)
-            self._prev_frames[monitor_index] = rgb
-            yield CapturedFrame(
-                data=rgb,
-                monitor_index=monitor_index,
-                timestamp=t0,
-                region=(mon["left"], mon["top"], mon["width"], mon["height"]),
-            )
-            elapsed = time.perf_counter() - t0
-            sleep_needed = max(0.0, (1.0 / self._compute_fps(diff)) - elapsed)
-            if sleep_needed > 0:
-                time.sleep(sleep_needed)
-
     # ── internal: PipeWire ──────────────────────────────────────────
 
     def _get_pw(self) -> PipeWireCapture:
         if self._pw is None:
             self._pw = PipeWireCapture()
         return self._pw
-
-    def _loop_pipewire(self, monitor_index: int = 0) -> Iterator[CapturedFrame]:
-        pw = self._get_pw()
-        pw.start(monitor_index)
-        consecutive_none = 0
-        while True:
-            t0 = time.perf_counter()
-            frame = pw.capture_one(monitor_index)
-            if frame is None:
-                if pw.has_failed:
-                    logger.warning("PipeWire failed, falling back to MSS")
-                    yield from self._loop_mss(monitor_index)
-                    return
-                # Still waiting for portal — brief sleep, keep trying
-                consecutive_none += 1
-                if consecutive_none > 300:  # ~10 s at 30 fps
-                    logger.warning("PipeWire timed out, falling back to MSS")
-                    yield from self._loop_mss(monitor_index)
-                    return
-                time.sleep(0.01)
-                continue
-            consecutive_none = 0
-            prev = self._prev_frames.get(monitor_index)
-            diff = frame_diff_ratio(frame.data, prev, threshold=12)
-            self._prev_frames[monitor_index] = frame.data
-            yield frame
-            elapsed = time.perf_counter() - t0
-            sleep_needed = max(0.0, (1.0 / self._compute_fps(diff)) - elapsed)
-            if sleep_needed > 0:
-                time.sleep(sleep_needed)
 
     # ── internal: PORTAL (WaylandScreenCast D-Bus + GStreamer) ─────
 
@@ -1066,42 +938,6 @@ class ScreenCapture:
             region=(0, 0, w, h),
         )
 
-    def _loop_portal(self, monitor_index: int = 0) -> Iterator[CapturedFrame]:
-        """Continuous capture via PORTAL (WaylandScreenCast)."""
-        try:
-            wsc = self._get_portal()
-        except Exception as e:
-            logger.warning("PORTAL init failed: %s — falling back to PIPEWIRE", e)
-            self._method = CaptureMethod.PIPEWIRE
-            yield from self._loop_pipewire(monitor_index)
-            return
-
-        w = wsc.width
-        h = wsc.height
-        while True:
-            t0 = time.perf_counter()
-            rgb = wsc.capture_frame_sync()
-            if rgb is None:
-                logger.warning("PORTAL stream ended, falling back to PIPEWIRE")
-                self._release_portal()
-                self._method = CaptureMethod.PIPEWIRE
-                yield from self._loop_pipewire(monitor_index)
-                return
-
-            prev = self._prev_frames.get(monitor_index)
-            diff = frame_diff_ratio(rgb, prev, threshold=12)
-            self._prev_frames[monitor_index] = rgb
-            yield CapturedFrame(
-                data=rgb,
-                monitor_index=monitor_index,
-                timestamp=t0,
-                region=(0, 0, w, h),
-            )
-            elapsed = time.perf_counter() - t0
-            sleep_needed = max(0.0, (1.0 / self._compute_fps(diff)) - elapsed)
-            if sleep_needed > 0:
-                time.sleep(sleep_needed)
-
     def _release_portal(self) -> None:
         """Shut down the portal session synchronously."""
         if self._portal is None:
@@ -1121,22 +957,6 @@ class ScreenCapture:
         else:
             asyncio.run(self._portal.shutdown())
         self._portal = None
-
-    # ── FPS helper ──────────────────────────────────────────────────
-
-    def _compute_fps(self, diff: float) -> float:
-        if not self._fps_adaptive:
-            return self._fps_target
-        if diff < 0.001:
-            self._idle_counter += 1
-        else:
-            self._idle_counter = 0
-        if self._idle_counter > 10:
-            return self._min_fps
-        if diff < 0.01:
-            return max(self._min_fps, self._fps_target * 0.3)
-        return self._fps_target
-
 
 # ---------------------------------------------------------------------------
 # Convenience screenshot
