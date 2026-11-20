@@ -240,6 +240,10 @@ class SettingsDialog(QDialog):
         self._relay_port.setValue(8474)
         net_layout.addRow("Relay Port:", self._relay_port)
 
+        self._relay_tls = QCheckBox("Use TLS (verify server certificate)")
+        self._relay_tls.setChecked(True)
+        net_layout.addRow("", self._relay_tls)
+
         self._enable_relay = QCheckBox("Enable relay fallback")
         self._enable_relay.setChecked(True)
         net_layout.addRow("", self._enable_relay)
@@ -528,6 +532,9 @@ class SettingsDialog(QDialog):
         self._relay_port.setValue(
             cast(int, self._settings.value("network/relay_port", 8474, type=int))
         )
+        self._relay_tls.setChecked(
+            cast(bool, self._settings.value("network/relay_tls", True, type=bool))
+        )
         self._enable_relay.setChecked(
             cast(bool, self._settings.value("network/enable_relay", True, type=bool))
         )
@@ -813,6 +820,7 @@ class SettingsDialog(QDialog):
         self._settings.setValue("network/stun_server", self._stun_server.text())
         self._settings.setValue("network/relay_host", self._relay_host.text())
         self._settings.setValue("network/relay_port", self._relay_port.value())
+        self._settings.setValue("network/relay_tls", self._relay_tls.isChecked())
         self._settings.setValue("network/enable_relay", self._enable_relay.isChecked())
         self._settings.setValue("network/p2p_enabled", self._enable_p2p.isChecked())
         self._settings.setValue("network/turn_url", self._turn_url.text())

@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import queue
+import ssl
 import threading
 import time
 from collections.abc import Awaitable, Callable
@@ -63,6 +64,7 @@ def _get_cv2() -> Any:  # noqa: ANN401
 
         _cv2 = cv2
     return _cv2
+
 
 # ---------------------------------------------------------------------------
 # Role
@@ -138,9 +140,12 @@ class _RelaySession:
         ice_servers: list | None = None,
         relay_fallback: bool = True,
         allowed_peer_ids: set[str] | None = None,
+        tls: bool = True,
     ) -> None:
         self.host = host
         self.port = port
+        # TLS con verifica del certificato (CA di sistema + hostname).
+        self.tls = tls
         self.session_id = session_id
         self.password = password.strip()
         self.role = role
@@ -874,16 +879,24 @@ class _RelaySession:
         Su fallimento emette gli eventi ``error`` e ``disconnected`` e
         ritorna ``False``; i chiamanti escono subito dal flusso del ruolo.
         """
-        logger.info("%s connecting to relay %s:%s", role_label, self.host, self.port)
+        logger.info(
+            "%s connecting to relay %s:%s (TLS=%s)", role_label, self.host, self.port, self.tls
+        )
         try:
+            ssl_ctx = ssl.create_default_context() if self.tls else None
             self._reader, self._writer = await asyncio.wait_for(
-                asyncio.open_connection(self.host, self.port),
+                asyncio.open_connection(
+                    self.host,
+                    self.port,
+                    ssl=ssl_ctx,
+                    server_hostname=self.host if ssl_ctx else None,
+                ),
                 timeout=_CONNECT_TIMEOUT,
             )
             return True
         except TimeoutError:
             err = f"Connection to relay {self.host}:{self.port} timed out ({_CONNECT_TIMEOUT}s)"
-        except OSError as e:
+        except (OSError, ssl.SSLError) as e:
             err = str(e)
         logger.error("%s connection failed: %s", role_label, err)
         self.inbox.put(("error", err, self.session_seq))
@@ -1546,6 +1559,7 @@ class RelayClient(QObject):
         self._turn_username = ""
         self._turn_credential = ""
         self._relay_fallback = True
+        self._relay_tls = True
         self._ice_servers: list = []
         self._load_p2p_settings()
 
@@ -1591,6 +1605,7 @@ class RelayClient(QObject):
         self._turn_username = cast(str, settings.value("network/turn_username", "", type=str))
         self._turn_credential = cast(str, settings.value("network/turn_credential", "", type=str))
         self._relay_fallback = cast(bool, settings.value("network/enable_relay", True, type=bool))
+        self._relay_tls = cast(bool, settings.value("network/relay_tls", True, type=bool))
         self._ice_servers = build_ice_servers(
             stun_server=self._stun_server,
             turn_url=self._turn_url,
@@ -1658,6 +1673,7 @@ class RelayClient(QObject):
             ice_servers=self._ice_servers,
             relay_fallback=self._relay_fallback,
             allowed_peer_ids=allowed_peer_ids,
+            tls=self._relay_tls,
         )
         self._start_host_thread()
 
@@ -1713,6 +1729,7 @@ class RelayClient(QObject):
             p2p_enabled=self._p2p_enabled,
             ice_servers=self._ice_servers,
             relay_fallback=self._relay_fallback,
+            tls=self._relay_tls,
         )
         self._start_client_thread()
 

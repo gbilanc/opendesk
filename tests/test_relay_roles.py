@@ -133,6 +133,7 @@ class _Session:
             device_name=role.name,
             e2ee_enabled=False,
             p2p_enabled=False,
+            tls=False,  # relay di test in chiaro
         )
         self._thread = threading.Thread(target=self.session.start, daemon=True)
 
@@ -242,6 +243,7 @@ def test_unreachable_relay_reports_error_and_disconnected() -> None:
         inbox=session.inbox,
         e2ee_enabled=False,
         p2p_enabled=False,
+        tls=False,  # relay di test in chiaro
     )
     session._thread = threading.Thread(target=session.session.start, daemon=True)
     session.start()
