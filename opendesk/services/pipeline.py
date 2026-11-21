@@ -74,6 +74,11 @@ _CPU_FREE_TIER2 = 0.30  # carico host sotto cui parte il boost massimo
 # Isteresi d'uscita: il campione CPU include il costo dell'encoder stesso,
 # quindi un boost appena applicato si auto-declasserebbe (rebuild a catena).
 _CPU_TIER_EXIT = 0.75
+# Isteresi sul confine tier1↔tier2: chi è già al tier 2 lo lascia solo oltre
+# questa soglia (più alta di _CPU_FREE_TIER2).  Senza, una CPU che oscilla
+# attorno a 0.30 fa flap tier 1↔2 a ogni frame → release/re-init encoder
+# continui (RCA 2026-11-21: 9 rebuild in 40 s, decoder del peer affamato).
+_CPU_TIER2_EXIT = 0.40
 # Nessun boost nei primi secondi di sessione: l'avvio (init encoder,
 # primo keyframe, assestamento rete) non è rappresentativo del carico idle.
 _BOOST_WARMUP_S = 10.0
@@ -114,8 +119,10 @@ def _choose_quality_tier(idle_frames: int, cpu_load: float | None, current_tier:
     busy_threshold = _CPU_TIER_EXIT if current_tier > 0 else _CPU_FREE_TIER1
     if cpu_load is not None and cpu_load >= busy_threshold:
         return 0
-    if idle_frames >= _IDLE_TIER2_FRAMES and cpu_load is not None and cpu_load < _CPU_FREE_TIER2:
-        return 2
+    if idle_frames >= _IDLE_TIER2_FRAMES and cpu_load is not None:
+        tier2_threshold = _CPU_TIER2_EXIT if current_tier == 2 else _CPU_FREE_TIER2
+        if cpu_load < tier2_threshold:
+            return 2
     return 1
 
 
@@ -782,11 +789,13 @@ class EncoderWorker(threading.Thread):
             target = _choose_quality_tier(self._idle_frames, cpu, self._quality_tier)
         if target == self._quality_tier:
             return
-        if target < self._quality_tier:
-            # Ritorno alla qualità base: rispetta l'isteresi anti-oscillazione
-            if time.monotonic() - self._last_quality_flip_mono < _QUALITY_FLIP_HYSTERESIS_S:
-                return
-        elif time.monotonic() < self._tier_block_until_mono:
+        # Isteresi anti-oscillazione su OGNI cambio di tier, non solo sui
+        # downgrade: prima l'upgrade era ammesso subito, quindi una CPU sul
+        # confine tier1↔2 (o idle_frames sul confine) ri-flippava 1-2 s dopo
+        # il downgrade → rebuild encoder a catena (RCA 2026-11-21).
+        if time.monotonic() - self._last_quality_flip_mono < _QUALITY_FLIP_HYSTERESIS_S:
+            return
+        if target > self._quality_tier and time.monotonic() < self._tier_block_until_mono:
             return
         self._apply_quality_tier(target, cpu)
 

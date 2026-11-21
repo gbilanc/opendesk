@@ -58,6 +58,15 @@ def _log_thread_stacks(stall: float) -> None:
         logger.exception("hang_watchdog: dump stack fallito")
 
 
+def _heartbeat_path() -> str | None:
+    """Path del file di heartbeat: accanto al file di log, se esiste."""
+    for handler in logging.getLogger().handlers:
+        filename = getattr(handler, "baseFilename", None)
+        if filename:
+            return os.path.join(os.path.dirname(filename), "watchdog.beat")
+    return None
+
+
 def _find_pyspy() -> str | None:
     """Trova l'eseguibile py-spy: PATH, oppure accanto all'interprete."""
     exe = shutil.which("py-spy")
@@ -135,8 +144,22 @@ class HangWatchdog:
             self._native_dumped = False
 
     def _run(self) -> None:
+        # Heartbeat su file: se il processo si congela in codice nativo col
+        # GIL tenuto (es. font fallback DirectWrite, RCA 2026-11-21), questo
+        # thread non può né loggare né scrivere — ma il file resta fermo al
+        # momento del freeze, ed è l'unica evidenza post-mortem disponibile.
+        beat_path = _heartbeat_path()
+        last_hb = 0.0
         while True:
             time.sleep(_WATCH_INTERVAL)
+            now = time.monotonic()
+            if beat_path is not None and now - last_hb >= 1.0:
+                last_hb = now
+                try:
+                    with open(beat_path, "w") as f:
+                        f.write(f"{time.time():.3f}\n")
+                except OSError:
+                    pass
             with self._lock:
                 stall = time.monotonic() - self._last_beat
                 # Re-report ogni ~5s se lo stallo persiste (prima: una sola

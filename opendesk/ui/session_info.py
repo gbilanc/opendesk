@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 
 from PySide6.QtCore import Qt, Signal, Slot
-from PySide6.QtGui import QMouseEvent
+from PySide6.QtGui import QBrush, QColor, QIcon, QMouseEvent, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QStyle,
     QVBoxLayout,
     QWidget,
 )
@@ -26,6 +27,27 @@ from opendesk.crypto.auth import generate_otp
 from opendesk.ui.widgets.flash_button import flash_button
 
 logger = logging.getLogger(__name__)
+
+
+def _theme_toggle_icon() -> QIcon:
+    """Icona sole/luna disegnata in codice (metà chiara, metà scura).
+
+    Niente glifi emoji: su Windows ogni carattere fuori dal font base
+    scatena una font-fallback DirectWrite (``populateFamily``), che su
+    macchine con font database degradato blocca l'UI thread per secondi
+    o definitivamente (RCA 2026-11-21, hang in ``DWriteCreateFactory``).
+    """
+    pm = QPixmap(16, 16)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setBrush(QBrush(QColor("#f5c518")))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.drawChord(1, 1, 14, 14, 90 * 16, 180 * 16)  # metà chiara
+    p.setBrush(QBrush(QColor("#3b4252")))
+    p.drawChord(1, 1, 14, 14, 270 * 16, 180 * 16)  # metà scura
+    p.end()
+    return QIcon(pm)
 
 
 class SessionInfoWidget(QWidget):
@@ -142,7 +164,12 @@ class SessionInfoWidget(QWidget):
         row2.addStretch(1)
 
         # ── Refresh button (right-aligned) ──
-        self._refresh_btn = QPushButton("🔄 New Session")
+        # Icona nativa QStyle: niente glifi emoji → niente font-fallback
+        # DirectWrite (vedi nota in _theme_toggle_icon).
+        self._refresh_btn = QPushButton("New Session")
+        self._refresh_btn.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload)
+        )
         self._refresh_btn.setFixedHeight(26)
         self._refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._refresh_btn.setProperty("class", "flat")
@@ -150,7 +177,8 @@ class SessionInfoWidget(QWidget):
         row2.addWidget(self._refresh_btn)
 
         # ── Theme switch (next to New Session) ──
-        self._theme_btn = QPushButton("🌙")
+        self._theme_btn = QPushButton()
+        self._theme_btn.setIcon(_theme_toggle_icon())
         self._theme_btn.setFixedHeight(26)
         self._theme_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._theme_btn.setToolTip("Switch light/dark theme (Ctrl+T)")
@@ -163,8 +191,12 @@ class SessionInfoWidget(QWidget):
 
     @Slot(str)
     def set_theme(self, theme: str) -> None:
-        """Update the switch icon (icon = the theme it will switch to)."""
-        self._theme_btn.setText("☀️" if theme == "dark" else "🌙")
+        """Update the switch tooltip (the icon is theme-agnostic)."""
+        self._theme_btn.setToolTip(
+            "Switch to light theme (Ctrl+T)"
+            if theme == "dark"
+            else "Switch to dark theme (Ctrl+T)"
+        )
 
     @staticmethod
     def _button_style() -> str:
