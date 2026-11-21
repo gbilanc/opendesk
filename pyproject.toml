@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opendesk"
-version = "3.4.1"
+version = "3.4.2"
 description = "Remote desktop application (TeamViewer/AnyDesk-like)"
 readme = "README.md"
 license = {text = "MIT"}
