@@ -1039,6 +1039,18 @@ def _cursor_state() -> tuple[tuple[int, int], int] | None:
     return (ci.ptScreenPos.x, ci.ptScreenPos.y), ci.hCursor
 
 
+def cursor_position() -> tuple[int, int] | None:
+    """Posizione globale del cursore, se visibile e determinabile.
+
+    Usata dallo streaming per non considerare "idle" un desktop in cui
+    l'unico movimento è il puntatore: così il flusso resta fluido mentre
+    l'utente muove il mouse invece di scendere a ``_MIN_IDLE_FPS``.
+    ``None`` su piattaforme non supportate o cursore nascosto.
+    """
+    state = _cursor_state()
+    return state[0] if state is not None else None
+
+
 def _cursor_rgba(hcursor: int) -> tuple[int, int, np.ndarray] | None:
     """Bitmap RGBA (h, w, 4) del cursore, con cache per handle.
 

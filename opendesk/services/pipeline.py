@@ -23,7 +23,7 @@ from collections.abc import Callable
 import cv2
 import numpy as np
 
-from opendesk.core.screen_capture import ScreenCapture, _changed_mask
+from opendesk.core.screen_capture import ScreenCapture, _changed_mask, cursor_position
 from opendesk.core.video_codec import (
     _QUALITY_CRF,
     _QUALITY_PRESET,
@@ -78,7 +78,12 @@ _CPU_TIER_EXIT = 0.75
 # questa soglia (più alta di _CPU_FREE_TIER2).  Senza, una CPU che oscilla
 # attorno a 0.30 fa flap tier 1↔2 a ogni frame → release/re-init encoder
 # continui (RCA 2026-11-21: 9 rebuild in 40 s, decoder del peer affamato).
-_CPU_TIER2_EXIT = 0.40
+_CPU_TIER2_EXIT = 0.60
+# Il campione CPU esterno è istantaneo e i due campionamenti (sistema e
+# processo) non sono sincronizzati: durante un keyframe boostato può
+# schizzare a 95%+ per un attimo.  Un filtro esponenziale evita che il
+# tier insegua questi spike (RCA 2026-11-21: flap 0/1/2 ogni 5 s).
+_CPU_EMA_ALPHA = 0.30
 # Nessun boost nei primi secondi di sessione: l'avvio (init encoder,
 # primo keyframe, assestamento rete) non è rappresentativo del carico idle.
 _BOOST_WARMUP_S = 10.0
@@ -230,6 +235,9 @@ class CaptureWorker(threading.Thread):
         self._on_error = on_error
         self._capture: ScreenCapture | None = None
         self._shared = shared
+        # Ultima posizione del cursore osservata, per distinguere il solo
+        # movimento del puntatore da un desktop realmente fermo.
+        self._last_cursor_pos: tuple[int, int] | None = None
 
     def run(self) -> None:
         logger.info("CaptureWorker started")
@@ -347,14 +355,28 @@ class CaptureWorker(threading.Thread):
             # (già calcolato per i tile — nessun diff extra).  A schermo fermo
             # l'fps scende a _MIN_IDLE_FPS: il keepalive 1×1 dell'encoder e i
             # keyframe idle tengono il flusso vivo con una frazione del CPU.
+            # Il cursore è compositato nel frame, ma da solo produce una
+            # change_ratio minima: senza questo controllo il flusso scende a
+            # _MIN_IDLE_FPS e il puntatore remoto appare a scatti.  Un
+            # puntatore in movimento conta come attività (anche per il boost
+            # qualità, che legge lo stesso flag).
+            pos = cursor_position()
+            cursor_moved = (
+                pos is not None
+                and self._last_cursor_pos is not None
+                and pos != self._last_cursor_pos
+            )
+            self._last_cursor_pos = pos
+            if self._shared is not None:
+                self._shared["cursor_active"] = cursor_moved
             if self._config.adaptive_fps:
                 ratio = float(self._shared.get("change_ratio", 1.0)) if self._shared else 1.0
-                if ratio < 0.001:
-                    fps_target = _MIN_IDLE_FPS
-                elif ratio < 0.01:
-                    fps_target = max(_MIN_IDLE_FPS, self._config.fps * 0.3)
-                else:
+                if cursor_moved or ratio >= 0.01:
                     fps_target = self._config.fps
+                elif ratio < 0.001:
+                    fps_target = _MIN_IDLE_FPS
+                else:
+                    fps_target = max(_MIN_IDLE_FPS, self._config.fps * 0.3)
             elapsed = time.perf_counter() - t0
             sleep = max(0.0, 1.0 / fps_target - elapsed)
             if sleep > 0.001:
@@ -418,6 +440,7 @@ class EncoderWorker(threading.Thread):
         self._idle_frames: int = 0
         self._last_quality_flip_mono: float = 0.0
         self._quality_tier: int = 0
+        self._cpu_ema: float | None = None  # carico esterno filtrato (anti-spike)
         self._start_mono: float = time.monotonic()  # warm-up del boost qualità
         self._tier_block_until_mono: float = 0.0
         self._last_boost_keyframe_mono: float = 0.0
@@ -552,7 +575,10 @@ class EncoderWorker(threading.Thread):
                     self._last_rebuild_mono = time.monotonic()
 
                 # ── Adaptive quality: idle counter + tier basato su CPU ──
-                if self._last_change_ratio < 0.05:
+                if self._shared is not None and self._shared.get("cursor_active"):
+                    # Solo il puntatore si muove: non è idle, niente boost.
+                    self._idle_frames = 0
+                elif self._last_change_ratio < 0.05:
                     self._idle_frames += 1
                 else:
                     self._idle_frames = 0
@@ -790,6 +816,13 @@ class EncoderWorker(threading.Thread):
             # Carico SENZA il nostro processo: quello totale include
             # l'encoder, quindi il boost si auto-declasserebbe (flapping)
             cpu = cpu_load_percent_external()
+            if cpu is not None:
+                self._cpu_ema = (
+                    cpu
+                    if self._cpu_ema is None
+                    else _CPU_EMA_ALPHA * cpu + (1 - _CPU_EMA_ALPHA) * self._cpu_ema
+                )
+                cpu = self._cpu_ema
             target = _choose_quality_tier(self._idle_frames, cpu, self._quality_tier)
         if target == self._quality_tier:
             return

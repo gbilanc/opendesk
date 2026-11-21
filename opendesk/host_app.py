@@ -1315,11 +1315,6 @@ def main_host() -> None:
     app.setWindowIcon(HostWindow._app_icon())
     app.setStyle("Fusion")
 
-    # Diagnostica: logga (con stack) gli stalli del main thread
-    from opendesk.utils.hang_watchdog import HangWatchdog
-
-    _hang_watchdog = HangWatchdog()  # noqa: F841 — tenuto vivo dal riferimento globale
-
     # La finestra puo' essere nascosta nella tray: non uscire quando non
     # resta nessuna finestra visibile.
     app.setQuitOnLastWindowClosed(False)
@@ -1332,6 +1327,14 @@ def main_host() -> None:
     # Crea servizio e finestra
     service = HostService()
     window = HostWindow(service, start_minimized=start_minimized)
+
+    # Diagnostica: logga (con stack) gli stalli del main thread.  Avviato
+    # dopo la costruzione della finestra: la prima enumerazione dei font
+    # DirectWrite blocca il main thread per alcuni secondi anche senza
+    # alcun deadlock (RCA 2026-11-21), e veniva segnalata come hang.
+    from opendesk.utils.hang_watchdog import HangWatchdog
+
+    _hang_watchdog = HangWatchdog()  # noqa: F841 — tenuto vivo dal riferimento globale
 
     # Istante singolo: un secondo avvio riporta in primo piano questa finestra
     lock_server.newConnection.connect(lambda: _on_second_instance(window, lock_server))

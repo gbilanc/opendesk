@@ -777,8 +777,11 @@ class _RelaySession:
             self._close_p2p()
 
     def _on_p2p_message(self, data: bytes) -> None:
+        # Leave the E2E envelope intact: _receive_loop decrypts every incoming
+        # message once. Decrypting here too made the decrypted Message look
+        # encrypted-without-envelope and get dropped on the second pass.
         try:
-            msg = self._decrypt_peer_message(Message.decode(data))
+            msg = Message.decode(data)
         except Exception as e:
             logger.warning("Dropped P2P message: %s", e)
             return
