@@ -32,7 +32,7 @@ from opendesk.core.video_codec import (
     QualityLevel,
     VideoEncoder,
 )
-from opendesk.utils.platform import cpu_load_percent
+from opendesk.utils.platform import cpu_load_percent_external
 
 logger = logging.getLogger(__name__)
 
@@ -82,8 +82,8 @@ _CPU_TIER2_EXIT = 0.40
 # Nessun boost nei primi secondi di sessione: l'avvio (init encoder,
 # primo keyframe, assestamento rete) non è rappresentativo del carico idle.
 _BOOST_WARMUP_S = 10.0
-_MIN_BOOST_CRF = 10  # limite di sicurezza (sotto = bitrate ingestibile)
-_MAX_BOOST_KEYFRAME_MS = 500.0  # oltre: il preset lento satura l'encoder
+_MIN_BOOST_CRF = 12  # limite di sicurezza (sotto = bitrate ingestibile + CPU)
+_MAX_BOOST_KEYFRAME_MS = 300.0  # oltre: il preset lento satura l'encoder
 _TIER_BLOCK_OUT_S = 30.0  # attesa dopo un downgrade per saturazione
 
 # Scala dei preset libx264/libx265 dal più veloce al più lento.  Il boost
@@ -98,7 +98,9 @@ _PRESET_LADDER = [
     "slow",
     "veryslow",
 ]
-_PRESET_TIER_STEP = {1: 1, 2: 3}
+# Tier 2: 2 gradini (non 3) e CRF −6 (non −8): su encoder software il
+# salto superfast→fast a CRF 10 portava la CPU host al 90%+ (RCA 2026-11-21).
+_PRESET_TIER_STEP = {1: 1, 2: 2}
 _SW_CODECS = {"h264", "libx264", "hevc", "libx265"}
 
 
@@ -785,7 +787,9 @@ class EncoderWorker(threading.Thread):
             # Warm-up: il carico dei primi secondi non è idle credibile
             return
         else:
-            cpu = cpu_load_percent()
+            # Carico SENZA il nostro processo: quello totale include
+            # l'encoder, quindi il boost si auto-declasserebbe (flapping)
+            cpu = cpu_load_percent_external()
             target = _choose_quality_tier(self._idle_frames, cpu, self._quality_tier)
         if target == self._quality_tier:
             return
@@ -808,7 +812,7 @@ class EncoderWorker(threading.Thread):
         """
         crf = self._base_crf
         if crf is not None:
-            step = {1: 4, 2: 8}.get(tier, 0)
+            step = {1: 4, 2: 6}.get(tier, 0)
             crf = max(_MIN_BOOST_CRF, crf - step)
 
         preset = self._base_preset_effective

@@ -86,6 +86,8 @@ _POLL_INTERVAL_MS = 16  # poll inbox every 16 ms (~60 Hz); i frame stale
 # sono coalesced per ciclo, quindi il costo risveglio e' quasi nullo
 # e la latenza di presentazione non puo' superare 16 ms
 _POLL_INTERVAL_IDLE_MS = 100  # senza sessione/peer attivo: 60 wakeup/s a
+_HOST_POLL_BUDGET = 50  # max eventi host per tick: i restanti vanno al
+# prossimo aboutToBlock, così un burst non blocca mai il main thread
 # vuoto costavano ~2% di CPU anche da fermi; a riposo basta 10 Hz
 _CONNECT_TIMEOUT = 15.0  # max seconds to wait for TCP connection
 _STOP_JOIN_TIMEOUT = 8.0  # max seconds to wait for session thread to stop
@@ -2079,7 +2081,7 @@ class RelayClient(QObject):
         t0 = time.perf_counter()
         events = 0
         last_frame = None
-        while not self._host_inbox.empty():
+        while events < _HOST_POLL_BUDGET and not self._host_inbox.empty():
             try:
                 event, data, seq = self._host_inbox.get_nowait()
                 events += 1
@@ -2105,6 +2107,13 @@ class RelayClient(QObject):
                 "main thread e l'iniezione input remota",
                 dt_ms,
                 events,
+            )
+        elif events >= _HOST_POLL_BUDGET:
+            logger.debug(
+                "_poll_host_inbox: budget %d raggiunto, %d eventi rinviati "
+                "al prossimo tick",
+                events,
+                self._host_inbox.qsize(),
             )
 
     def _route_client_event(self, event: str, data: Any) -> None:

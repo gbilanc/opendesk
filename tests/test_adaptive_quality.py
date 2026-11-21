@@ -41,8 +41,8 @@ def test_unknown_cpu_load_stays_conservative() -> None:
 
 def test_preset_ladder_moves_slower_and_clamps() -> None:
     assert _slower_preset("superfast", 1) == "veryfast"
-    assert _slower_preset("superfast", 2) == "fast"
-    assert _slower_preset("veryfast", 2) == "medium"
+    assert _slower_preset("superfast", 2) == "faster"
+    assert _slower_preset("veryfast", 2) == "fast"
     assert _slower_preset("veryslow", 2) == "veryslow"
     assert _slower_preset("unknown-preset", 1) == "faster"
 
@@ -72,6 +72,21 @@ def test_cpu_load_returns_none_when_unavailable(monkeypatch: pytest.MonkeyPatch)
 
     monkeypatch.setattr(platform_utils.os, "getloadavg", _boom, raising=False)
     assert platform_utils.cpu_load_percent() is None
+
+
+def test_external_cpu_load_subtracts_own_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Il boost decide sul carico altrui, non sul proprio (RCA 2026-11-21)."""
+    monkeypatch.setattr(platform_utils, "cpu_load_percent", lambda: 0.5)
+    monkeypatch.setattr(platform_utils, "_own_process_cpu", lambda: 0.4)
+    assert platform_utils.cpu_load_percent_external() == pytest.approx(0.1)
+
+    # Clamp a 0: il nostro processo non può rendere "negativo" il resto
+    monkeypatch.setattr(platform_utils, "_own_process_cpu", lambda: 0.9)
+    assert platform_utils.cpu_load_percent_external() == 0.0
+
+    # Campione mancante → None (comportamento prudente)
+    monkeypatch.setattr(platform_utils, "_own_process_cpu", lambda: None)
+    assert platform_utils.cpu_load_percent_external() is None
 
 
 def test_cpu_hysteresis_prevents_boost_self_oscillation() -> None:

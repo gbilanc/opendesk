@@ -66,6 +66,60 @@ _CPU_SAMPLE_INTERVAL = 1.0  # s — il campionamento è memoizzato per un second
 _cpu_last_sample_mono = 0.0
 _cpu_last_value: float | None = None
 _cpu_prev_times: tuple[int, int, int] | None = None
+_proc_last_sample_mono = 0.0
+_proc_last_value: float | None = None
+_proc_prev_times: tuple[float, float] | None = None  # (user+system, mono)
+
+
+def _own_process_cpu() -> float | None:
+    """Carico CPU del nostro processo, normalizzato in ``0.0..1.0``.
+
+    Usa ``os.times()`` (stdlib, anche su Windows): frazione di un core =
+    Δ(user+system) / Δwall, divisa per i core per stare sulla stessa scala
+    del carico host.  ``None`` al primo campione (serve un delta).
+    """
+    global _proc_last_sample_mono, _proc_last_value, _proc_prev_times  # noqa: PLW0603
+
+    now = time.monotonic()
+    if now - _proc_last_sample_mono < _CPU_SAMPLE_INTERVAL:
+        return _proc_last_value
+    _proc_last_sample_mono = now
+
+    try:
+        t = os.times()
+        cpu_time = t.user + t.system
+        cores = os.cpu_count() or 1
+    except (AttributeError, OSError):
+        _proc_prev_times = None
+        _proc_last_value = None
+        return None
+
+    prev = _proc_prev_times
+    _proc_prev_times = (cpu_time, now)
+    if prev is None or now <= prev[1]:
+        _proc_last_value = None
+        return None  # primo campione: serve un delta
+    value = max(0.0, min(1.0, (cpu_time - prev[0]) / (now - prev[1]) / cores))
+    _proc_last_value = value
+    return value
+
+
+def cpu_load_percent_external() -> float | None:
+    """Carico CPU dell'host **senza** il nostro processo, in ``0.0..1.0``.
+
+    Serve a decidere il boost qualità: il carico totale include il costo
+    dell'encoder stesso, quindi un boost appena applicato si auto-declassa
+    (flapping, RCA 2026-11-21).  Sottraendo il nostro consumo il tier
+    riflette solo quanto è libero il *resto* del sistema.  ``None`` se
+    uno dei due campioni non è determinabile.  Su POSIX il carico host è
+    una media di loadavg mentre il proprio è istantaneo: la sottrazione è
+    approssimata, ma con clamp a 0 resta prudente.
+    """
+    host = cpu_load_percent()
+    own = _own_process_cpu()
+    if host is None or own is None:
+        return None
+    return max(0.0, min(1.0, host - own))
 
 
 def _windows_cpu_load() -> float | None:

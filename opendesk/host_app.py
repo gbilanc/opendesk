@@ -627,7 +627,10 @@ class HostWindow(QMainWindow):
     """
 
     WINDOW_TITLE = "OpenDesk Host"
-    MIN_WIDTH = 440
+    # La SessionInfoWidget ha sizeHint ~534px: con MIN_WIDTH più basso la
+    # riga credenziali si schiaccia e i widget si sovrappongono (RCA probe
+    # Qt: sizeHint 534 vs finestra 440).  580 = 534 + margini (40).
+    MIN_WIDTH = 580
     MIN_HEIGHT = 420
 
     # ── Design tokens ───────────────────────────────────────────────────

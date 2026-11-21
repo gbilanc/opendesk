@@ -13,7 +13,6 @@ from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtGui import QBrush, QColor, QIcon, QMouseEvent, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
-    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -121,7 +120,7 @@ class SessionInfoWidget(QWidget):
         row1.addStretch(1)
         layout.addLayout(row1)
 
-        # ── Row 2: Device ID (large, for sharing) + Password ──
+        # ── Row 2: Device ID (large, for sharing) ──
         row2 = QHBoxLayout()
         row2.setSpacing(8)
 
@@ -140,28 +139,30 @@ class SessionInfoWidget(QWidget):
         self._copy_id_btn.clicked.connect(self._copy_device_id)
         row2.addWidget(self._copy_id_btn)
 
-        # Separator
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.VLine)
-        sep.setStyleSheet("max-width: 1px;")
-        row2.addWidget(sep)
+        row2.addStretch(1)
+
+        layout.addLayout(row2)
+
+        # ── Row 3: Password ──
+        row3 = QHBoxLayout()
+        row3.setSpacing(8)
 
         pwd_label = QLabel("Password:")
         pwd_label.setObjectName("FieldLabel")
-        row2.addWidget(pwd_label)
+        row3.addWidget(pwd_label)
 
         self._pwd_display = QLabel("—")
         self._pwd_display.setObjectName("SessionPwdDisplay")
-        row2.addWidget(self._pwd_display)
+        row3.addWidget(self._pwd_display)
 
         self._copy_pwd_btn = QPushButton("Copy")
         self._copy_pwd_btn.setFixedHeight(26)
         self._copy_pwd_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._copy_pwd_btn.setStyleSheet(self._button_style())
         self._copy_pwd_btn.clicked.connect(self._copy_password)
-        row2.addWidget(self._copy_pwd_btn)
+        row3.addWidget(self._copy_pwd_btn)
 
-        row2.addStretch(1)
+        row3.addStretch(1)
 
         # ── Refresh button (right-aligned) ──
         # Icona nativa QStyle: niente glifi emoji → niente font-fallback
@@ -174,7 +175,7 @@ class SessionInfoWidget(QWidget):
         self._refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._refresh_btn.setProperty("class", "flat")
         self._refresh_btn.clicked.connect(self.refresh_session)
-        row2.addWidget(self._refresh_btn)
+        row3.addWidget(self._refresh_btn)
 
         # ── Theme switch (next to New Session) ──
         self._theme_btn = QPushButton()
@@ -185,9 +186,9 @@ class SessionInfoWidget(QWidget):
         self._theme_btn.setProperty("class", "flat")
         self._theme_btn.clicked.connect(lambda: self.theme_toggle_requested.emit())
         self._theme_btn.setVisible(self._theme_toggle)
-        row2.addWidget(self._theme_btn)
+        row3.addWidget(self._theme_btn)
 
-        layout.addLayout(row2)
+        layout.addLayout(row3)
 
     @Slot(str)
     def set_theme(self, theme: str) -> None:
