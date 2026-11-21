@@ -103,12 +103,23 @@ class EncryptedMessage:
 
     @classmethod
     def decode(cls, data: bytes) -> EncryptedMessage:
-        """Deserialize from the binary format."""
+        """Deserialize and validate the binary envelope."""
+        if len(data) < 2 + KEY_SIZE + 1 + NONCE_SIZE + 16:
+            raise ValueError("Truncated encrypted message")
         pk_len = int.from_bytes(data[:2], "big")
-        sender_pk = data[2 : 2 + pk_len]
-        n_len = data[2 + pk_len]
-        nonce = data[2 + pk_len + 1 : 2 + pk_len + 1 + n_len]
-        ciphertext = data[2 + pk_len + 1 + n_len :]
+        if pk_len != KEY_SIZE:
+            raise ValueError("Invalid sender key length")
+        nonce_offset = 2 + pk_len
+        n_len = data[nonce_offset]
+        if n_len != NONCE_SIZE:
+            raise ValueError("Invalid nonce length")
+        nonce_start = nonce_offset + 1
+        ciphertext_start = nonce_start + n_len
+        if len(data) < ciphertext_start + 16:
+            raise ValueError("Truncated encrypted payload")
+        sender_pk = data[2:nonce_offset]
+        nonce = data[nonce_start:ciphertext_start]
+        ciphertext = data[ciphertext_start:]
         return cls(ciphertext=ciphertext, nonce=nonce, sender_public_key=sender_pk)
 
 

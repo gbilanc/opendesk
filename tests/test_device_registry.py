@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+
+import pytest
 
 from opendesk.core.device_registry import DeviceRegistry
 
@@ -41,3 +44,11 @@ def test_peer_secret_roundtrip_and_forget(tmp_path: Path) -> None:
 
     reg.forget_secrets("host-1")
     assert reg.known_peer_secrets() == {}
+
+
+def test_registry_file_is_private(tmp_path: Path) -> None:
+    reg = _registry(tmp_path)
+    reg.set_peer_secret("host-1", "abc")
+    if os.name == "nt":
+        pytest.skip("POSIX permissions are not available on Windows")
+    assert (tmp_path / "registry.json").stat().st_mode & 0o777 == 0o600

@@ -275,10 +275,6 @@ class SettingsDialog(QDialog):
         auth_form = QFormLayout(auth_group)
         auth_form.setSpacing(8)
 
-        self._require_auth = QCheckBox("Require password for incoming connections")
-        self._require_auth.setChecked(True)
-        auth_form.addRow("", self._require_auth)
-
         self._e2ee_check = QCheckBox("Enable end-to-end encryption")
         self._e2ee_check.setChecked(True)
         auth_form.addRow("", self._e2ee_check)
@@ -549,9 +545,6 @@ class SettingsDialog(QDialog):
             cast(str, self._settings.value("network/turn_credential", "", type=str))
         )
 
-        self._require_auth.setChecked(
-            cast(bool, self._settings.value("security/require_auth", True, type=bool))
-        )
         self._e2ee_check.setChecked(
             cast(bool, self._settings.value("security/e2ee", True, type=bool))
         )
@@ -827,7 +820,6 @@ class SettingsDialog(QDialog):
         self._settings.setValue("network/turn_username", self._turn_username.text())
         self._settings.setValue("network/turn_credential", self._turn_credential.text())
 
-        self._settings.setValue("security/require_auth", self._require_auth.isChecked())
         self._settings.setValue("security/e2ee", self._e2ee_check.isChecked())
         self._write_unattended_config()
 

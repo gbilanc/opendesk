@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from opendesk.crypto.auth import generate_session_id, hash_password, verify_password
+from opendesk.utils import write_json_atomic
 
 logger = logging.getLogger(__name__)
 
@@ -213,5 +214,5 @@ class UnattendedAccess:
             "require_master_password": self._config.require_master_password,
             "master_password_hash": self._config.master_password_hash,
         }
-        self._config_path.write_text(json.dumps(data, indent=2))
+        write_json_atomic(self._config_path, data)
         logger.debug("Unattended config saved")

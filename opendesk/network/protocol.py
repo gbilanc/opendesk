@@ -134,8 +134,11 @@ class Message:
                 "t": self.type.value,
                 "p": self.payload,
                 "e": self.encrypted,
-            }
+            },
+            use_bin_type=True,
         )
+        if len(body) > _MAX_MESSAGE_SIZE:
+            raise ValueError(f"Message too large: {len(body)} bytes")
         header = struct.pack(_HEADER_FORMAT, len(body))
         return header + body
 
@@ -153,9 +156,15 @@ class Message:
         -------
         Message
         """
+        if len(data) < _HEADER_SIZE:
+            raise ValueError("Truncated message header")
         body_len = struct.unpack(_HEADER_FORMAT, data[:_HEADER_SIZE])[0]
-        body = data[_HEADER_SIZE : _HEADER_SIZE + body_len]
-        obj = msgpack.unpackb(body)
+        if body_len > _MAX_MESSAGE_SIZE:
+            raise ValueError(f"Message too large: {body_len} bytes")
+        if len(data) != _HEADER_SIZE + body_len:
+            raise ValueError("Message length does not match header")
+        body = data[_HEADER_SIZE:]
+        obj = msgpack.unpackb(body, raw=False)
         return cls(
             type=MessageType(obj["t"]),
             payload=obj.get("p", {}),
@@ -177,7 +186,7 @@ class Message:
             raise ValueError(f"Message too large: {body_len} bytes")
 
         body = await reader.readexactly(body_len)
-        obj = msgpack.unpackb(body)
+        obj = msgpack.unpackb(body, raw=False)
         return cls(
             type=MessageType(obj["t"]),
             payload=obj.get("p", {}),
@@ -227,7 +236,11 @@ class Message:
 
     @classmethod
     def auth_response(
-        cls, nonce_hash: str, device_id: str = "", connection_mode: str = "remote_desktop"
+        cls,
+        nonce_hash: str,
+        device_id: str = "",
+        connection_mode: str = "remote_desktop",
+        trust_response: str = "",
     ) -> Message:
         """Respond to an authentication challenge.
 
@@ -243,6 +256,9 @@ class Message:
         connection_mode : str
             "remote_desktop" (default) for full remote desktop,
             "file_transfer" for file-transfer-only mode (no streaming).
+        trust_response : str
+            HMAC-SHA256(nonce, per-device secret), used for trusted
+            password-less authentication after an authenticated pairing.
         """
         return cls(
             MessageType.AUTH_RESPONSE,
@@ -250,6 +266,7 @@ class Message:
                 "nonce_hash": nonce_hash,
                 "device_id": device_id,
                 "connection_mode": connection_mode,
+                "trust_response": trust_response,
             },
         )
 

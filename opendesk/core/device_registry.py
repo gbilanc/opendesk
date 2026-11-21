@@ -19,6 +19,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from opendesk.utils import write_json_atomic
+
 logger = logging.getLogger(__name__)
 
 
@@ -283,4 +285,4 @@ class DeviceRegistry:
         data = {
             "devices": [asdict(entry) for entry in self._devices.values()],
         }
-        self._path.write_text(json.dumps(data, indent=2))
+        write_json_atomic(self._path, data)

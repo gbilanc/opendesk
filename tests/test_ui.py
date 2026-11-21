@@ -225,13 +225,12 @@ class TestChatPanel:
         from opendesk.ui.chat_panel import ChatPanel
 
         panel = ChatPanel()
-        panel.message_sent.connect(lambda m: setattr(panel, "_emitted", True))
+        emitted: list[str] = []
+        panel.message_sent.connect(emitted.append)
 
         panel._input.setText("   ")
         panel._send_message()
-        # Should not have emitted
-        with pytest.raises(AttributeError):
-            _ = panel._emitted
+        assert emitted == []
 
 
 # ═══════════════════════════════════════════════════════════════════

@@ -5,6 +5,7 @@ Tests for advanced modules: file transfer, clipboard sync, audio, unattended.
 from __future__ import annotations
 
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,7 @@ from opendesk.core.file_transfer import (
     TransferState,
 )
 from opendesk.core.unattended import UnattendedAccess
+from opendesk.network.protocol import Message, MessageType
 
 # ======================================================================
 # File transfer tests
@@ -95,6 +97,83 @@ class TestFileTransferManager:
         assert job.state == TransferState.COMPLETED
         assert Path(job.final_path).read_bytes() == payload
         assert job.bytes_transferred == len(payload)
+        mgr.shutdown()
+
+    def test_zero_size_file_accepts_no_data(self, tmp_path: Path) -> None:
+        mgr = FileTransferManager(receive_root=tmp_path)
+        job_id = mgr.handle_file_request(
+            Message(MessageType.FILE_REQUEST, {"name": "empty.bin", "size": 0})
+        )
+        assert job_id is not None
+        assert mgr.accept_incoming(job_id)
+        mgr.handle_chunk(Message.file_chunk(job_id, 0, b"unexpected"))
+        job = mgr.get_job(job_id)
+        assert job is not None
+        assert job.state == TransferState.FAILED
+        assert not Path(job.temp_path).exists()
+        mgr.shutdown()
+
+    def test_zero_size_file_completes_empty(self, tmp_path: Path) -> None:
+        mgr = FileTransferManager(receive_root=tmp_path)
+        job_id = mgr.handle_file_request(
+            Message(MessageType.FILE_REQUEST, {"name": "empty.bin", "size": 0})
+        )
+        assert job_id is not None
+        assert mgr.accept_incoming(job_id)
+        assert mgr.handle_file_complete(Message.file_complete(job_id))
+        job = mgr.get_job(job_id)
+        assert job is not None
+        assert Path(job.final_path).read_bytes() == b""
+        mgr.shutdown()
+
+    def test_rejects_oversized_chunk_and_invalid_job_id(self, tmp_path: Path) -> None:
+        mgr = FileTransferManager(receive_root=tmp_path)
+        assert (
+            mgr.handle_file_request(
+                Message(
+                    MessageType.FILE_REQUEST,
+                    {"name": "bad.bin", "size": 1, "job_id": "../../escape"},
+                )
+            )
+            is None
+        )
+        job_id = mgr.handle_file_request(
+            Message(MessageType.FILE_REQUEST, {"name": "data.bin", "size": 100_000})
+        )
+        assert job_id is not None
+        assert mgr.accept_incoming(job_id)
+        mgr.handle_chunk(Message.file_chunk(job_id, 0, b"x" * 65_537))
+        job = mgr.get_job(job_id)
+        assert job is not None
+        assert job.state == TransferState.FAILED
+        mgr.shutdown()
+
+    def test_send_failure_marks_job_failed(self, tmp_path: Path) -> None:
+        source = tmp_path / "source.bin"
+        source.write_bytes(b"payload")
+        mgr = FileTransferManager(receive_root=tmp_path)
+        jobs_future = mgr.send_files([source], lambda _msg: True)
+        jobs_future.result(timeout=2)
+        job = mgr.jobs[0]
+        job.state = TransferState.ACCEPTED
+        mgr.send_chunks(job, lambda _msg: False)
+        deadline = time.monotonic() + 2
+        while job.state != TransferState.FAILED and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert job.state == TransferState.FAILED
+        assert "Transport rejected" in job.error
+        mgr.shutdown()
+
+    def test_pause_and_resume_state(self) -> None:
+        mgr = FileTransferManager()
+        info = FileInfo(name="test.bin", size=1)
+        from opendesk.core.file_transfer import TransferDirection, TransferJob
+
+        job = TransferJob("send-test", info, TransferDirection.SEND, TransferState.IN_PROGRESS)
+        mgr._jobs[job.id] = job
+        assert mgr.pause_job(job.id)
+        assert mgr.resume_job(job.id)
+        assert job.state == TransferState.IN_PROGRESS
         mgr.shutdown()
 
     def test_rejects_path_traversal_filename(self) -> None:
@@ -196,20 +275,22 @@ class TestClipboardSync:
         assert not cs.toggle()  # starts disabled, toggle does nothing without send_fn
 
     def test_receive_text(self) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])
+        assert app is not None
         cs = ClipboardSync()
-        received = []
+        cs.start(lambda _msg: True)
+        received: list[str] = []
 
         def on_text(text: str) -> None:
             received.append(text)
 
         cs.text_received.connect(on_text)
 
-        from opendesk.network.protocol import Message, MessageType
-
-        msg = Message(MessageType.CLIPBOARD_TEXT, {"text": "Hello from remote!"})
-
-        cs.receive_from_remote(msg)
-        assert len(received) >= 0  # can't assert >0 because no event loop
+        cs.receive_from_remote(Message.clipboard_text("Hello from remote!"))
+        assert received == ["Hello from remote!"]
+        cs.stop()
 
 
 # ======================================================================

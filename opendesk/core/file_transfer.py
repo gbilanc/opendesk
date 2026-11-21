@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 _CHUNK_SIZE = 64 * 1024  # 64 KiB
 _MAX_CONCURRENT = 4
 _MAX_FILE_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB safety limit
+_MAX_JOB_ID_LENGTH = 128
 _PART_SUFFIX = ".opendesk-part"
 
 # Tipi di messaggio gestiti da ``FileTransferManager.dispatch()``:
@@ -220,8 +221,12 @@ class FileTransferManager:
         receive_root: str | Path | None = None,
     ) -> None:
         self._max_concurrent = max_concurrent
+        if max_concurrent < 1:
+            raise ValueError("max_concurrent must be positive")
         self._jobs: dict[str, TransferJob] = {}
         self._receive_targets: dict[str, _ReceiveTarget] = {}
+        self._send_semaphore = asyncio.Semaphore(max_concurrent)
+        self._send_tasks: set[Future] = set()
         self._receive_root = (
             Path(receive_root or Path.home() / "Downloads" / "OpenDesk").expanduser().resolve()
         )
@@ -237,6 +242,16 @@ class FileTransferManager:
 
     def shutdown(self) -> None:
         """Stop the background event loop. Call on application exit."""
+        for job in self._jobs.values():
+            if job.state in (
+                TransferState.PENDING,
+                TransferState.ACCEPTED,
+                TransferState.IN_PROGRESS,
+                TransferState.PAUSED,
+            ):
+                job.state = TransferState.CANCELLED
+        for task in list(self._send_tasks):
+            task.cancel()
         for job_id in list(self._receive_targets):
             self._close_receive_target(job_id)
         self._bg_loop.stop()
@@ -340,24 +355,32 @@ class FileTransferManager:
         job: TransferJob,
         send_fn: Callable,
     ) -> None:
-        """Send file chunks one by one in the background.
+        """Send file chunks with bounded concurrency and transport backpressure."""
+        if job.direction != TransferDirection.SEND or job.state in (
+            TransferState.COMPLETED,
+            TransferState.FAILED,
+            TransferState.CANCELLED,
+        ):
+            return
+        self._track_send_task(self._send_with_limit(job, send_fn))
 
-        Parameters
-        ----------
-        job : TransferJob
-            The job to send (must be accepted).
-        send_fn : callable
-            Function to send a ``Message``.
-        """
-        self._bg_loop.run(self._send_chunks_async(job, send_fn))
+    def _track_send_task(self, coro) -> None:
+        task = self._bg_loop.run(coro)
+        self._send_tasks.add(task)
 
-    async def _send_chunks_async(
-        self,
-        job: TransferJob,
-        send_fn: Callable,
-    ) -> None:
-        """Async implementation of send_chunks."""
-        await self._stream_file_async(job, send_fn)
+        # Consume exceptions and keep strong references until completion.
+        def _consume(future: Future) -> None:
+            self._send_tasks.discard(future)
+            if not future.cancelled():
+                future.exception()
+
+        task.add_done_callback(_consume)
+
+    async def _send_with_limit(self, job: TransferJob, send_fn: Callable) -> None:
+        async with self._send_semaphore:
+            if job.state not in (TransferState.ACCEPTED, TransferState.PENDING):
+                return
+            await self._stream_file_async(job, send_fn)
 
     async def _stream_file_async(self, job: TransferJob, send_fn: Callable) -> None:
         """Stream a local file in chunks, honouring cancellation.
@@ -386,11 +409,18 @@ class FileTransferManager:
                     chunk = f.read(_CHUNK_SIZE)
                     if not chunk:
                         break
+                    while job.state == TransferState.PAUSED:
+                        await asyncio.sleep(0.1)
+                    if job.state == TransferState.CANCELLED:
+                        return
 
-                    send_fn(Message.file_chunk(job.id, seq, chunk, is_last=False))
+                    if send_fn(Message.file_chunk(job.id, seq, chunk, is_last=False)) is False:
+                        raise ConnectionError("Transport rejected file chunk")
 
                     job.bytes_transferred += len(chunk)
-                    job.progress = job.bytes_transferred / job.file_info.size
+                    job.progress = (
+                        job.bytes_transferred / job.file_info.size if job.file_info.size else 1.0
+                    )
                     seq += 1
 
                     # Throttle progress updates to avoid flooding the queue
@@ -400,7 +430,8 @@ class FileTransferManager:
                     # Yield control between chunks
                     await asyncio.sleep(0)
 
-            send_fn(Message.file_complete(job.id))
+            if send_fn(Message.file_complete(job.id)) is False:
+                raise ConnectionError("Transport rejected completion message")
             job.state = TransferState.COMPLETED
             job.completed_at = time.time()
             self._push_update("transfer", job.id)
@@ -422,6 +453,11 @@ class FileTransferManager:
             return None
 
         job_id = str(msg.payload.get("job_id", "")) or f"recv-{uuid.uuid4().hex}"
+        if len(job_id) > _MAX_JOB_ID_LENGTH or not all(
+            char.isalnum() or char in "-_" for char in job_id
+        ):
+            logger.warning("Rejected incoming file with invalid job ID")
+            return None
         if job_id in self._jobs:
             logger.warning("Rejected duplicate incoming job: %s", job_id)
             return None
@@ -488,10 +524,13 @@ class FileTransferManager:
 
         seq = msg.payload.get("seq")
         data = msg.payload.get("data", b"")
-        if not isinstance(seq, int) or seq != job.expected_seq or not isinstance(data, bytes):
+        if not isinstance(seq, int) or isinstance(seq, bool) or seq != job.expected_seq:
             self._fail_job(job, "Invalid or out-of-order file chunk")
             return
-        if job.file_info.size and job.bytes_transferred + len(data) > job.file_info.size:
+        if not isinstance(data, bytes) or len(data) > _CHUNK_SIZE:
+            self._fail_job(job, "Invalid or oversized file chunk")
+            return
+        if job.bytes_transferred + len(data) > job.file_info.size:
             self._fail_job(job, "Received more bytes than declared")
             return
 
@@ -520,7 +559,7 @@ class FileTransferManager:
         job = self._jobs.get(str(msg.payload.get("job_id", "")))
         if job is None or job.direction != TransferDirection.RECEIVE:
             return False
-        if job.file_info.size and job.bytes_transferred != job.file_info.size:
+        if job.bytes_transferred != job.file_info.size:
             self._fail_job(job, "Received size differs from declared size")
             self._remove_partial(job)
             return False
@@ -567,6 +606,15 @@ class FileTransferManager:
         self._push_update("transfer", job_id)
         return True
 
+    def resume_job(self, job_id: str) -> bool:
+        """Resume a paused transfer."""
+        job = self._jobs.get(job_id)
+        if job is None or job.state != TransferState.PAUSED:
+            return False
+        job.state = TransferState.IN_PROGRESS
+        self._push_update("transfer", job.id)
+        return True
+
     # ── internal ────────────────────────────────────────────────────
 
     def _push_update(self, kind: str, *args) -> None:
@@ -577,6 +625,7 @@ class FileTransferManager:
         job.state = TransferState.FAILED
         job.error = error
         self._close_receive_target(job.id)
+        self._remove_partial(job)
         self._push_update("transfer", job.id)
         logger.error("Transfer failed: %s — %s", job.file_info.name, error)
 
@@ -782,6 +831,16 @@ class FileTransferManager:
         """
         remote_path = msg.payload.get("remote_path", "")
         job_id = msg.payload.get("job_id", "")
+        if not isinstance(remote_path, str) or not isinstance(job_id, str):
+            return
+        if (
+            not job_id
+            or len(job_id) > _MAX_JOB_ID_LENGTH
+            or not all(char.isalnum() or char in "-_" for char in job_id)
+            or job_id in self._jobs
+        ):
+            send_fn(Message.file_download_reject(str(job_id), "Invalid or duplicate job ID"))
+            return
 
         path = Path(remote_path).expanduser().resolve()
         home = Path.home().resolve()
@@ -803,12 +862,14 @@ class FileTransferManager:
         self._push_update("transfer", job_id)
 
         # Start chunk transfer on background loop
-        self._bg_loop.run(self._send_download_chunks_async(job, send_fn))
+        self._track_send_task(self._send_download_chunks_async(job, send_fn))
 
     async def _send_download_chunks_async(self, job: TransferJob, send_fn: Callable) -> None:
-        """Send file chunks for a download request (background)."""
-        send_fn(Message.file_download_accept(job.id))
-        await self._stream_file_async(job, send_fn)
+        """Accept and send a download with the same bounds as uploads."""
+        if send_fn(Message.file_download_accept(job.id)) is False:
+            self._fail_job(job, "Transport rejected download acceptance")
+            return
+        await self._send_with_limit(job, send_fn)
 
     def handle_download_accept(self, msg: Message) -> None:
         """Handle FILE_DOWNLOAD_ACCEPT — prepare the local temporary file."""

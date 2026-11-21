@@ -21,6 +21,8 @@ from pathlib import Path
 from argon2 import PasswordHasher
 from argon2.exceptions import VerificationError, VerifyMismatchError
 
+from opendesk.utils import write_json_atomic
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -388,5 +390,5 @@ class AuthManager:
                 for u, c in self._credentials.items()
             }
         }
-        self._config_path.write_text(json.dumps(data, indent=2))
+        write_json_atomic(self._config_path, data)
         logger.debug("Credentials saved to %s", self._config_path)

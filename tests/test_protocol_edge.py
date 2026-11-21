@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import struct
 
+import pytest
+
 from opendesk.network.protocol import (
     _HEADER_FORMAT,
     _HEADER_SIZE,
@@ -162,3 +164,14 @@ class TestProtocolEdgeCases:
         data = msg.encode()
         restored = Message.decode(data)
         assert restored.payload == {}
+
+    @pytest.mark.parametrize("data", [b"", b"\x00\x00", b"\x00\x00\x00\x01"])
+    def test_truncated_frame_rejected(self, data: bytes) -> None:
+        with pytest.raises(ValueError):
+            Message.decode(data)
+
+    def test_oversized_and_trailing_frames_rejected(self) -> None:
+        with pytest.raises(ValueError, match="too large"):
+            Message.decode(struct.pack(_HEADER_FORMAT, _MAX_MESSAGE_SIZE + 1))
+        with pytest.raises(ValueError, match="does not match"):
+            Message.decode(Message.ping().encode() + b"trailing")

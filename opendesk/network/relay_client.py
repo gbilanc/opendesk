@@ -26,6 +26,7 @@ import asyncio
 import logging
 import queue
 import random
+import secrets
 import ssl
 import threading
 import time
@@ -99,6 +100,7 @@ _SEND_DRAIN_TIMEOUT = 5.0  # max seconds to wait for TCP send buffer to drain
 _SEND_MAX_CONSECUTIVE_TIMEOUTS = 3  # consecutive drain timeouts before disconnecting
 _SEND_MAX_PENDING = 20  # max pending sends before backpressure kicks in
 _PING_INTERVAL = 25.0  # s — keep-alive; il relay disconnette peer idle > 120s
+_E2EE_TIMEOUT = 10.0  # s — fail-closed se il key exchange non viene completato
 
 # Retry host → relay: backoff esponenziale con jitter.  Con l'intervallo
 # fisso di 10 s un outage del relay produceva un tentativo ogni 20 s per
@@ -222,7 +224,7 @@ class _RelaySession:
         # password.  For trusted (password-less) sessions it is set to the
         # per-device secret so the proof doesn't depend on the password.
         self._proof_secret: str = ""
-
+        self._pairing_secret: str = ""  # trusted secret to deliver after E2EE setup
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_future: Future | None = None  # DISCONNECT schedulata da stop()
         self._reader: asyncio.StreamReader | None = None
@@ -230,6 +232,7 @@ class _RelaySession:
         self._running = threading.Event()
         self._decoder: VideoDecoder | None = None
         self._auth_nonce: str = ""  # challenge nonce for challenge-response auth
+        self._key_exchange_pending = False
         self._e2ee = E2EEncryption()
         self._e2ee_ready = False
 
@@ -415,7 +418,7 @@ class _RelaySession:
     )
 
     # Message types that should never be dropped by backpressure.
-    # Everything except video frames/tiles is considered critical.
+    # Media and file chunks are bounded; small control messages bypass it.
     _BACKPRESSURE_BYPASS = frozenset(
         {
             MessageType.HELLO,
@@ -446,7 +449,6 @@ class _RelaySession:
             MessageType.FILE_REQUEST,
             MessageType.FILE_ACCEPT,
             MessageType.FILE_REJECT,
-            MessageType.FILE_CHUNK,
             MessageType.FILE_COMPLETE,
             MessageType.FILE_ERROR,
             MessageType.FILE_PROGRESS,
@@ -501,13 +503,10 @@ class _RelaySession:
     )
 
     def _key_exchange_message(self, message_type: MessageType) -> Message:
-        """Build an ephemeral public-key message for E2E encryption setup.
+        """Build an authenticated ephemeral public-key message.
 
-        Include a *proof* = HMAC-SHA256(secret, public_key) so the peer can
-        detect a malicious relay substituting a different key in transit.
-        The secret is the session password, or the per-device secret for
-        trusted (password-less) sessions (also sent as ``trust_secret`` so
-        the peer can pin it).
+        The HMAC uses the session password or an already paired per-device
+        secret.  The secret itself is never included in this clear handshake.
         """
         public_key = self._e2ee.get_public_key_string()
         secret = self._proof_secret or self.password
@@ -517,11 +516,6 @@ class _RelaySession:
         }
         if secret:
             payload["proof"] = compute_response(public_key, secret)
-        if self._proof_secret:
-            # Trusted session: hand the per-device secret to the peer so a
-            # device that doesn't know the session password can verify the
-            # key.  The peer pins it (TOFU) and rejects later changes.
-            payload["trust_secret"] = self._proof_secret
         return Message(message_type, payload)
 
     def _accept_remote_key(self, payload: dict[str, Any]) -> bool:
@@ -532,13 +526,12 @@ class _RelaySession:
         that only forwards traffic cannot forge it for a substituted key.
         This binds the ephemeral public key to the authenticated channel.
 
-        Password-less (trusted-device) sessions fall back to accepting the
-        key unverified when no verifiable proof is available, otherwise the
-        peer could never establish E2EE.
+        Password-less trusted sessions use the per-device secret pinned
+        during a previous password-authenticated pairing.  Missing or
+        invalid proofs are always rejected.
         """
         public_key = payload.get("public_key", "")
         proof = payload.get("proof", "")
-        trust_secret = payload.get("trust_secret", "")
         sender_id = payload.get("device_id", "")
         if not isinstance(public_key, str) or not public_key:
             logger.warning(
@@ -546,39 +539,26 @@ class _RelaySession:
                 type(public_key).__name__,
             )
             return False
+        if not isinstance(proof, str) or not isinstance(sender_id, str):
+            logger.warning("Rejected E2E key exchange: malformed proof or device_id")
+            return False
 
-        # Per-device secret takes precedence over the session password for
-        # trusted (password-less) sessions.
-        secret = trust_secret if isinstance(trust_secret, str) and trust_secret else self.password
-
-        # Pin the peer's per-device secret and reject silent changes (a
-        # relay that swaps the secret would otherwise be able to MITM).
-        if trust_secret and sender_id:
-            known = self._known_device_secrets.get(sender_id)
-            if known and known != trust_secret:
-                logger.warning(
-                    "Rejected E2E key exchange: per-device secret for %s changed "
-                    "(possible relay MITM)",
-                    sender_id[:8],
-                )
-                return False
-
-        verified = bool(proof) and verify_response(public_key, secret, proof)
+        # Trusted sessions use the secret established during pairing.  It is
+        # deliberately not accepted from this clear, relay-visible message.
+        paired_secret = self._known_device_secrets.get(sender_id, "")
+        candidates = []
+        for candidate in (self._proof_secret, paired_secret, self.password):
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+        verified = any(
+            bool(proof) and verify_response(public_key, candidate, proof)
+            for candidate in candidates
+        )
         if not verified:
-            if not self.password:
-                # Password-less session (trusted-device bypass): the peer may
-                # not be able to produce a password proof.  Accept the key
-                # unverified rather than dropping the encrypted stream.
-                logger.warning(
-                    "E2E key proof non verificabile su sessione senza password — "
-                    "accetto la chiave senza verifica (trusted device)",
-                )
-            else:
-                logger.warning(
-                    "Rejected E2E key exchange: invalid or missing password proof "
-                    "(possible relay MITM)",
-                )
-                return False
+            logger.warning(
+                "Rejected E2E key exchange: invalid or missing key proof (possible relay MITM)"
+            )
+            return False
 
         try:
             self._e2ee.set_remote_key(public_key)
@@ -586,20 +566,20 @@ class _RelaySession:
             logger.warning("Rejected E2E key exchange: %s", e)
             return False
         self._e2ee_ready = True
-        if verified and trust_secret and sender_id:
-            # Use the per-device secret for our own proof (e.g. the
-            # KEY_EXCHANGE_ACK the client sends back) and pin it locally.
-            self._proof_secret = trust_secret
-            self._known_device_secrets[sender_id] = trust_secret
-            if self.role == RelayRole.CLIENT:
-                self.inbox.put(("trust_secret", (sender_id, trust_secret), self.session_seq))
-        logger.info("E2E peer channel established (key verified=%s)", verified)
+        self._key_exchange_pending = False
+        if paired_secret and verify_response(public_key, paired_secret, proof):
+            self._proof_secret = paired_secret
+        elif self.password and verify_response(public_key, self.password, proof):
+            self._proof_secret = ""
+        logger.info("E2E peer channel established (key verified=True)")
         return True
 
     def _encrypt_peer_message(self, msg: Message) -> Message:
         """Encrypt a peer payload while preserving its message type."""
-        if not self._e2ee_enabled or not self._e2ee_ready:
+        if not self._e2ee_enabled:
             return msg
+        if not self._e2ee_ready:
+            raise RuntimeError("E2E channel is not ready")
         plaintext = msgpack.packb(msg.payload, use_bin_type=True)
         encrypted = self._e2ee.encrypt(plaintext)
         return Message(
@@ -612,6 +592,8 @@ class _RelaySession:
         """Decrypt an E2E envelope received from the relay."""
         envelope = msg.payload.get("_e2ee")
         if envelope is None:
+            if msg.encrypted:
+                raise ValueError("Encrypted peer payload has no envelope")
             return msg
         if not self._e2ee_ready or not isinstance(envelope, bytes):
             raise ValueError("Encrypted peer payload received before E2E setup")
@@ -624,7 +606,53 @@ class _RelaySession:
             raise ValueError("Unable to decrypt peer payload") from e
         if not isinstance(payload, dict):
             raise ValueError("Invalid decrypted peer payload")
-        return Message(msg.type, payload)
+        # RELAY_ROUTE carries the inner payload but not its encrypted flag;
+        # the authenticated envelope is the reliable wire-level marker.
+        return Message(msg.type, payload, encrypted=True)
+
+    async def _share_trust_secret(self) -> None:
+        """Deliver a newly paired trusted secret inside the E2E channel."""
+        if not self._pairing_secret or not self._e2ee_ready:
+            return
+        await self._send_peer_signalling(
+            Message(
+                MessageType.SESSION_INFO,
+                {"device_id": self.device_id, "trust_secret": self._pairing_secret},
+            )
+        )
+
+    async def _e2ee_timeout(self) -> None:
+        """Close rather than silently downgrade when key exchange stalls."""
+        await asyncio.sleep(_E2EE_TIMEOUT)
+        if not self._key_exchange_pending or not self._running.is_set():
+            return
+        self._key_exchange_pending = False
+        error = "E2E key exchange timed out"
+        logger.error(error)
+        self.inbox.put(("error", error, self.session_seq))
+        self.inbox.put(("auth_result", (False, error), self.session_seq))
+        await self._close_writer()
+
+    def _accept_trust_secret(self, payload: dict[str, Any]) -> bool:
+        """Pin a trusted secret received in an authenticated E2E message."""
+        if self.role != RelayRole.CLIENT or not self._authenticated or not self._e2ee_ready:
+            return False
+        device_id = payload.get("device_id", "")
+        secret = payload.get("trust_secret", "")
+        if (
+            not isinstance(device_id, str)
+            or not device_id
+            or not isinstance(secret, str)
+            or not secret
+        ):
+            return False
+        known = self._known_device_secrets.get(device_id)
+        if known is not None and not secrets.compare_digest(known, secret):
+            logger.warning("Rejected changed trusted secret for %s", device_id[:8])
+            return False
+        self._known_device_secrets[device_id] = secret
+        self.inbox.put(("trust_secret", (device_id, secret), self.session_seq))
+        return True
 
     # ── direct P2P ──────────────────────────────────────────────────
 
@@ -683,7 +711,7 @@ class _RelaySession:
         Once E2EE is ready the SDP is encrypted like any other peer payload,
         so the relay cannot read local IP addresses or DTLS fingerprints.
         """
-        inner = self._encrypt_peer_message(msg)
+        inner = self._encrypt_peer_message(msg) if self._e2ee_enabled else msg
         await self._send_async(
             Message.relay_route(inner.type.value, inner.payload),
             bypass_backpressure=True,
@@ -830,10 +858,13 @@ class _RelaySession:
             is_relay_control = msg.type in self._RELAY_CONTROL_TYPES
             bypass_backpressure = msg.type in self._BACKPRESSURE_BYPASS
 
-            # Encrypt peer-to-peer messages once, before choosing the path.
-            # Relay-internal control messages are sent as-is.
+            # Peer payloads are never sent in clear when E2EE is enabled.
             if not is_relay_control:
-                msg = self._encrypt_peer_message(msg)
+                if self._e2ee_enabled and not self._e2ee_ready:
+                    logger.debug("Dropping %s: E2E channel not ready", msg.type.name)
+                    return False
+                if self._e2ee_enabled:
+                    msg = self._encrypt_peer_message(msg)
 
                 # Prefer the direct data channel when it is established.
                 # Media is dropped on P2P backpressure instead of being sent
@@ -851,14 +882,14 @@ class _RelaySession:
 
             # Backpressure: only drop video frames/tiles when the send pipe is full
             if not bypass_backpressure:
-                if self._pending_sends >= _SEND_MAX_PENDING:
-                    logger.debug(
-                        "Send backpressure: %d pending sends, dropping message type=%s",
-                        self._pending_sends,
-                        msg.type.name if hasattr(msg.type, "name") else msg.type,
-                    )
-                    return False
                 with self._send_lock:
+                    if self._pending_sends >= _SEND_MAX_PENDING:
+                        logger.debug(
+                            "Send backpressure: %d pending sends, dropping message type=%s",
+                            self._pending_sends,
+                            msg.type.name if hasattr(msg.type, "name") else msg.type,
+                        )
+                        return False
                     self._pending_sends += 1
 
             # Serializza sul thread chiamante (tipicamente NetworkWorker):
@@ -980,10 +1011,46 @@ class _RelaySession:
             except ValueError as e:
                 logger.warning("Dropped encrypted %s message: %s", role_label.lower(), e)
                 continue
+            is_handshake = msg.type in {MessageType.KEY_EXCHANGE, MessageType.KEY_EXCHANGE_ACK}
+            is_peer_payload = (
+                msg.type not in self._RELAY_CONTROL_TYPES or msg.type == MessageType.SESSION_INFO
+            )
+            if self._e2ee_enabled and is_peer_payload and not is_handshake and not msg.encrypted:
+                logger.warning(
+                    "Dropped unencrypted %s peer message: %s", role_label.lower(), msg.type
+                )
+                continue
             if msg.type not in _P2P_SIGNAL_TYPES:
                 self.inbox.put(("message", msg, self.session_seq))
             if await dispatch(msg.type, msg):
                 break
+
+    async def _complete_host_auth(
+        self, client_device_id: str, trust_secret: str, trusted_auth: bool
+    ) -> None:
+        """Finish host authentication and start the protected key exchange."""
+        self._authenticated = True
+        self._proof_secret = trust_secret if trusted_auth else ""
+        self._pairing_secret = trust_secret
+        await self._send_async(Message.auth_ok())
+        if self._e2ee_enabled:
+            self._key_exchange_pending = True
+            asyncio.create_task(self._e2ee_timeout())
+            await self._send_async(
+                Message.relay_route(
+                    inner_type=MessageType.KEY_EXCHANGE.value,
+                    inner_payload=self._key_exchange_message(MessageType.KEY_EXCHANGE).payload,
+                )
+            )
+        self._maybe_start_p2p()
+        label = "Authenticated (trusted device)" if trusted_auth else "Authenticated"
+        self.inbox.put(("auth_result", (True, label), self.session_seq))
+        logger.info(
+            "Host auth OK (%s) — device=%s connection_mode=%s",
+            label,
+            client_device_id[:8] or "<unknown>",
+            self.connection_mode,
+        )
 
     async def _run_host(self) -> None:
         if not await self._connect("Host"):
@@ -1018,6 +1085,7 @@ class _RelaySession:
                     self._e2ee = E2EEncryption()
                     self._e2ee_ready = False
                     self._proof_secret = ""
+                    self._pairing_secret = ""
                     # Authentication first, E2E key exchange after (see AUTH_RESPONSE).
                     # This ensures trusted devices can establish E2E even with
                     # different (or empty) passwords.
@@ -1036,11 +1104,13 @@ class _RelaySession:
 
                 elif t == MessageType.KEY_EXCHANGE_ACK:
                     if not self._accept_remote_key(msg.payload):
-                        logger.warning(
-                            "E2E key exchange ACK failed, continuing without encryption"
-                        )
-                    else:
-                        self._maybe_start_p2p()
+                        error = "E2E key exchange failed"
+                        logger.error(error)
+                        self.inbox.put(("error", error, self.session_seq))
+                        self.inbox.put(("auth_result", (False, error), self.session_seq))
+                        return True
+                    await self._share_trust_secret()
+                    self._maybe_start_p2p()
 
                 elif t == MessageType.P2P_ANSWER:
                     await self._handle_p2p_answer(msg.payload)
@@ -1052,7 +1122,22 @@ class _RelaySession:
                 elif t == MessageType.AUTH_RESPONSE:
                     client_hash = msg.payload.get("nonce_hash", "")
                     client_device_id = msg.payload.get("device_id", "")
+                    trust_hash = msg.payload.get("trust_response", "")
                     client_connection_mode = msg.payload.get("connection_mode", "remote_desktop")
+                    if not all(
+                        isinstance(value, str)
+                        for value in (
+                            client_hash,
+                            client_device_id,
+                            trust_hash,
+                            client_connection_mode,
+                        )
+                    ):
+                        await self._send_async(Message.auth_fail("Malformed authentication"))
+                        return True
+                    if client_connection_mode not in {"remote_desktop", "file_transfer"}:
+                        await self._send_async(Message.auth_fail("Invalid connection mode"))
+                        return True
                     self.connection_mode = client_connection_mode
 
                     # Accesso non presidiato: se è configurata una allowlist,
@@ -1065,67 +1150,39 @@ class _RelaySession:
                         )
                         await self._send_async(Message.auth_fail("Device not allowed"))
                         self.inbox.put(
-                            (
-                                "auth_result",
-                                (False, "Device not allowed"),
-                                self.session_seq,
-                            )
+                            ("auth_result", (False, "Device not allowed"), self.session_seq)
                         )
-                        return False
+                        return True
 
-                    # Trusted device bypass: skip password verification
-                    if client_device_id and client_device_id in self._trusted_device_ids:
-                        logger.info(
-                            "Trusted device '%s' authenticated without password",
-                            client_device_id[:8],
+                    # A nonce is single-use: a second AUTH_RESPONSE on the same
+                    # peer connection can never replay either proof.
+                    nonce = self._auth_nonce
+                    self._auth_nonce = ""
+                    trust_secret = self._trusted_devices.get(client_device_id, "")
+                    trusted_auth = bool(
+                        nonce
+                        and trust_secret
+                        and trust_hash
+                        and verify_response(nonce, trust_secret, trust_hash)
+                    )
+                    password_auth = bool(
+                        nonce
+                        and self.password
+                        and client_hash
+                        and verify_response(nonce, self.password, client_hash)
+                    )
+                    if trusted_auth or password_auth:
+                        # Password pairing also shares the trusted secret, but
+                        # only later, inside the established E2E channel.
+                        await self._complete_host_auth(
+                            client_device_id, trust_secret, trusted_auth
                         )
-                        # Use the per-device secret for the E2EE proof so the
-                        # peer doesn't need to know the session password.
-                        self._proof_secret = self._trusted_devices.get(client_device_id, "")
-                        self._authenticated = True
-                        await self._send_async(Message.auth_ok())
-                        # E2E key exchange after authentication
-                        if self._e2ee_enabled:
-                            await self._send_async(
-                                Message.relay_route(
-                                    inner_type=MessageType.KEY_EXCHANGE.value,
-                                    inner_payload=self._key_exchange_message(
-                                        MessageType.KEY_EXCHANGE
-                                    ).payload,
-                                )
-                            )
-                        self._maybe_start_p2p()
-                        self.inbox.put(
-                            (
-                                "auth_result",
-                                (True, "Authenticated (trusted device)"),
-                                self.session_seq,
-                            )
-                        )
-                        return False
-
-                    success = verify_response(self._auth_nonce, self.password, client_hash)
-                    if success:
-                        self._authenticated = True
-                        await self._send_async(Message.auth_ok())
-                        # E2E key exchange after authentication
-                        if self._e2ee_enabled:
-                            await self._send_async(
-                                Message.relay_route(
-                                    inner_type=MessageType.KEY_EXCHANGE.value,
-                                    inner_payload=self._key_exchange_message(
-                                        MessageType.KEY_EXCHANGE
-                                    ).payload,
-                                )
-                            )
-                        self._maybe_start_p2p()
-                        self.inbox.put(("auth_result", (True, "Authenticated"), self.session_seq))
-                        logger.debug("Host auth OK — connection_mode=%s", client_connection_mode)
                     else:
                         await self._send_async(Message.auth_fail("Invalid credentials"))
                         self.inbox.put(
                             ("auth_result", (False, "Invalid credentials"), self.session_seq)
                         )
+                        return True
 
                 elif t == MessageType.VIDEO_REQUEST_KEYFRAME:
                     logger.info("Peer requested keyframe (host)")
@@ -1238,9 +1295,11 @@ class _RelaySession:
                             _missed,
                         )
                         self.inbox.put(("video_stalled", stalled_s, self.session_seq))
+                    if self._e2ee_enabled and not self._e2ee_ready:
+                        continue
                     _frame_count = 0
                     self._last_video_activity_time = time.time()
-                    await self._send_async(
+                    await self._send_peer_signalling(
                         Message(MessageType.VIDEO_REQUEST_KEYFRAME, {}),
                     )
                     _watchdog_delay = min(_watchdog_delay * 2, 60.0)
@@ -1280,7 +1339,13 @@ class _RelaySession:
                 elif t == MessageType.KEY_EXCHANGE:
                     if not self._e2ee_enabled:
                         logger.info("Peer offered E2E, but it is disabled locally")
-                    elif self._accept_remote_key(msg.payload):
+                    elif not self._accept_remote_key(msg.payload):
+                        error = "E2E key exchange failed"
+                        logger.error(error)
+                        self.inbox.put(("error", error, self.session_seq))
+                        self.inbox.put(("auth_result", (False, error), self.session_seq))
+                        return True
+                    else:
                         await self._send_async(
                             Message.relay_route(
                                 inner_type=MessageType.KEY_EXCHANGE_ACK.value,
@@ -1289,17 +1354,38 @@ class _RelaySession:
                                 ).payload,
                             )
                         )
-                    else:
-                        logger.warning("E2E key exchange failed, continuing without encryption")
+                        if self.connection_mode == "remote_desktop":
+                            await self._send_peer_signalling(
+                                Message(MessageType.VIDEO_REQUEST_KEYFRAME, {})
+                            )
+
+                elif t == MessageType.SESSION_INFO:
+                    if not self._accept_trust_secret(msg.payload):
+                        logger.warning("Rejected invalid SESSION_INFO trusted pairing")
+                        return True
 
                 elif t == MessageType.AUTH_REQUEST:
                     nonce = msg.payload.get("nonce", "")
-                    nonce_hash = compute_response(nonce, self.password) if nonce else ""
+                    if not isinstance(nonce, str) or not nonce:
+                        self.inbox.put(
+                            (
+                                "auth_result",
+                                (False, "Malformed authentication request"),
+                                self.session_seq,
+                            )
+                        )
+                        return True
+                    nonce_hash = compute_response(nonce, self.password) if self.password else ""
+                    trust_secret = self._known_device_secrets.get(self.session_id, "")
+                    if trust_secret:
+                        self._proof_secret = trust_secret
+                    trust_response = compute_response(nonce, trust_secret) if trust_secret else ""
                     await self._send_async(
                         Message.auth_response(
                             nonce_hash,
                             device_id=self.device_id,
                             connection_mode=self.connection_mode,
+                            trust_response=trust_response,
                         )
                     )
                     self.inbox.put(("auth_requested", None, self.session_seq))
@@ -1307,10 +1393,13 @@ class _RelaySession:
                 elif t == MessageType.AUTH_OK:
                     self._authenticated = True
                     self.inbox.put(("auth_result", (True, "Authenticated"), self.session_seq))
-                    if self.connection_mode == "remote_desktop":
-                        # Richiedi subito un keyframe per avviare lo streaming
+                    if self._e2ee_enabled:
+                        self._key_exchange_pending = True
+                        asyncio.create_task(self._e2ee_timeout())
+                    elif self.connection_mode == "remote_desktop":
+                        # Senza E2EE il keyframe può essere richiesto subito.
                         logger.info("Auth OK — requesting first keyframe from host")
-                        await self._send_async(
+                        await self._send_peer_signalling(
                             Message(MessageType.VIDEO_REQUEST_KEYFRAME, {}),
                         )
                     else:
@@ -1318,6 +1407,8 @@ class _RelaySession:
 
                 elif t == MessageType.AUTH_FAIL:
                     reason = msg.payload.get("reason", "Authentication failed")
+                    if not isinstance(reason, str):
+                        reason = "Authentication failed"
                     self.inbox.put(("auth_result", (False, reason), self.session_seq))
                     return True
 
@@ -1383,13 +1474,13 @@ class _RelaySession:
                                 )
                                 if not is_keyframe and self._decoder is not None:
                                     self._decoder.reset()
-                                    await self._send_async(
+                                    await self._send_peer_signalling(
                                         Message(MessageType.VIDEO_REQUEST_KEYFRAME, {}),
                                     )
                         except Exception as e:
                             logger.error("Frame decode error: %s", e)
                             self._decoder.reset()
-                            await self._send_async(
+                            await self._send_peer_signalling(
                                 Message(MessageType.VIDEO_REQUEST_KEYFRAME, {}),
                             )
                     else:
@@ -1470,7 +1561,7 @@ class _RelaySession:
                         if now - self._last_keyframe_request_ts > 5.0:
                             self._last_keyframe_request_ts = now
                             logger.debug("Tile dropped - no reference frame, requesting keyframe")
-                            await self._send_async(
+                            await self._send_peer_signalling(
                                 Message(MessageType.VIDEO_REQUEST_KEYFRAME, {}),
                             )
                 elif t == MessageType.VIDEO_REQUEST_KEYFRAME:
@@ -2110,8 +2201,7 @@ class RelayClient(QObject):
             )
         elif events >= _HOST_POLL_BUDGET:
             logger.debug(
-                "_poll_host_inbox: budget %d raggiunto, %d eventi rinviati "
-                "al prossimo tick",
+                "_poll_host_inbox: budget %d raggiunto, %d eventi rinviati",
                 events,
                 self._host_inbox.qsize(),
             )

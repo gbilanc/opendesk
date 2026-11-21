@@ -6,12 +6,15 @@ Covers E2E encryption roundtrip, key exchange, and password hashing.
 
 from __future__ import annotations
 
+import asyncio
 import queue
+
+import pytest
 
 from opendesk.crypto.auth import generate_session_id, hash_password, verify_password
 from opendesk.crypto.e2ee import CryptoKeyPair, E2EEncryption, EncryptedMessage
 from opendesk.network.protocol import Message, MessageType
-from opendesk.network.relay_client import RelayRole, _RelaySession
+from opendesk.network.relay_client import _INCOMING_CLOSED, RelayRole, _RelaySession
 
 # ── E2E encryption ────────────────────────────────────────────────────────
 
@@ -133,13 +136,14 @@ class TestE2EEncryption:
             RelayRole.CLIENT,
             queue.Queue(),
             device_id="client-1",
+            known_device_secrets={"host-1": "device-secret"},
         )
-        # The host sets this when authenticating a trusted device.
+        # The host sets this after password pairing or trusted HMAC auth.
         host._proof_secret = "device-secret"
+        host_key = host._key_exchange_message(MessageType.KEY_EXCHANGE)
+        assert "trust_secret" not in host_key.payload
 
-        assert client._accept_remote_key(
-            host._key_exchange_message(MessageType.KEY_EXCHANGE).payload
-        )
+        assert client._accept_remote_key(host_key.payload)
         assert host._accept_remote_key(
             client._key_exchange_message(MessageType.KEY_EXCHANGE_ACK).payload
         )
@@ -147,6 +151,32 @@ class TestE2EEncryption:
         encrypted = host._encrypt_peer_message(Message.chat_message("private"))
         assert encrypted.encrypted is True
         assert client._decrypt_peer_message(encrypted).payload == {"text": "private"}
+
+    def test_password_proof_recovers_from_stale_trusted_secret(self) -> None:
+        """A changed trusted secret does not prevent password re-pairing."""
+        host = _RelaySession(
+            "relay",
+            1,
+            "session",
+            "host-password",
+            RelayRole.HOST,
+            queue.Queue(),
+            device_id="host-1",
+        )
+        client = _RelaySession(
+            "relay",
+            1,
+            "session",
+            "host-password",
+            RelayRole.CLIENT,
+            queue.Queue(),
+            known_device_secrets={"host-1": "stale-secret"},
+        )
+        client._proof_secret = "stale-secret"
+        assert client._accept_remote_key(
+            host._key_exchange_message(MessageType.KEY_EXCHANGE).payload
+        )
+        assert client._proof_secret == ""
 
     def test_trusted_device_rejects_changed_secret(self) -> None:
         """A pinned per-device secret cannot be silently replaced."""
@@ -174,13 +204,45 @@ class TestE2EEncryption:
             host._key_exchange_message(MessageType.KEY_EXCHANGE).payload
         )
 
-    def test_passwordless_accepts_legacy_unverified_key(self) -> None:
-        """A password-less peer accepts a legacy host key that has no proof."""
+    def test_passwordless_rejects_legacy_unverified_key(self) -> None:
+        """A password-less peer cannot downgrade to an unverified key."""
         client = _RelaySession(
             "relay", 1, "session", "", RelayRole.CLIENT, queue.Queue(), device_id="client-1"
         )
         legacy = Message.key_exchange(E2EEncryption().get_public_key_string())
-        assert client._accept_remote_key(legacy.payload)
+        assert not client._accept_remote_key(legacy.payload)
+
+    def test_e2ee_send_is_fail_closed(self) -> None:
+        """Peer payloads are not queued in clear while E2EE is unavailable."""
+        session = _RelaySession("relay", 1, "session", "secret", RelayRole.HOST, queue.Queue())
+        session._running.set()
+        session._loop = object()  # enough to enter send_message(); no I/O is reached
+        assert not session.send_message(Message.chat_message("must not be clear"))
+        with pytest.raises(RuntimeError):
+            session._encrypt_peer_message(Message.chat_message("must not be clear"))
+
+    def test_encrypted_envelope_rejects_malformed_lengths(self) -> None:
+        with pytest.raises(ValueError):
+            EncryptedMessage.decode(b"\x00")
+        with pytest.raises(ValueError):
+            EncryptedMessage.decode(b"\x00\x01" + b"\x00" * 64)
+
+    @pytest.mark.asyncio
+    async def test_plaintext_peer_messages_are_dropped_with_e2ee(self) -> None:
+        session = _RelaySession("relay", 1, "session", "secret", RelayRole.CLIENT, queue.Queue())
+        session._running.set()
+        session._incoming = asyncio.Queue()
+        await session._incoming.put(Message.chat_message("injected"))
+        await session._incoming.put(_INCOMING_CLOSED)
+        dispatched: list[MessageType] = []
+
+        async def dispatch(message_type: MessageType, _msg: Message) -> bool:
+            dispatched.append(message_type)
+            return False
+
+        await session._receive_loop("Client", dispatch)
+        assert dispatched == []
+        session._running.clear()
 
     def test_key_rotation(self) -> None:
         """After key rotation, old ciphertexts should not decrypt."""

@@ -10,6 +10,7 @@ contro un relay finto che implementa il minimo pairing necessario.
 from __future__ import annotations
 
 import asyncio
+import logging
 import queue
 import threading
 import time
@@ -18,6 +19,8 @@ import pytest
 
 from opendesk.network.protocol import Message, MessageType
 from opendesk.network.relay_client import RelayRole, _RelaySession
+
+logger = logging.getLogger(__name__)
 
 _TIMEOUT = 5.0
 
@@ -60,16 +63,28 @@ class _ScriptedRelay:
                 role = "host"
                 await self._send(writer, Message(MessageType.RELAY_REGISTER, {"mode": "host"}))
             self._peers[role] = (reader, writer)
+            if {"host", "client"} <= self._peers.keys():
+                await self._send(
+                    self._peers["host"][1],
+                    Message(MessageType.RELAY_PEER_LIST, {"peers": [{"id": "client"}]}),
+                )
             assert self._paired is not None
             self._paired.set()
 
             other = "host" if role == "client" else "client"
             while True:
                 msg = await Message.from_reader(reader)
+                if msg.type == MessageType.RELAY_ROUTE:
+                    msg = Message(
+                        MessageType(msg.payload["inner_type"]),
+                        msg.payload["inner_payload"],
+                    )
                 peer = self._peers.get(other)
                 await self._send(peer[1] if peer else None, msg)
         except (TimeoutError, ConnectionError, asyncio.IncompleteReadError):
             pass
+        except Exception:
+            logger.exception("Scripted relay peer failed")
         finally:
             if task is not None:
                 self._tasks.discard(task)
@@ -120,18 +135,29 @@ class _ScriptedRelay:
 class _Session:
     """Wrapper: ``_RelaySession`` su un thread, con inbox ispezionabile."""
 
-    def __init__(self, relay: _ScriptedRelay, role: RelayRole) -> None:
+    def __init__(
+        self,
+        relay: _ScriptedRelay,
+        role: RelayRole,
+        *,
+        password: str = "pw",
+        trusted_devices: dict[str, str] | None = None,
+        known_device_secrets: dict[str, str] | None = None,
+        e2ee_enabled: bool = False,
+    ) -> None:
         self.inbox: queue.Queue = queue.Queue()
         self.session = _RelaySession(
             host="127.0.0.1",
             port=relay.port,
-            session_id="SID123",
-            password="pw",
+            session_id="dev-host",
+            password=password,
             role=role,
             inbox=self.inbox,
             device_id="dev-host" if role is RelayRole.HOST else "dev-client",
             device_name=role.name,
-            e2ee_enabled=False,
+            trusted_devices=trusted_devices,
+            known_device_secrets=known_device_secrets,
+            e2ee_enabled=e2ee_enabled,
             p2p_enabled=False,
             tls=False,  # relay di test in chiaro
         )
@@ -252,3 +278,80 @@ def test_unreachable_relay_reports_error_and_disconnected() -> None:
         assert session.wait_event("disconnected")[0] == "disconnected"
     finally:
         session._thread.join(timeout=_TIMEOUT)
+
+
+def test_trusted_device_id_alone_does_not_bypass_password(relay: _ScriptedRelay) -> None:
+    """A spoofed trusted UUID without its secret is rejected."""
+    host = _Session(
+        relay,
+        RelayRole.HOST,
+        trusted_devices={"dev-client": "pairing-secret"},
+    )
+    client = _Session(relay, RelayRole.CLIENT, password="")
+    host.start()
+    client.start()
+    try:
+        assert client.wait_event("auth_result")[1][0] is False
+        assert host.wait_event("auth_result")[1][0] is False
+        assert not host.session._authenticated
+    finally:
+        client.stop()
+        host.stop()
+
+
+def test_trusted_pairing_then_passwordless_authentication(relay: _ScriptedRelay) -> None:
+    """Password pairing shares the secret via E2EE and enables later trusted auth."""
+    secret = "pairing-secret"
+    host = _Session(
+        relay,
+        RelayRole.HOST,
+        trusted_devices={"dev-client": secret},
+        e2ee_enabled=True,
+    )
+    client = _Session(relay, RelayRole.CLIENT, e2ee_enabled=True)
+    host.start()
+    client.start()
+    try:
+        assert client.wait_event("auth_result")[1][0] is True
+        assert host.wait_event("auth_result")[1][0] is True
+        trust_event = client.wait_event("trust_secret")
+        assert trust_event[1] == ("dev-host", secret)
+        assert client.session._e2ee_ready
+        assert host.session._e2ee_ready
+    finally:
+        client.stop()
+        host.stop()
+
+    relay.stop()
+    second_relay = _ScriptedRelay()
+    second_relay.start_thread()
+    paired_host = _Session(
+        second_relay,
+        RelayRole.HOST,
+        trusted_devices={"dev-client": secret},
+        e2ee_enabled=True,
+    )
+    paired_client = _Session(
+        second_relay,
+        RelayRole.CLIENT,
+        password="",
+        known_device_secrets={"dev-host": secret},
+        e2ee_enabled=True,
+    )
+    paired_host.start()
+    paired_client.start()
+    try:
+        assert paired_client.wait_event("auth_result")[1][0] is True
+        host_auth = paired_host.wait_event("auth_result")
+        assert host_auth[1] == (True, "Authenticated (trusted device)")
+        assert paired_client.wait_event("trust_secret")[1] == ("dev-host", secret)
+        assert paired_client.session._e2ee_ready
+        assert paired_host.session._e2ee_ready
+        assert paired_host.session.send_message(Message.chat_message("encrypted"))
+        message = paired_client.wait_event("message")[1]
+        assert message.payload == {"text": "encrypted"}
+        assert message.encrypted is True  # authenticated origin is preserved after decryption
+    finally:
+        paired_client.stop()
+        paired_host.stop()
+        second_relay.stop()
