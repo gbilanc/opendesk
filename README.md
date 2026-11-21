@@ -8,7 +8,7 @@
 
 Multi-platform remote desktop application (TeamViewer / AnyDesk-like).
 
-[![Version](https://img.shields.io/badge/version-3.4.2-blue)](https://github.com/gbilanc/opendesk-client/releases)
+[![Version](https://img.shields.io/badge/version-3.4.4-blue)](https://github.com/gbilanc/opendesk-client/releases)
 [![Python](https://img.shields.io/badge/python-3.12%2B-blue)](https://github.com/gbilanc/opendesk-client)
 [![License](https://img.shields.io/badge/license-MIT-green)](https://github.com/gbilanc/opendesk-client/blob/main/LICENSE)
 [![CI](https://github.com/gbilanc/opendesk-client/actions/workflows/ci.yml/badge.svg)](https://github.com/gbilanc/opendesk-client/actions/workflows/ci.yml)
