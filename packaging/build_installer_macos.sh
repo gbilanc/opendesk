@@ -62,7 +62,7 @@ if [ -n "${OPENDESK_SIGN_IDENTITY:-}" ]; then
 fi
 
 echo "==> [4/5] Staging DMG contents"
-STAGE="build/dmg"
+STAGE="build/dmg-$COMPONENT"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 cp -a "$APP" "$STAGE/"
