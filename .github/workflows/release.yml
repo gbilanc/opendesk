@@ -1,3 +1,6 @@
+# Nota: GitHub non crea eventi per i push che contengono più di tre tag, quindi
+# spingere un tag per volta (`git push origin vX.Y.Z`). Se il workflow non è
+# partito: `gh workflow run Release --ref vX.Y.Z` (workflow_dispatch sul tag).
 name: Release
 
 on:

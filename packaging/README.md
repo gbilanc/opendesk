@@ -57,6 +57,14 @@ Gli script firmano se le variabili d'ambiente sono presenti:
 Se i secrets sono configurati, i binari vengono firmati automaticamente.
 Il build **non è cross-platform**: ogni installer va generato sul proprio OS.
 
+> **Attenzione al push dei tag**: GitHub non genera alcun evento `push` quando
+> una singola `git push` crea **più di tre tag** — il workflow non parte e la
+> release resta senza installer. Spingere un tag per volta:
+> `git push origin v3.4.1` (non `git push --follow-tags` con tag multipli).
+> Rimedio se è già successo:
+> `gh workflow run Release --ref v3.4.1` (i job `build_installer.*` girano su
+> `workflow_dispatch` e il job `release` pubblica gli asset sul tag).
+
 ### Secrets del repository
 
 | Secret | Contenuto |
