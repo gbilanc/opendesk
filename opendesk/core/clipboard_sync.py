@@ -95,11 +95,13 @@ class ClipboardSync(QObject):
         logger.info("Clipboard sync started")
 
     def stop(self) -> None:
-        """Disable clipboard syncing."""
+        """Disable clipboard syncing (no-op silenzioso se già fermo)."""
+        was_enabled = self._enabled
         self._enabled = False
         self._timer.stop()
         self.sync_toggled.emit(False)
-        logger.info("Clipboard sync stopped")
+        if was_enabled:
+            logger.info("Clipboard sync stopped")
 
     def toggle(self) -> bool:
         """Toggle sync on/off. Returns the new state."""

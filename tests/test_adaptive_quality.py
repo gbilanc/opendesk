@@ -72,3 +72,29 @@ def test_cpu_load_returns_none_when_unavailable(monkeypatch: pytest.MonkeyPatch)
 
     monkeypatch.setattr(platform_utils.os, "getloadavg", _boom, raising=False)
     assert platform_utils.cpu_load_percent() is None
+
+
+def test_cpu_hysteresis_prevents_boost_self_oscillation() -> None:
+    """Regressione RCA 2026-11-21: il campione CPU include il costo del boost.
+
+    Sequenza reale dal log: idle=4 -> tier 1 -> cpu 67% -> tier 0 -> cpu 52%
+    -> tier 1 -> ... Con l'isteresi d'uscita il boost resta finché il carico
+    non supera ``_CPU_TIER_EXIT``.
+    """
+    from opendesk.services.pipeline import _CPU_TIER_EXIT
+
+    idle = _IDLE_TIER2_FRAMES
+    # Ingresso dal tier 0: basta superare _CPU_FREE_TIER1
+    assert _choose_quality_tier(idle, 0.80, 0) == 0
+    assert _choose_quality_tier(idle, 0.59, 0) == 1
+    # Già boostati: 0.67 (< _CPU_TIER_EXIT) non declassa, oltre sì
+    assert _choose_quality_tier(idle, 0.67, 1) == 1
+    assert _choose_quality_tier(idle, _CPU_TIER_EXIT, 1) == 0
+    # Schermo che si muove declassa comunque subito
+    assert _choose_quality_tier(0, 0.10, 2) == 0
+
+
+def test_boost_warmup_constant_is_finite() -> None:
+    from opendesk.services.pipeline import _BOOST_WARMUP_S
+
+    assert 0 < _BOOST_WARMUP_S <= 30

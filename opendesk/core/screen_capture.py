@@ -958,6 +958,7 @@ class ScreenCapture:
             asyncio.run(self._portal.shutdown())
         self._portal = None
 
+
 # ---------------------------------------------------------------------------
 # Convenience screenshot
 # ---------------------------------------------------------------------------

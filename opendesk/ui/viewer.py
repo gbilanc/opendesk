@@ -339,7 +339,8 @@ class RemoteViewer(QGraphicsView):
         self._camera_overlay = CameraOverlay(self.viewport())
         self._camera_overlay.setVisible(False)
 
-        # Placeholder while disconnected
+        # Placeholder while disconnected (testo override per lo stallo video)
+        self._placeholder_text: str | None = None
         self._show_placeholder()
 
     # ── Public API ──────────────────────────────────────────────────
@@ -382,6 +383,9 @@ class RemoteViewer(QGraphicsView):
         # Skip if viewport not ready yet (window still initialising)
         if self.viewport().width() < 2 or self.viewport().height() < 2:
             return
+
+        # Il flusso è ripartito: via il messaggio di stallo
+        self._placeholder_text = None
 
         try:
             # ── Convert to QImage ───────────────────────────────────
@@ -475,6 +479,8 @@ class RemoteViewer(QGraphicsView):
         """
         if self._pixmap_item is None:
             return
+        # Il flusso è ripartito: via il messaggio di stallo
+        self._placeholder_text = None
         # Riusa la pixmap in attesa di flush: i tile dello stesso frame
         # si accumulano su di essa e producono un solo setPixmap/redraw.
         pixmap = (
@@ -707,6 +713,14 @@ class RemoteViewer(QGraphicsView):
         """Emitted when no frame arrives within the timeout window."""
         self.frame_timeout.emit()
 
+    def set_stalled(self, stalled_s: int) -> None:
+        """Mostra che il peer è autenticato ma non invia video."""
+        self._placeholder_text = (
+            f"Remote device is not sending video ({stalled_s}s)\n"
+            "Check that OpenDesk is running and unlocked on the other PC"
+        )
+        self._show_placeholder()
+
     def _show_placeholder(self) -> None:
         """Show a placeholder when not connected."""
         pixmap = QPixmap(self._remote_resolution[0], self._remote_resolution[1])
@@ -718,7 +732,9 @@ class RemoteViewer(QGraphicsView):
         font = QFont("Segoe UI", 18)
         painter.setFont(font)
 
-        if self._connection_active:
+        if self._placeholder_text:
+            text = self._placeholder_text
+        elif self._connection_active:
             text = "Waiting for stream..."
         else:
             text = "Disconnected\nUse Session → Connect to start"
@@ -1193,6 +1209,11 @@ class ViewerWindow(QMainWindow):
     def display_tile(self, rgb_data: np.ndarray, x: int, y: int, w: int, h: int) -> None:
         """Blit a single tile region into the viewer frame."""
         self._viewer.display_tile(rgb_data, x, y, w, h)
+
+    def set_stalled(self, stalled_s: int) -> None:
+        """Il peer è autenticato ma non invia video: messaggio a schermo."""
+        self._viewer.set_stalled(stalled_s)
+        self._status_label.setText(f"⚠ No video from remote device ({stalled_s}s)")
 
     def set_connection_active(self, active: bool, peer_name: str = "") -> None:
         """Update UI state for connection status."""

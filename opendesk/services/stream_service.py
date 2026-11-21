@@ -62,6 +62,20 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+# Attesa massima del join dei worker della pipeline precedente prima di
+# avviarne una nuova (un peer che rientra subito non deve trovare i vecchi
+# worker ancora dentro capture/encoder).
+_SHUTDOWN_JOIN_TIMEOUT_S = 10.0
+
+
+def _shutdown_pipeline(pipeline: StreamingPipeline) -> None:
+    """Ferma la pipeline su un thread dedicato (join fino a ~9 s)."""
+    try:
+        pipeline.stop()
+    except Exception:
+        logger.exception("Pipeline stop error (ignored)")
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Tile grid / keyframe constants
 # ═══════════════════════════════════════════════════════════════════
@@ -192,6 +206,8 @@ class StreamService(QObject):
 
         # Pipeline multi-thread
         self._pipeline: StreamingPipeline | None = None
+        # Thread di shutdown della pipeline precedente (join in start)
+        self._shutdown_thread: threading.Thread | None = None
 
         # Timer per bandwidth adaptation (solo lettura contatori)
         self._bw_timer = QTimer(self)
@@ -378,6 +394,15 @@ class StreamService(QObject):
         if self._pipeline is not None:
             logger.warning("Pipeline already running — ignoring start")
             return
+        shutdown = self._shutdown_thread
+        if shutdown is not None and shutdown.is_alive():
+            shutdown.join(timeout=_SHUTDOWN_JOIN_TIMEOUT_S)
+            if shutdown.is_alive():
+                logger.warning(
+                    "Previous pipeline still shutting down after %.0fs — starting anyway",
+                    _SHUTDOWN_JOIN_TIMEOUT_S,
+                )
+        self._shutdown_thread = None
 
         try:
             self._start_input_backend()
@@ -462,14 +487,18 @@ class StreamService(QObject):
         pipeline = self._pipeline
         self._pipeline = None
         if pipeline is not None:
-
-            def _shutdown() -> None:
-                try:
-                    pipeline.stop()
-                except Exception:
-                    logger.exception("Pipeline stop error (ignored)")
-
-            threading.Thread(target=_shutdown, name="PipelineShutdown", daemon=True).start()
+            # Il join dei worker avviene in background, ma il thread resta
+            # referenziato: start_streaming() lo attende prima di creare una
+            # nuova pipeline (altrimenti i vecchi worker rilasciano capture ed
+            # encoder mentre i nuovi li stanno usando).
+            shutdown = threading.Thread(
+                target=_shutdown_pipeline,
+                args=(pipeline,),
+                name="PipelineShutdown",
+                daemon=True,
+            )
+            self._shutdown_thread = shutdown
+            shutdown.start()
         if self._input_backend:
             self._input_backend.release()
             self._input_backend = None
@@ -484,7 +513,10 @@ class StreamService(QObject):
                     logger.debug("release %s error (ignored): %s", manager_attr, e)
                 setattr(self, manager_attr, None)
         self._bw_measure_bytes = 0
-        logger.info("Streaming stopped")
+        if pipeline is not None:
+            logger.info("Streaming stopped")
+        else:
+            logger.debug("Streaming stop requested while idle")
 
     # ── audio capture (host side) ─────────────────────────────────────
 

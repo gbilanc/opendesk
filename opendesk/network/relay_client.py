@@ -25,10 +25,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import queue
+import random
 import ssl
 import threading
 import time
 from collections.abc import Awaitable, Callable
+from concurrent.futures import Future
 from enum import Enum, auto
 from typing import Any, cast
 
@@ -87,10 +89,52 @@ _POLL_INTERVAL_IDLE_MS = 100  # senza sessione/peer attivo: 60 wakeup/s a
 # vuoto costavano ~2% di CPU anche da fermi; a riposo basta 10 Hz
 _CONNECT_TIMEOUT = 15.0  # max seconds to wait for TCP connection
 _STOP_JOIN_TIMEOUT = 8.0  # max seconds to wait for session thread to stop
+_STOP_FINISH_TIMEOUT = 3.0  # s — attesa della DISCONNECT pendente prima di chiudere il loop
+# Richieste di keyframe consecutive senza alcun frame prima di dichiarare
+# lo stallo all'utente (3 → ~6+12+24 s dopo l'ultimo frame).
+_VIDEO_STALL_ATTEMPTS = 3
 _SEND_DRAIN_TIMEOUT = 5.0  # max seconds to wait for TCP send buffer to drain
 _SEND_MAX_CONSECUTIVE_TIMEOUTS = 3  # consecutive drain timeouts before disconnecting
 _SEND_MAX_PENDING = 20  # max pending sends before backpressure kicks in
 _PING_INTERVAL = 25.0  # s — keep-alive; il relay disconnette peer idle > 120s
+
+# Retry host → relay: backoff esponenziale con jitter.  Con l'intervallo
+# fisso di 10 s un outage del relay produceva un tentativo ogni 20 s per
+# minuti (log flood, nessun segnale di degrado).
+_RETRY_BASE_MS = 5_000  # primo ritentativo dopo un disconnect
+_RETRY_MAX_MS = 60_000  # tetto
+_RETRY_JITTER = 0.20  # ±20%: evita che tutti gli host ritentino in fase
+
+
+def _drain_stop(loop: asyncio.AbstractEventLoop, future: Future | None) -> None:
+    """Porta a termine la ``_stop_async`` pendente prima di chiudere il loop.
+
+    ``stop()`` schedula la DISCONNECT con ``run_coroutine_threadsafe``: se il
+    loop viene chiuso subito dopo, asyncio distrugge il task pending
+    ("Task was destroyed but it is pending!") e il relay non riceve la
+    DISCONNECT, tenendo la sessione viva fino allo scadere del timeout.
+    """
+    if future is None or future.done():
+        return
+    try:
+        loop.run_until_complete(
+            asyncio.wait_for(asyncio.wrap_future(future, loop=loop), _STOP_FINISH_TIMEOUT)
+        )
+    except Exception as e:
+        logger.warning("Stop della sessione non completato (%s) — chiusura forzata", e)
+
+
+def retry_delay_ms(attempt: int) -> int:
+    """Ritardo del prossimo ritentativo host → relay.
+
+    ``attempt`` è 1-based: dopo il primo fallimento ``_RETRY_BASE_MS``, poi
+    il doppio, fino a ``_RETRY_MAX_MS``; il jitter è proporzionale al ritardo.
+    """
+    exponent = min(max(attempt - 1, 0), 10)
+    base = min(_RETRY_MAX_MS, _RETRY_BASE_MS * 2**exponent)
+    spread = int(base * _RETRY_JITTER)
+    return base + random.randint(-spread, spread)
+
 
 # Sentinel pushed into the incoming queue when the relay reader ends.
 _INCOMING_CLOSED = object()
@@ -178,6 +222,7 @@ class _RelaySession:
         self._proof_secret: str = ""
 
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._stop_future: Future | None = None  # DISCONNECT schedulata da stop()
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._running = threading.Event()
@@ -287,13 +332,23 @@ class _RelaySession:
                 self._loop.run_until_complete(self._run_client())
         finally:
             self._running.clear()
-            self._loop.close()
+            loop = self._loop
+            _drain_stop(loop, self._stop_future)
+            # I task rimasti (watchdog keyframe, ping, reader) vanno cancellati
+            # e attesi: chiudere il loop con task pending li distrugge a metà.
+            pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.close()
             self._loop = None
+            self._stop_future = None
 
     def stop(self) -> None:
         """Signal the event loop to stop."""
         if self._loop and self._running.is_set():
-            asyncio.run_coroutine_threadsafe(self._stop_async(), self._loop)
+            self._stop_future = asyncio.run_coroutine_threadsafe(self._stop_async(), self._loop)
 
     async def _stop_async(self) -> None:
         """Cleanly stop the network session.
@@ -1147,9 +1202,11 @@ class _RelaySession:
         # congelata per sempre con sessione comunque connessa.
         _frame_count = 0  # track frames received since last watchdog check
         _watchdog_delay = 3.0
+        _missed = 0  # richieste di keyframe consecutive rimaste senza frame
+        _stall_start = self._start_time
 
         async def _keyframe_watchdog():
-            nonlocal _frame_count, _watchdog_delay
+            nonlocal _frame_count, _watchdog_delay, _missed, _stall_start
             while self._running.is_set():
                 await asyncio.sleep(_watchdog_delay)
                 if not self._running.is_set():
@@ -1157,13 +1214,28 @@ class _RelaySession:
                 last_activity = self._last_video_activity_time or self._start_time
                 elapsed_since_activity = time.time() - last_activity
                 if elapsed_since_activity > 5.0:
+                    if _missed == 0:
+                        # Inizio dello stallo: riferimento per la durata reale
+                        _stall_start = last_activity
+                    _missed += 1
                     logger.warning(
                         "No video activity for %.0fs (frames received: %d) — "
-                        "requesting keyframe (next attempt in %.0fs)",
+                        "requesting keyframe (attempt %d, next in %.0fs)",
                         elapsed_since_activity,
                         _frame_count,
+                        _missed,
                         _watchdog_delay * 2,
                     )
+                    if _missed == _VIDEO_STALL_ATTEMPTS:
+                        stalled_s = int(time.time() - _stall_start)
+                        logger.error(
+                            "Peer autenticato ma nessun frame ricevuto da %ds "
+                            "(%d richieste di keyframe senza risposta) — "
+                            "l'host non sta inviando video",
+                            stalled_s,
+                            _missed,
+                        )
+                        self.inbox.put(("video_stalled", stalled_s, self.session_seq))
                     _frame_count = 0
                     self._last_video_activity_time = time.time()
                     await self._send_async(
@@ -1172,6 +1244,8 @@ class _RelaySession:
                     _watchdog_delay = min(_watchdog_delay * 2, 60.0)
                 else:
                     _watchdog_delay = 3.0
+                    _missed = 0
+                    _stall_start = last_activity
 
         watchdog_task = asyncio.create_task(_keyframe_watchdog())
         ping_task = asyncio.create_task(self._ping_loop())
@@ -1535,6 +1609,9 @@ class RelayClient(QObject):
     trust_secret_received = Signal(str, str)  # peer device_id, per-device secret
     p2p_state_changed = Signal(str)  # "connected" | "failed" | "closed"
     main_keyframe_requested = Signal()  # legacy alias for host_keyframe_requested
+    # Il peer è autenticato ma non invia video: N richieste di keyframe
+    # consecutive senza frame (argomento: secondi senza attività video).
+    video_stalled = Signal(int)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -2063,6 +2140,8 @@ class RelayClient(QObject):
             self.trust_secret_received.emit(device_id, secret)
         elif event == "p2p_state":
             self.p2p_state_changed.emit(data)
+        elif event == "video_stalled":
+            self.video_stalled.emit(data)
         else:
             logger.debug("Unhandled client event: %s", event)
 

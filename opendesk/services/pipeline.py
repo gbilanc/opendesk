@@ -67,10 +67,16 @@ _QUALITY_FLIP_HYSTERESIS_S = 5.0
 # Tier crescenti applicati quando lo schermo è fermo E la CPU è libera:
 # il costo di un keyframe "bello" è irrilevante se nessuno sta usando
 # l'host, quindi si reinveste in CRF/preset invece di sprecare il margine.
-_IDLE_TIER1_FRAMES = 4  # ~2 s a _MIN_IDLE_FPS
+_IDLE_TIER1_FRAMES = 10  # ~5 s a _MIN_IDLE_FPS
 _IDLE_TIER2_FRAMES = 20  # ~10 s a _MIN_IDLE_FPS
 _CPU_FREE_TIER1 = 0.60  # carico host sotto cui parte il boost leggero
 _CPU_FREE_TIER2 = 0.30  # carico host sotto cui parte il boost massimo
+# Isteresi d'uscita: il campione CPU include il costo dell'encoder stesso,
+# quindi un boost appena applicato si auto-declasserebbe (rebuild a catena).
+_CPU_TIER_EXIT = 0.75
+# Nessun boost nei primi secondi di sessione: l'avvio (init encoder,
+# primo keyframe, assestamento rete) non è rappresentativo del carico idle.
+_BOOST_WARMUP_S = 10.0
 _MIN_BOOST_CRF = 10  # limite di sicurezza (sotto = bitrate ingestibile)
 _MAX_BOOST_KEYFRAME_MS = 500.0  # oltre: il preset lento satura l'encoder
 _TIER_BLOCK_OUT_S = 30.0  # attesa dopo un downgrade per saturazione
@@ -91,16 +97,22 @@ _PRESET_TIER_STEP = {1: 1, 2: 3}
 _SW_CODECS = {"h264", "libx264", "hevc", "libx265"}
 
 
-def _choose_quality_tier(idle_frames: int, cpu_load: float | None) -> int:
+def _choose_quality_tier(idle_frames: int, cpu_load: float | None, current_tier: int = 0) -> int:
     """Sceglie il tier qualità (0=base, 1=boost, 2=boost massimo).
 
     ``cpu_load`` è normalizzato 0..1; ``None`` (piattaforma senza
     campionatore) vale come carico sconosciuto: si resta prudenti al
     Tier 1, mai al 2.
+
+    ``current_tier`` introduce l'isteresi d'uscita: chi è già boostato
+    lascia il boost solo oltre ``_CPU_TIER_EXIT`` (soglia più alta di quella
+    d'ingresso), perché il carico misurato include il costo del boost
+    stesso — senza, il tier oscilla a ogni chiave (RCA 2026-11-21).
     """
     if idle_frames < _IDLE_TIER1_FRAMES:
         return 0
-    if cpu_load is not None and cpu_load >= _CPU_FREE_TIER1:
+    busy_threshold = _CPU_TIER_EXIT if current_tier > 0 else _CPU_FREE_TIER1
+    if cpu_load is not None and cpu_load >= busy_threshold:
         return 0
     if idle_frames >= _IDLE_TIER2_FRAMES and cpu_load is not None and cpu_load < _CPU_FREE_TIER2:
         return 2
@@ -273,7 +285,7 @@ class CaptureWorker(threading.Thread):
                 if now_mono - last_status_log >= 5.0:
                     fps_eff = (frame_idx - frames_at_last_log) / 5.0
                     logger.info(
-                        "CaptureWorker: %d frames captured (%.0f fps effettivi, target %.0f)",
+                        "CaptureWorker: frames=%d window=5s fps=%.1f target=%.1f",
                         frame_idx,
                         fps_eff,
                         fps_target,
@@ -397,6 +409,7 @@ class EncoderWorker(threading.Thread):
         self._idle_frames: int = 0
         self._last_quality_flip_mono: float = 0.0
         self._quality_tier: int = 0
+        self._start_mono: float = time.monotonic()  # warm-up del boost qualità
         self._tier_block_until_mono: float = 0.0
         self._last_boost_keyframe_mono: float = 0.0
 
@@ -423,6 +436,7 @@ class EncoderWorker(threading.Thread):
         logger.info("EncoderWorker started")
         last_frame_time = time.monotonic()
         encoded_count = 0
+        frames_at_last_log = 0
         last_status_log = time.monotonic()
 
         while not self._stop_event.is_set():
@@ -434,7 +448,13 @@ class EncoderWorker(threading.Thread):
                 # Status log ogni 5 secondi
                 now_mono = time.monotonic()
                 if now_mono - last_status_log >= 5.0:
-                    logger.info("EncoderWorker: %d frames encoded", encoded_count)
+                    logger.info(
+                        "EncoderWorker: frames=%d window=5s fps=%.1f tier=%d",
+                        encoded_count,
+                        (encoded_count - frames_at_last_log) / 5.0,
+                        self._quality_tier,
+                    )
+                    frames_at_last_log = encoded_count
                     last_status_log = now_mono
             except queue.Empty:
                 # Schermo fermo/bloccato: nessun tile da inviare.  Un
@@ -754,9 +774,12 @@ class EncoderWorker(threading.Thread):
             return
         if not self._config.idle_quality_boost:
             target, cpu = 0, None
+        elif time.monotonic() - self._start_mono < _BOOST_WARMUP_S:
+            # Warm-up: il carico dei primi secondi non è idle credibile
+            return
         else:
             cpu = cpu_load_percent()
-            target = _choose_quality_tier(self._idle_frames, cpu)
+            target = _choose_quality_tier(self._idle_frames, cpu, self._quality_tier)
         if target == self._quality_tier:
             return
         if target < self._quality_tier:
@@ -788,6 +811,12 @@ class EncoderWorker(threading.Thread):
             # yuv444p: chroma a piena risoluzione, testo più nitido.  Vale
             # solo su keyframe rari (idle), quindi il costo CPU è irrilevante.
             pixel_format = "yuv444p"
+        elif tier == 2 and self._config.pixel_format_auto is False:
+            # Skip silenzioso: un pixel_format scelto dall'utente resta com'è
+            logger.debug(
+                "Adaptive quality: yuv444p non applicato (pixel_format fisso a %s)",
+                pixel_format,
+            )
 
         threads = self._base_threads
         if tier == 2 and self._software_encoder:

@@ -152,3 +152,62 @@ class TestProtocol:
         assert callable(Message.pong)
         assert callable(Message.disconnect)
         assert callable(Message.error)
+
+
+class TestRetryBackoff:
+    def test_delay_grows_and_caps_with_jitter(self) -> None:
+        from opendesk.network.relay_client import (
+            _RETRY_BASE_MS,
+            _RETRY_JITTER,
+            _RETRY_MAX_MS,
+            retry_delay_ms,
+        )
+
+        for attempt in range(1, 9):
+            delay = retry_delay_ms(attempt)
+            expected = min(_RETRY_MAX_MS, _RETRY_BASE_MS * 2 ** (attempt - 1))
+            assert expected * (1 - _RETRY_JITTER) <= delay <= expected * (1 + _RETRY_JITTER)
+        # Tetto rispettato anche con tentativi molto alti
+        assert retry_delay_ms(50) <= _RETRY_MAX_MS * (1 + _RETRY_JITTER)
+
+    def test_delay_never_shorter_than_one_second(self) -> None:
+        from opendesk.network.relay_client import retry_delay_ms
+
+        assert retry_delay_ms(1) >= 1_000
+
+
+class TestSessionStop:
+    def test_stop_is_drained_before_loop_close(self) -> None:
+        """Regressione: la DISCONNECT schedulata da stop() non deve restare pending."""
+        import asyncio
+        from concurrent.futures import Future
+
+        from opendesk.network.relay_client import _drain_stop
+
+        loop = asyncio.new_event_loop()
+        try:
+            future: Future = Future()
+            loop.call_soon(future.set_result, None)  # si completa appena il loop gira
+            _drain_stop(loop, future)
+            assert future.done()
+            assert [t for t in asyncio.all_tasks(loop) if not t.done()] == []
+        finally:
+            loop.close()
+
+    def test_drain_without_pending_stop_is_noop(self) -> None:
+        import asyncio
+
+        from opendesk.network.relay_client import _drain_stop
+
+        loop = asyncio.new_event_loop()
+        try:
+            _drain_stop(loop, None)  # nessuna eccezione, nessuna attesa
+        finally:
+            loop.close()
+
+
+class TestVideoStallSignal:
+    def test_relay_client_exposes_video_stalled(self) -> None:
+        from opendesk.network.relay_client import RelayClient
+
+        assert hasattr(RelayClient, "video_stalled")

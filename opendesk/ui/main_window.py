@@ -67,6 +67,7 @@ class MainWindow(QMainWindow):
         self._fullscreen: bool = False
         self._peer_id: str = ""  # remote session ID when acting as client
         self._file_transfer_mode: bool = False  # True when connecting for file-transfer-only
+        self._input_dropped_logged: bool = False  # input msg dropped for missing backend
 
         # Settings
         self._settings = QSettings("OpenDesk", "OpenDesk")
@@ -92,6 +93,7 @@ class MainWindow(QMainWindow):
         self._connection.host_auth_result.connect(self._on_host_auth_result)
         self._connection.client_auth_result.connect(self._on_client_auth_result)
         self._connection.p2p_state_changed.connect(self._on_p2p_state_changed)
+        self._connection.relay.video_stalled.connect(self._on_video_stalled)
         self._connection.frame_received.connect(self._on_frame_received)
         self._connection.tile_received.connect(self._on_tile_received)
         self._connection.message_received.connect(self._on_relay_message)
@@ -623,6 +625,21 @@ class MainWindow(QMainWindow):
         if self._connection.role != RelayRole.CLIENT:
             self._stop_streaming()
 
+    @Slot(int)
+    def _on_video_stalled(self, stalled_s: int) -> None:
+        """Il peer è autenticato ma non invia frame (pipeline host ferma)."""
+        logger.error(
+            "Remote peer is not sending video (no frames for %ds) — "
+            "host pipeline likely stopped or capture blocked",
+            stalled_s,
+        )
+        self._status_text.setText(
+            f"⚠ Remote device is not sending video ({stalled_s}s) — "
+            "check OpenDesk on the other PC"
+        )
+        if self._viewer_window is not None:
+            self._viewer_window.set_stalled(stalled_s)
+
     @Slot(str)
     def _on_stream_error(self, error_msg: str) -> None:
         """Stream error (from StreamService).
@@ -652,12 +669,27 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _on_relay_message(self, msg: Message) -> None:
         """Handle an incoming relay message."""
-        if msg.type == MessageType.MOUSE_EVENT and self._stream.input_backend:
-            self._inject_mouse(msg)
-        elif msg.type == MessageType.KEYBOARD_EVENT and self._stream.input_backend:
-            self._inject_keyboard(msg)
-        elif msg.type == MessageType.CAPS_LOCK_STATE and self._stream.input_backend:
-            self._stream.sync_remote_caps_lock(msg.payload.get("active", False))
+        if msg.type in (
+            MessageType.MOUSE_EVENT,
+            MessageType.KEYBOARD_EVENT,
+            MessageType.CAPS_LOCK_STATE,
+        ):
+            if self._stream.input_backend is None:
+                # Silently dropping input makes "screen visible but input dead"
+                # impossible to diagnose from the host log; log once per session.
+                if not self._input_dropped_logged:
+                    self._input_dropped_logged = True
+                    logger.warning(
+                        "%s received but the input backend is unavailable — "
+                        "remote input is being ignored",
+                        msg.type.name,
+                    )
+            elif msg.type == MessageType.MOUSE_EVENT:
+                self._inject_mouse(msg)
+            elif msg.type == MessageType.KEYBOARD_EVENT:
+                self._inject_keyboard(msg)
+            else:
+                self._stream.sync_remote_caps_lock(msg.payload.get("active", False))
         elif msg.type == MessageType.CHAT_MESSAGE:
             text = msg.payload.get("text", "")
             self._chat_panel.add_message("Remote", text, is_remote=True)
